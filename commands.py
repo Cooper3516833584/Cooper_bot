@@ -199,14 +199,19 @@ def _stage_for_napcat(ctx, src: Path, display_name: Optional[str] = None) -> tup
     - msg: 失败原因/补充说明
     """
     try:
+        mirror_dir: Optional[Path] = None
         if ctx.scene == "group":
             host_dir = UPLOAD_GROUP_HOST_DIR
             cont_dir = UPLOAD_GROUP_CONTAINER_DIR
+            # 群里发送失败时会尝试“临时会话私聊”兜底，这里同步一份到私聊目录。
+            mirror_dir = UPLOAD_PRIVATE_HOST_DIR
         else:
             host_dir = UPLOAD_PRIVATE_HOST_DIR
             cont_dir = UPLOAD_PRIVATE_CONTAINER_DIR
 
         host_dir.mkdir(parents=True, exist_ok=True)
+        if mirror_dir is not None:
+            mirror_dir.mkdir(parents=True, exist_ok=True)
 
         # 目标文件名（落地到 upload_* 目录里用 ASCII，避免容器侧解析/编码问题）
         safe_base = _sanitize_ascii_filename(src.name)
@@ -219,6 +224,13 @@ def _stage_for_napcat(ctx, src: Path, display_name: Optional[str] = None) -> tup
         # 注意：Windows + Docker Desktop 的共享目录有时会有“同步延迟”，
         # 因此这里只负责把文件落盘；真正发送失败会在 _send_file 里自动重试。
         shutil.copy2(src, dst)
+
+        # 群聊额外镜像到私聊目录（用于群失败后私聊兜底）。
+        if mirror_dir is not None:
+            try:
+                shutil.copy2(src, mirror_dir / staged_name)
+            except Exception:
+                pass
 
         # 基本校验：避免拷贝出空文件（例如源文件被占用/权限问题）
         try:
@@ -260,10 +272,18 @@ async def _send_file(api, ctx, container_path: str, name: str):
     def _is_rich_fail(s: str) -> bool:
         return "rich media transfer failed" in (s or "").lower()
 
+    def _is_missing_file_fail(s: str) -> bool:
+        s2 = (s or "").lower()
+        return ("enoent" in s2) or ("no such file or directory" in s2)
+
+    def _is_retryable_fail(s: str) -> bool:
+        # ENOENT 在 Windows+Docker 挂载同步延迟时很常见，重试通常可恢复。
+        return _is_rich_fail(s) or _is_missing_file_fail(s)
+
     async def _retry(loop_fn, first_detail: str) -> tuple[Optional[bool], str]:
-        """仅在 rich media transfer failed 时按 SEND_RETRY_DELAYS 重试。"""
+        """仅在可重试错误时按 SEND_RETRY_DELAYS 重试。"""
         d = first_detail
-        if not _is_rich_fail(d):
+        if not _is_retryable_fail(d):
             return False, d
         for delay in (SEND_RETRY_DELAYS or []):
             await asyncio.sleep(float(delay))
@@ -274,7 +294,7 @@ async def _send_file(api, ctx, container_path: str, name: str):
             if _ok(resp):
                 return True, "（已自动重试后成功）"
             d = _detail(resp)
-            if not _is_rich_fail(d):
+            if not _is_retryable_fail(d):
                 break
         return False, d
 
@@ -287,14 +307,15 @@ async def _send_file(api, ctx, container_path: str, name: str):
         d = _detail(resp)
         return await _retry(lambda: api.upload_group_file(ctx.group_id, container_path, use_name), d)
 
-    async def _try_private_send(use_name: str, group_id: Optional[int] = None) -> tuple[Optional[bool], str]:
-        resp = await api.upload_private_file(ctx.user_id, container_path, use_name, group_id=group_id)
+    async def _try_private_send(use_name: str, group_id: Optional[int] = None, use_path: Optional[str] = None) -> tuple[Optional[bool], str]:
+        path = use_path or container_path
+        resp = await api.upload_private_file(ctx.user_id, path, use_name, group_id=group_id)
         if resp is None:
             return None, ""
         if _ok(resp):
             return True, ""
         d = _detail(resp)
-        return await _retry(lambda: api.upload_private_file(ctx.user_id, container_path, use_name, group_id=group_id), d)
+        return await _retry(lambda: api.upload_private_file(ctx.user_id, path, use_name, group_id=group_id), d)
 
     # 1) 群聊优先走群文件
     if ctx.scene == "group" and ctx.group_id is not None:
@@ -305,7 +326,10 @@ async def _send_file(api, ctx, container_path: str, name: str):
             return None, ""
 
         # 2) 群文件失败：尝试临时会话私聊兜底
-        sentp, detailp = await _try_private_send(name, group_id=ctx.group_id)
+        private_path = container_path
+        if _is_missing_file_fail(detail) and container_path.startswith(UPLOAD_GROUP_CONTAINER_DIR.rstrip("/") + "/"):
+            private_path = UPLOAD_PRIVATE_CONTAINER_DIR.rstrip("/") + "/" + Path(container_path).name
+        sentp, detailp = await _try_private_send(name, group_id=ctx.group_id, use_path=private_path)
         if sentp is True:
             return True, "（群文件发送失败，已改为私聊发送）" + (detailp or "")
         if sentp is None:

@@ -163,7 +163,7 @@ LARGE_FILE_WARN_MB = 50
 # 展示/搜索限制
 LS_LIMIT = 50
 FIND_LIMIT = 50
-FIND_MAX_SCAN = 3000   # 最多扫描多少个文件/目录项，避免卡死
+FIND_MAX_SCAN = 100000   # 最多扫描多少个文件/目录项，避免卡死
 
 # ===== 新增：/get 多文件默认打包 =====
 # /get 选择文件数 > 该阈值时，默认打包成一个 zip 发送
