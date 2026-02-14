@@ -64,6 +64,10 @@ class BotState:
     last_find_label: Dict[str, str] = field(default_factory=dict)   # conv_key -> keyword/task-name (for zip naming)
     # Handin: user_id -> queue of inbox files
     pending_handin_files: Dict[int, List[dict]] = field(default_factory=dict)
+    # Handin: user_id -> {"ts": float}（检测到多文件后，等待用户回复 done 再打包）
+    pending_handin_wait_done: Dict[int, dict] = field(default_factory=dict)
+    # Handin: user_id -> {"ts": float}（已 done，等待用户回复 zip 名称）
+    pending_handin_zip_name: Dict[int, dict] = field(default_factory=dict)
     # Handin: user_id -> {"mode": "submit"|"status"|"cancel", "task_ids":[...], "ts": float, "group_id": Optional[int]}
     pending_handin_choose: Dict[int, dict] = field(default_factory=dict)
     # Handin: user_id -> {"task_id": str, "path": str, "name": str, "ts": float}
@@ -188,6 +192,56 @@ def _zip_directory(src_dir: Path, out_zip: Path) -> Tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, str(e)
+
+
+def _zip_pending_files(items: List[dict], out_zip: Path) -> Tuple[bool, str, int, int]:
+    """把待提交队列里的多个文件打成一个 zip。
+
+    返回：(ok, msg, packed_count, missing_count)
+    """
+    try:
+        out_zip.parent.mkdir(parents=True, exist_ok=True)
+        packed = 0
+        missing = 0
+        name_count: Dict[str, int] = {}
+        with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for idx, it in enumerate(items, 1):
+                p = Path(str(it.get("path") or ""))
+                if (not p.exists()) or (not p.is_file()):
+                    missing += 1
+                    continue
+                arc0 = (str(it.get("name") or "").strip() or p.name or f"file_{idx}")
+                arc = arc0
+                name_count[arc0] = name_count.get(arc0, 0) + 1
+                if name_count[arc0] > 1:
+                    arc = f"{idx}_{arc0}"
+                zf.write(p, arcname=arc)
+                packed += 1
+        if packed <= 0:
+            try:
+                out_zip.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False, "打包失败：没有可用文件。", 0, missing
+        return True, "", packed, missing
+    except Exception as e:
+        return False, f"打包失败：{e}", 0, 0
+
+
+def _suggest_batch_zip_basename(items: List[dict], user_id: int) -> str:
+    """根据文件名推断一个默认 zip 基名（不含 .zip）。"""
+    nm = ""
+    sid = ""
+    for it in (items or []):
+        raw_name = str(it.get("name") or "").strip()
+        if (not nm) and raw_name:
+            nm = extract_name_from_filename(raw_name)
+        if (not sid) and raw_name:
+            sid = extract_student_id(raw_name)
+        if nm and sid:
+            break
+    base = f"{nm}-{sid}" if (nm and sid) else (sid or nm or f"handin_u{user_id}")
+    return _safe_zip_label(base, default=f"handin_u{user_id}")[:60].strip("._-") or f"handin_u{user_id}"
 
 
 def _stage_for_napcat(ctx, src: Path, display_name: Optional[str] = None) -> tuple[Optional[str], Optional[str], str]:
@@ -453,10 +507,30 @@ async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: B
     q.append({"path": str(p), "name": fname, "ts": time.time()})
     state.pending_handin_files[ctx.user_id] = q
 
-    # 若已有待选择状态，先让他处理上一份
+    # 已进入“等待 zip 名称”阶段时，新文件继续加入队列并保持等待命名
+    if state.pending_handin_zip_name.get(ctx.user_id):
+        await reply(
+            api,
+            ctx,
+            f"{msg}\n已加入打包队列，当前共 {len(q)} 个文件。\n请回复压缩包名称（无需 .zip）。",
+            logsvc,
+        )
+        return True
+
+    # 若已有待选择状态，且又收到了新文件：进入“等待 done 再批量打包”模式
     pend = state.pending_handin_choose.get(ctx.user_id)
     if pend and pend.get("mode") == "submit":
-        await reply(api, ctx, f"{msg}\n你还有待分配的提交文件，请先回复数字处理上一份（回复 0 取消上一份）。", logsvc)
+        if len(q) >= 2:
+            state.pending_handin_wait_done[ctx.user_id] = {"ts": time.time()}
+            state.pending_handin_zip_name.pop(ctx.user_id, None)
+            await reply(
+                api,
+                ctx,
+                f"{msg}\n检测到你在连续发送多个文件：当前共 {len(q)} 个。\n请把文件发完后回复 done，我会先询问压缩包名称，再打包并让你选择归档任务。",
+                logsvc,
+            )
+        else:
+            await reply(api, ctx, f"{msg}\n你还有待分配的提交文件，请先回复数字处理上一份（回复 0 取消上一份）。", logsvc)
         return True
 
     tasks = handin.list_active_tasks()
@@ -464,6 +538,9 @@ async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: B
         await reply(api, ctx, f"{msg}\n当前没有正在进行的提交任务。", logsvc)
         return True
 
+    # 新一轮提交流程，清掉旧的 done 等待状态
+    state.pending_handin_wait_done.pop(ctx.user_id, None)
+    state.pending_handin_zip_name.pop(ctx.user_id, None)
     lines = [msg, "检测到你发送了文件提交。", "请确保文件名包含【姓名】和【学号】。", _handin_tasks_list_text(tasks)]
     await reply(api, ctx, "\n".join(lines), logsvc)
 
@@ -490,6 +567,8 @@ async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogServic
     q = state.pending_handin_files.get(ctx.user_id) or []
     if not q:
         state.pending_handin_overwrite.pop(ctx.user_id, None)
+        state.pending_handin_wait_done.pop(ctx.user_id, None)
+        state.pending_handin_zip_name.pop(ctx.user_id, None)
         await reply(api, ctx, "没有待处理的提交文件了。", logsvc)
         return True
 
@@ -549,6 +628,9 @@ async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogServic
         if tasks:
             state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
             await reply(api, ctx, "你还有待分配的提交文件。\n" + _handin_tasks_list_text(tasks), logsvc)
+    else:
+        state.pending_handin_wait_done.pop(ctx.user_id, None)
+        state.pending_handin_zip_name.pop(ctx.user_id, None)
 
     return True
 
@@ -576,8 +658,27 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
 
         q = state.pending_handin_files.get(ctx.user_id) or []
         if not q:
+            state.pending_handin_wait_done.pop(ctx.user_id, None)
+            state.pending_handin_zip_name.pop(ctx.user_id, None)
             state.pending_handin_choose.pop(ctx.user_id, None)
             await reply(api, ctx, "没有待分配的文件了。", logsvc)
+            return True
+
+        # 多文件收集中：先等 done，再统一打包并选择任务
+        if state.pending_handin_wait_done.get(ctx.user_id):
+            if choice == 0:
+                for it in q:
+                    try:
+                        Path(str(it.get("path") or "")).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                state.pending_handin_files[ctx.user_id] = []
+                state.pending_handin_wait_done.pop(ctx.user_id, None)
+                state.pending_handin_zip_name.pop(ctx.user_id, None)
+                state.pending_handin_choose.pop(ctx.user_id, None)
+                await reply(api, ctx, "已取消并删除全部临时文件。", logsvc)
+            else:
+                await reply(api, ctx, "检测到你在批量发送文件，请先发完后回复 done（随后会先让你命名 zip；回复 0 可取消全部临时文件）。", logsvc)
             return True
 
         if choice == 0:
@@ -587,6 +688,8 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
                 Path(item["path"]).unlink(missing_ok=True)
             except Exception:
                 pass
+            state.pending_handin_wait_done.pop(ctx.user_id, None)
+            state.pending_handin_zip_name.pop(ctx.user_id, None)
             state.pending_handin_choose.pop(ctx.user_id, None)
             await reply(api, ctx, "已取消并删除临时文件。", logsvc)
             return True
@@ -637,6 +740,8 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
             state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
             await reply(api, ctx, f"你还有 {len(q)} 份待分配文件。\n" + _handin_tasks_list_text(tasks), logsvc)
         else:
+            state.pending_handin_wait_done.pop(ctx.user_id, None)
+            state.pending_handin_zip_name.pop(ctx.user_id, None)
             state.pending_handin_choose.pop(ctx.user_id, None)
         return True
 
@@ -884,6 +989,12 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
         handled = await _handle_private_overwrite_yesno(api, ctx, text, logsvc, state, handin)
         if handled:
             return
+        handled = await _handle_private_done_batch(api, ctx, text, logsvc, state, handin)
+        if handled:
+            return
+        handled = await _handle_private_zip_name_input(api, ctx, text, logsvc, state, handin)
+        if handled:
+            return
         handled = await _handle_private_number_choice(api, ctx, text, logsvc, state, handin, filesvc)
         if handled:
             return
@@ -939,7 +1050,7 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
             "/handincheck  （查看你创建的任务已提交文件，可配合 /get）\n"
             "/handinget  （打包你创建任务的已提交文件为 zip 并发送）\n"
             "/chandin  （取消提交任务，列出任务后回复数字）\n"
-            "（私聊发送文件后按提示选择任务）\n"
+            "（私聊发送文件后按提示选择任务；若连续发多个文件，发完回复 done 后会先让你命名 zip，再打包并让你选任务）\n"
         )
         await reply(api, ctx, msg, logsvc)
         return
@@ -1408,3 +1519,142 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
 
     # 未知命令
     await reply(api, ctx, f"未知命令：/{cmd}（用 /help 查看）", logsvc)
+async def _handle_private_done_batch(api, ctx, text: str, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
+    """处理私聊批量文件的 done 指令：进入“等待 zip 命名”阶段。"""
+    t = (text or "").strip()
+    if not re.fullmatch(r"(?i)/?done", t):
+        return False
+    if not state.pending_handin_wait_done.get(ctx.user_id):
+        return False
+
+    logsvc.log_in(ctx, t)
+
+    if state.pending_handin_overwrite.get(ctx.user_id):
+        await reply(api, ctx, "你有一个待确认的覆盖操作，请先回复 Y/N。", logsvc)
+        return True
+
+    q = state.pending_handin_files.get(ctx.user_id) or []
+    if not q:
+        state.pending_handin_wait_done.pop(ctx.user_id, None)
+        state.pending_handin_zip_name.pop(ctx.user_id, None)
+        state.pending_handin_choose.pop(ctx.user_id, None)
+        await reply(api, ctx, "没有待处理的提交文件了。", logsvc)
+        return True
+
+    # 仅 1 个文件时无需打包，直接回到任务选择
+    if len(q) == 1:
+        state.pending_handin_wait_done.pop(ctx.user_id, None)
+        state.pending_handin_zip_name.pop(ctx.user_id, None)
+        tasks = handin.list_active_tasks()
+        if not tasks:
+            state.pending_handin_choose.pop(ctx.user_id, None)
+            await reply(api, ctx, "当前没有正在进行的提交任务。", logsvc)
+            return True
+        state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
+        await reply(api, ctx, "当前仅有 1 个文件，无需打包。\n" + _handin_tasks_list_text(tasks), logsvc)
+        return True
+
+    # 多文件：先询问 zip 名称
+    suggested = _suggest_batch_zip_basename(q, ctx.user_id)
+    state.pending_handin_wait_done.pop(ctx.user_id, None)
+    state.pending_handin_zip_name[ctx.user_id] = {"ts": time.time(), "suggested": suggested}
+    await reply(
+        api,
+        ctx,
+        f"请回复压缩包名称（无需 .zip）。\n例如：{suggested}\n我会用你的回复作为 zip 名，再让你选择归档任务。",
+        logsvc,
+    )
+    return True
+
+
+async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
+    """处理私聊批量文件打包命名输入。"""
+    pend = state.pending_handin_zip_name.get(ctx.user_id)
+    if not pend:
+        return False
+
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    logsvc.log_in(ctx, t)
+
+    if state.pending_handin_overwrite.get(ctx.user_id):
+        await reply(api, ctx, "你有一个待确认的覆盖操作，请先回复 Y/N。", logsvc)
+        return True
+
+    if t in ("0", "取消", "/cancel", "／cancel"):
+        q_cancel = state.pending_handin_files.get(ctx.user_id) or []
+        for it in q_cancel:
+            try:
+                Path(str(it.get("path") or "")).unlink(missing_ok=True)
+            except Exception:
+                pass
+        state.pending_handin_files[ctx.user_id] = []
+        state.pending_handin_wait_done.pop(ctx.user_id, None)
+        state.pending_handin_zip_name.pop(ctx.user_id, None)
+        state.pending_handin_choose.pop(ctx.user_id, None)
+        await reply(api, ctx, "已取消并删除全部临时文件。", logsvc)
+        return True
+
+    q = state.pending_handin_files.get(ctx.user_id) or []
+    if not q:
+        state.pending_handin_wait_done.pop(ctx.user_id, None)
+        state.pending_handin_zip_name.pop(ctx.user_id, None)
+        state.pending_handin_choose.pop(ctx.user_id, None)
+        await reply(api, ctx, "没有待处理的提交文件了。", logsvc)
+        return True
+
+    raw_name = t.lstrip("/／").strip()
+    if raw_name.lower().endswith(".zip"):
+        raw_name = raw_name[:-4].strip()
+    default_name = str(pend.get("suggested") or _suggest_batch_zip_basename(q, ctx.user_id))
+    base = _safe_zip_label(raw_name, default=default_name)
+    if not base:
+        base = default_name
+
+    out_dir = DATA_DIR / "temp" / "handin_batch"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_zip = out_dir / f"{base}.zip"
+    if out_zip.exists():
+        i = 2
+        while i < 1000:
+            p2 = out_dir / f"{base}_{i}.zip"
+            if not p2.exists():
+                out_zip = p2
+                break
+            i += 1
+
+    ok_zip, msg_zip, packed, missing = _zip_pending_files(q, out_zip)
+    if not ok_zip:
+        await reply(api, ctx, msg_zip, logsvc)
+        return True
+
+    # 打包成功后删除原临时文件，仅保留 zip
+    for it in q:
+        try:
+            Path(str(it.get("path") or "")).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    state.pending_handin_files[ctx.user_id] = [{
+        "path": str(out_zip),
+        "name": out_zip.name,
+        "ts": time.time(),
+    }]
+    state.pending_handin_wait_done.pop(ctx.user_id, None)
+    state.pending_handin_zip_name.pop(ctx.user_id, None)
+
+    tasks = handin.list_active_tasks()
+    if not tasks:
+        state.pending_handin_choose.pop(ctx.user_id, None)
+        await reply(api, ctx, f"已将 {packed} 个文件打包为：{out_zip.name}\n当前没有正在进行的提交任务。", logsvc)
+        return True
+
+    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
+    lines = [f"已将 {packed} 个文件打包为：{out_zip.name}。"]
+    if missing > 0:
+        lines.append(f"另有 {missing} 个文件未找到，已跳过。")
+    lines.append(_handin_tasks_list_text(tasks))
+    await reply(api, ctx, "\n".join(lines), logsvc)
+    return True
