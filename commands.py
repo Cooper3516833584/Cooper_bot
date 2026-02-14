@@ -31,6 +31,129 @@ from config import (
 
 
 LARGE_FILE_WARN_BYTES = int(LARGE_FILE_WARN_MB) * 1024 * 1024
+ANSWER_FILE_PATH = Path(__file__).resolve().parent / "answer.txt"
+_ANSWER_CACHE_MTIME: Optional[float] = None
+_ANSWER_CACHE: Dict[str, List[str]] = {}
+
+
+def _normalize_answer_q(s: str) -> str:
+    # 触发词匹配：忽略首尾空白、大小写，内部连续空白视为一个空格
+    return re.sub(r"\s+", " ", (s or "").strip()).casefold()
+
+
+def _finalize_answer_block(questions: List[str], replies: List[str], table: Dict[str, List[str]]) -> None:
+    if not questions or not replies:
+        return
+    rs = [x for x in replies if (x or "").strip()]
+    if not rs:
+        return
+    for q in questions:
+        k = _normalize_answer_q(q)
+        if k:
+            table[k] = list(rs)
+
+
+def _parse_answer_txt(content: str) -> Dict[str, List[str]]:
+    """解析 answer.txt：
+    - q: 触发词（可写多条，作为同义词）
+    - a: 单行回复（可写多条，逐条发送）
+    - a:| 多行回复（后续缩进行）
+    """
+    lines = content.splitlines()
+    table: Dict[str, List[str]] = {}
+    questions: List[str] = []
+    replies: List[str] = []
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+
+        # 空行：结束当前 block
+        if not stripped:
+            _finalize_answer_block(questions, replies, table)
+            questions, replies = [], []
+            i += 1
+            continue
+
+        # 注释行
+        if stripped.startswith("#"):
+            i += 1
+            continue
+
+        low = stripped.lower()
+        if low.startswith("q:"):
+            # 若当前 block 已有回复，则新 q 代表新 block
+            if questions and replies:
+                _finalize_answer_block(questions, replies, table)
+                questions, replies = [], []
+            q = stripped[2:].strip()
+            if q:
+                questions.append(q)
+            i += 1
+            continue
+
+        if low.startswith("a:"):
+            body = stripped[2:].lstrip()
+            # 多行回复：a:| + 后续缩进行
+            if body == "|":
+                i += 1
+                block_lines: List[str] = []
+                while i < len(lines):
+                    ln = lines[i]
+                    if ln.startswith("  "):
+                        block_lines.append(ln[2:])
+                        i += 1
+                        continue
+                    if ln.startswith("\t"):
+                        block_lines.append(ln[1:])
+                        i += 1
+                        continue
+                    break
+                replies.append("\n".join(block_lines).rstrip("\n"))
+                continue
+
+            # 单行回复支持 \n 转义
+            replies.append(body.replace("\\n", "\n"))
+            i += 1
+            continue
+
+        # 兼容：若写成了缩进行，接到上一条回复后面
+        if replies and (raw.startswith("  ") or raw.startswith("\t")):
+            add = raw[2:] if raw.startswith("  ") else raw[1:]
+            replies[-1] = replies[-1] + "\n" + add
+            i += 1
+            continue
+
+        i += 1
+
+    _finalize_answer_block(questions, replies, table)
+    return table
+
+
+def _reload_answer_cache_if_needed() -> None:
+    global _ANSWER_CACHE_MTIME, _ANSWER_CACHE
+    try:
+        mtime = float(ANSWER_FILE_PATH.stat().st_mtime)
+    except Exception:
+        _ANSWER_CACHE = {}
+        _ANSWER_CACHE_MTIME = None
+        return
+
+    if _ANSWER_CACHE_MTIME is not None and abs(_ANSWER_CACHE_MTIME - mtime) < 1e-6:
+        return
+
+    try:
+        txt = ANSWER_FILE_PATH.read_text(encoding="utf-8")
+        _ANSWER_CACHE = _parse_answer_txt(txt)
+    except Exception:
+        _ANSWER_CACHE = {}
+    _ANSWER_CACHE_MTIME = mtime
+
+
+def _lookup_fixed_answers(text: str) -> List[str]:
+    _reload_answer_cache_if_needed()
+    return list(_ANSWER_CACHE.get(_normalize_answer_q(text), []))
 
 
 def _fmt_mb(n_bytes: int) -> str:
@@ -1011,14 +1134,14 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
     # 记录 IN（只有最终 log_out 才会落盘）
     logsvc.log_in(ctx, t)
 
-    # 兼容 "hello"
-    if t.lower() == "hello":
-        await reply(api, ctx, "hello world", logsvc)
-        return
-
     if not (t.startswith("/") or t.startswith("／")):
         handled = await _handle_find_folder_number_choice(api, ctx, t, logsvc, state)
         if handled:
+            return
+        fixed_answers = _lookup_fixed_answers(t)
+        if fixed_answers:
+            for msg in fixed_answers:
+                await reply(api, ctx, msg, logsvc)
             return
         return
 
