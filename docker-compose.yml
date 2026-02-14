@@ -1,0 +1,27 @@
+version: "3"
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+
+    # 账号等敏感信息放在 secrets.env
+    env_file:
+      - ./secrets.env
+
+    ports:
+      - "3001:3001"   # WebSocket
+      - "6099:6099"   # WebUI
+      - "3010:3010"   # 你在 WebUI 里配置的 HTTP Server 端口（如果你就是用 3010）
+      - "3000:3000"   # 官方默认 HTTP 端口（留着不冲突，防止你哪天改回默认）
+
+    volumes:
+      # 资料库挂载（让 upload_* 能直接读到你的 data/ 里选中的文件）
+      - "./data:/bot_data"
+      # 你的“上传目录”挂载（给 upload_group_file / upload_private_file 用）
+      - "./upload_group_file:/data/upload_group_file"
+      - "./upload_private_file:/data/upload_private_file"
+
+      # 强烈建议：持久化 QQ 数据和 NapCat 配置，否则你一 recreate 容器配置就丢
+      - "./napcat_qq:/app/.config/QQ"
+      - "./napcat_config:/app/napcat/config"

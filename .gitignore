@@ -1,0 +1,23 @@
+# secrets
+secrets.env
+*.env
+
+# runtime folders (不上传这些目录)
+__pycache__/
+data/
+logs/
+napcat_config/
+napcat_qq/
+upload_group_file/
+upload_private_file/
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# python cache
+*.pyc
+*.pyo
+*.pyd
