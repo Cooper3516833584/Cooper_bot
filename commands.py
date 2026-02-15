@@ -27,6 +27,9 @@ from config import (
     AUTO_ZIP_FALLBACK,
     LARGE_FILE_WARN_MB,
     GET_ZIP_THRESHOLD,
+    LS_LIMIT,
+    FIND_DIR_LIMIT,
+    FIND_FILE_LIMIT,
 )
 
 
@@ -1038,7 +1041,7 @@ async def _handle_cancel_number_choice(api, ctx, text: str, logsvc: LogService, 
 
 
 async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogService, state: BotState) -> bool:
-    """处理 /find 结果的“直接回复序号查看目录内容”。"""
+    """处理 /find 结果的“直接回复序号查看目录内容（仅下一级）”。"""
     t = (text or "").strip()
     if not re.fullmatch(r"\d{1,3}", t):
         return False
@@ -1053,41 +1056,54 @@ async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogServ
         return False
 
     p = hits[idx - 1]
-    if (not p.exists()) or (not p.is_dir()):
+    if not p.exists():
+        await reply(api, ctx, "该条目已不存在，请重新 /find。", logsvc)
+        return True
+
+    if p.is_file():
+        await reply(api, ctx, f"「{p.name}」是文件，请用 /get {idx} 获取。", logsvc)
+        return True
+
+    if not p.is_dir():
         return False
 
-    logsvc.log_in(ctx, t)
+    try:
+        entries = list(p.iterdir())
+    except Exception as e:
+        await reply(api, ctx, f"读取目录失败：{e}", logsvc)
+        return True
 
-    files = [x for x in p.rglob("*") if x.is_file()]
-    files.sort(key=lambda x: x.relative_to(p).as_posix().lower())
-    if not files:
+    entries.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
+    has_more = len(entries) > int(LS_LIMIT)
+    entries = entries[: int(LS_LIMIT)]
+
+    # 下钻后刷新 /get 的候选列表，支持继续按数字进入下一层目录。
+    state.last_find[k] = entries
+    state.last_find_label[k] = p.name
+
+    if not entries:
         await reply(api, ctx, f"📁 {p.name}/ 目录为空。", logsvc)
         return True
 
-    lines = [f"📁 {p.name}/ 内文件列表（共 {len(files)} 个）："]
-    for i, fp in enumerate(files, 1):
-        rel = fp.relative_to(p).as_posix()
-        lines.append(f"{i}. {rel}")
+    lines = [f"📁 {p.name}/ 下一级目录与文件："]
+    for i, child in enumerate(entries, 1):
+        if child.is_dir():
+            lines.append(f"{i}. 📁 {child.name}/")
+            continue
+        suffix = ""
+        try:
+            sz = int(child.stat().st_size)
+            if _is_large(sz):
+                suffix = f" （{_fmt_mb(sz)}，大文件）"
+        except Exception:
+            pass
+        lines.append(f"{i}. 📄 {child.name}{suffix}")
 
-    max_chars = 2600
-    max_lines = 120
-    chunks: List[str] = []
-    cur: List[str] = []
-    cur_len = 0
-    for line in lines:
-        add_len = len(line) + (1 if cur else 0)
-        if cur and (cur_len + add_len > max_chars or len(cur) >= max_lines):
-            chunks.append("\n".join(cur))
-            cur = [line]
-            cur_len = len(line)
-        else:
-            cur.append(line)
-            cur_len += add_len
-    if cur:
-        chunks.append("\n".join(cur))
-
-    for msg in chunks:
-        await reply(api, ctx, msg, logsvc)
+    if has_more:
+        lines.append(f"（当前目录项较多，仅显示前 {LS_LIMIT} 项）")
+    lines.append("继续直接回复序号可进入下级目录；选择文件请用 /get 序号。")
+    lines.append("也可用 /get 序号 [序号...] 获取当前列表中的文件/文件夹。")
+    await reply(api, ctx, "\n".join(lines), logsvc)
     return True
 
 
@@ -1407,22 +1423,36 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
             await reply(api, ctx, "没找到匹配文件或文件夹。", logsvc)
             return
 
-        lines = ["搜索结果："]
+        dir_lines: List[str] = []
+        file_lines: List[str] = []
+        has_large = False
         for i, p in enumerate(hits, 1):
             if p.is_dir():
-                lines.append(f"{i}. 📁 {p.name}/")
+                dir_lines.append(f"{i}. 📁 {p.name}/")
                 continue
             suffix = ""
             try:
                 sz = int(p.stat().st_size)
                 if _is_large(sz):
                     suffix = f" （{_fmt_mb(sz)}，大文件）"
+                    has_large = True
             except Exception:
                 pass
-            lines.append(f"{i}. 📄 {p.name}{suffix}")
+            file_lines.append(f"{i}. 📄 {p.name}{suffix}")
+        lines = ["搜索结果："]
+        lines.append(f"📁 文件夹命中（最多 {FIND_DIR_LIMIT} 条）：")
+        if dir_lines:
+            lines.extend(dir_lines)
+        else:
+            lines.append("（无）")
+        lines.append(f"📄 文件命中（最多 {FIND_FILE_LIMIT} 条）：")
+        if file_lines:
+            lines.extend(file_lines)
+        else:
+            lines.append("（无）")
         lines.append("用 /get 序号 [序号...] 获取文件；文件夹会先打包成 zip。")
-        lines.append("若要查看某个文件夹里的文件，可直接回复该序号。")
-        if any(_is_large((p.stat().st_size if p.exists() and p.is_file() else None)) for p in hits[: min(len(hits), 50)]):
+        lines.append("直接回复序号可进入目录并继续按数字下钻。")
+        if has_large:
             lines.append("（提示：标记“大文件”的条目发送可能较慢，请耐心等待。）")
         await reply(api, ctx, "\n".join(lines), logsvc)
         return

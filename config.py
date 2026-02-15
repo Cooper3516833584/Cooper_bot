@@ -162,7 +162,9 @@ LARGE_FILE_WARN_MB = 50
 
 # 展示/搜索限制
 LS_LIMIT = 50
-FIND_LIMIT = 50
+FIND_DIR_LIMIT = 50
+FIND_FILE_LIMIT = 50
+FIND_LIMIT = max(FIND_DIR_LIMIT, FIND_FILE_LIMIT)  # 兼容旧代码
 FIND_MAX_SCAN = 100000   # 最多扫描多少个文件/目录项，避免卡死
 
 # ===== 新增：/get 多文件默认打包 =====

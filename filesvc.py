@@ -12,7 +12,8 @@ from config import (
     UPLOAD_GROUP_HOST_DIR,
     UPLOAD_PRIVATE_HOST_DIR,
     LS_LIMIT,
-    FIND_LIMIT,
+    FIND_DIR_LIMIT,
+    FIND_FILE_LIMIT,
     FIND_MAX_SCAN,
     DATA_DIR,
     DATA_DIR_CONTAINER,
@@ -139,7 +140,8 @@ class FileService:
 
         search_bases = base_filters if base_filters else [r.path for r in roots]
 
-        hits: List[Path] = []
+        dir_hits: List[Path] = []
+        file_hits: List[Path] = []
         seen = set()  # 去重：避免 admin 同时扫描 groups/ 与 group/ 时重复命中
         scanned = 0
         kw_low = keyword.lower()
@@ -152,7 +154,9 @@ class FileService:
                 for dn in dirs:
                     scanned += 1
                     if scanned > FIND_MAX_SCAN:
-                        return hits[:FIND_LIMIT]
+                        return dir_hits[:FIND_DIR_LIMIT] + file_hits[:FIND_FILE_LIMIT]
+                    if len(dir_hits) >= FIND_DIR_LIMIT:
+                        continue
                     if kw_low in dn.lower():
                         p = Path(root) / dn
                         try:
@@ -162,14 +166,16 @@ class FileService:
                         if key in seen:
                             continue
                         seen.add(key)
-                        hits.append(p)
-                        if len(hits) >= FIND_LIMIT:
-                            return hits
+                        dir_hits.append(p)
+                        if len(dir_hits) >= FIND_DIR_LIMIT and len(file_hits) >= FIND_FILE_LIMIT:
+                            return dir_hits + file_hits
 
                 for fn in files:
                     scanned += 1
                     if scanned > FIND_MAX_SCAN:
-                        return hits[:FIND_LIMIT]
+                        return dir_hits[:FIND_DIR_LIMIT] + file_hits[:FIND_FILE_LIMIT]
+                    if len(file_hits) >= FIND_FILE_LIMIT:
+                        continue
                     if kw_low in fn.lower():
                         p = Path(root) / fn
                         try:
@@ -179,10 +185,10 @@ class FileService:
                         if key in seen:
                             continue
                         seen.add(key)
-                        hits.append(p)
-                        if len(hits) >= FIND_LIMIT:
-                            return hits
-        return hits
+                        file_hits.append(p)
+                        if len(dir_hits) >= FIND_DIR_LIMIT and len(file_hits) >= FIND_FILE_LIMIT:
+                            return dir_hits + file_hits
+        return dir_hits + file_hits
 
     def display_rel(self, p: Path) -> str:
         """展示用：尽量显示相对 data/ 的路径（POSIX 风格）。"""

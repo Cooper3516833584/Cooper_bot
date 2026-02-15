@@ -169,7 +169,7 @@ class OneBotAPI:
             params["folder"] = str(folder)
         # 上传可能更久一些，但这里不硬等太久：
         # - 超时则返回 None，由上层标记“未确认”避免误报失败
-        return await self.call("upload_group_file", params, timeout=30.0)
+        return await self.call("upload_group_file", params, timeout=300.0)
 
     async def upload_private_file(self, user_id: int, file: str, name: str, group_id: Optional[int] = None):
         """私聊发文件。file 必须是 NapCat 容器内可访问的本地路径。
