@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -49,6 +50,18 @@ class OneBotAPI:
         if now - last >= interval:
             self._last_warn[key] = now
             self.log.warning(msg)
+
+    def _is_timeout_like(self, e: Exception) -> bool:
+        if isinstance(e, (TimeoutError, socket.timeout)):
+            return True
+        if isinstance(e, urllib.error.URLError):
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                return True
+            if reason and ("timed out" in str(reason).lower() or "timeout" in str(reason).lower()):
+                return True
+        s = str(e).lower()
+        return ("timed out" in s) or ("timeout" in s)
 
 
     def _file_uri(self, path: str) -> str:
@@ -130,6 +143,10 @@ class OneBotAPI:
         try:
             return await asyncio.to_thread(_do_request)
         except Exception as e:
+            # 某些 NapCat 部署下，上传 action 可能“已执行但 HTTP 长时间不回包”。
+            # 这类超时按“未确认”处理，避免误导性 warning 刷屏。
+            if action in ("upload_group_file", "upload_private_file") and self._is_timeout_like(e):
+                return None
             # 不要刷屏：同一 action 10 秒内只提示一次
             self._warn_throttle(action, f"OneBot call 超时/失败（HTTP）：{action}: {e}")
             return None
@@ -179,7 +196,7 @@ class OneBotAPI:
         params = {"user_id": int(user_id), "file": self._file_uri(file), "name": str(name)}
         if group_id is not None:
             params["group_id"] = int(group_id)
-        return await self.call("upload_private_file", params, timeout=30.0)
+        return await self.call("upload_private_file", params, timeout=300.0)
 
 
 
