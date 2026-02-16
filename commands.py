@@ -17,6 +17,7 @@ from logsvc import LogService
 from handinsvc import HandinService, parse_mmdd_hhmm, pretty_ts, extract_name_from_filename, extract_student_id
 from router import get_files
 from config import (
+    ADMIN_USERS,
     DATA_DIR,
     UPLOAD_GROUP_HOST_DIR,
     UPLOAD_PRIVATE_HOST_DIR,
@@ -1174,23 +1175,77 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
         await reply(api, ctx, f"scene={ctx.scene}, user={ctx.nickname}-{ctx.user_id}, group={g}, level={ctx.level}", logsvc)
         return
 
+    if cmd == "level":
+        if ctx.level < 3:
+            await reply(api, ctx, "权限不足：/level 仅管理员可用。", logsvc)
+            return
+        if perm is None:
+            await reply(api, ctx, "权限服务不可用：当前无法设置等级。", logsvc)
+            return
+
+        parts = rest.split()
+        if len(parts) != 2:
+            await reply(api, ctx, "用法：/level QQ号 等级\n例如：/level 123456789 2", logsvc)
+            return
+
+        uid_raw = parts[0].translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+        lv_raw = parts[1].translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+        try:
+            target_uid = int(uid_raw)
+            target_lv = int(lv_raw)
+        except Exception:
+            await reply(api, ctx, "参数格式不对：QQ号和等级都要是数字。", logsvc)
+            return
+
+        if target_uid <= 0:
+            await reply(api, ctx, "参数不对：QQ号必须是正整数。", logsvc)
+            return
+        if target_lv < 0 or target_lv > 3:
+            await reply(api, ctx, "参数不对：等级只能是 0~3。", logsvc)
+            return
+
+        perm.set_level(target_uid, target_lv)
+        stored = perm.get_level(target_uid)
+        effective = 3 if target_uid in ADMIN_USERS else stored
+
+        if target_uid in ADMIN_USERS and stored != 3:
+            await reply(
+                api,
+                ctx,
+                f"已将 {target_uid} 的存档等级设为 {stored}，但该账号在 ADMIN_USERS 中，实际生效等级仍为 3。",
+                logsvc,
+            )
+            return
+
+        await reply(api, ctx, f"已设置 {target_uid} 的等级为 {stored}（生效等级 {effective}）。", logsvc)
+        return
+
     if cmd in ("help", "h"):
-        msg = (
-            "可用命令：\n"
-            "/ping\n"
-            "/whoami\n"
-            "/ls [root/子目录]\n"
-            "/find 关键词 [可选: root/子目录]\n"
-            "/get 序号 [序号...]   （支持文件/文件夹；文件夹会先打包为 zip）\n"
-            "\n"
-            "提交功能：\n"
-            "/handin 任务名 [提醒时间...] 截止时间  （仅群聊）\n"
-            "/handinstatus  （列出任务并查询未交名单）\n"
-            "/handincheck  （查看你创建的任务已提交文件，可配合 /get）\n"
-            "/handinget  （打包你创建任务的已提交文件为 zip 并发送）\n"
-            "/chandin  （取消提交任务，列出任务后回复数字）\n"
-            "（私聊发送文件后按提示选择任务；若连续发多个文件，发完回复 done 后会先让你命名 zip，再打包并让你选任务）\n"
-        )
+        lines = [
+            "可用命令：",
+            "/ping",
+            "/whoami",
+        ]
+        if ctx.level >= 3:
+            lines.append("/level QQ号 等级")
+        if ctx.level >= 1:
+            lines.extend([
+                "/ls [root/子目录]",
+                "/find 关键词 [可选: root/子目录]",
+                "/get 序号 [序号...]   （支持文件/文件夹；文件夹会先打包为 zip）",
+            ])
+        if ctx.level >= 2:
+            lines.extend([
+                "",
+                "提交功能：",
+                "/handin 任务名 [提醒时间...] 截止时间  （仅群聊）",
+                "/handinstatus  （列出任务并查询未交名单）",
+                "/handincheck  （查看你创建的任务已提交文件，可配合 /get）",
+                "/handinget  （打包你创建任务的已提交文件为 zip 并发送）",
+                "/chandin  （取消提交任务，列出任务后回复数字）",
+                "（私聊发送文件后按提示选择任务；若连续发多个文件，发完回复 done 后会先让你命名 zip，再打包并让你选任务）",
+            ])
+        msg = "\n".join(lines)
         await reply(api, ctx, msg, logsvc)
         return
 
