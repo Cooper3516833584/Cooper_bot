@@ -181,6 +181,16 @@ class OneBotAPI:
             timeout=6.0,
         )
 
+    async def set_friend_add_request(self, flag: str, approve: bool = True, remark: str = ""):
+        """处理加好友请求（自动同意/拒绝）。
+
+        flag 来自上报的 request 事件。
+        """
+        params = {"flag": str(flag), "approve": bool(approve)}
+        if approve and remark:
+            params["remark"] = str(remark)
+        return await self.call("set_friend_add_request", params, timeout=6.0)
+
     async def upload_group_file(self, group_id: int, file: str, name: str, folder: Optional[str] = None):
         """上传群文件。file 必须是 NapCat 容器内可访问的本地路径。"""
         params = {"group_id": int(group_id), "file": self._file_uri(file), "name": str(name)}

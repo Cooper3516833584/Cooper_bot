@@ -5,7 +5,15 @@ import websockets
 from typing import Dict, Set
 
 from logger import Logger
-from config import WS_URI, HTTP_BASE, HTTP_TOKEN, LOG_DIR, PERM_DB_PATH
+from config import (
+    WS_URI,
+    HTTP_BASE,
+    HTTP_TOKEN,
+    LOG_DIR,
+    PERM_DB_PATH,
+    AUTO_APPROVE_FRIEND_REQUEST,
+    AUTO_APPROVE_FRIEND_REMARK,
+)
 from router import build_ctx, get_text
 from onebot import OneBotAPI
 from filesvc import FileService
@@ -64,6 +72,25 @@ async def run_forever():
                 try:
                     async for message in ws:
                         data = json.loads(message)
+
+                        # ===== 自动通过好友申请（post_type=request）=====
+                        if data.get("post_type") == "request" and data.get("request_type") == "friend":
+                            if AUTO_APPROVE_FRIEND_REQUEST:
+                                flag = data.get("flag")
+                                req_uid = int(data.get("user_id") or 0)
+                                comment = str(data.get("comment") or "").strip()
+                                if flag:
+                                    log.info(f"收到好友申请：user_id={req_uid} comment={comment!r} -> 自动通过")
+                                    asyncio.create_task(
+                                        api.set_friend_add_request(
+                                            flag=str(flag),
+                                            approve=True,
+                                            remark=AUTO_APPROVE_FRIEND_REMARK,
+                                        )
+                                    )
+                                else:
+                                    log.warning(f"收到好友申请但缺少 flag：{data}")
+                            continue
 
                         # action 回包
                         if "echo" in data:

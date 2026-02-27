@@ -42,6 +42,17 @@ def _get_env(name: str, default: str = "") -> str:
     v = str(v).strip()
     return v if v else default
 
+def _get_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(default)
+
 def _get_env_path(name: str, default: Path) -> Path:
     raw = _get_env(name, "")
     if not raw:
@@ -77,6 +88,11 @@ HTTP_BASE = f"http://127.0.0.1:{HTTP_PORT}"
 
 # 如果 NapCat 的 HTTP Server 也配置了 access_token，这里会自动带上（同时放在 query + Authorization）
 HTTP_TOKEN = _get_env("HTTP_TOKEN", TOKEN)
+
+# 自动通过好友申请（OneBot request_type=friend）
+AUTO_APPROVE_FRIEND_REQUEST = _get_env_bool("AUTO_APPROVE_FRIEND_REQUEST", True)
+# 通过后自动设置好友备注（可选；为空则不设置）
+AUTO_APPROVE_FRIEND_REMARK = _get_env("AUTO_APPROVE_FRIEND_REMARK", "")
 
 # 会话多久没说话就切一份日志
 IDLE_SPLIT_SECONDS = 1800
@@ -161,9 +177,9 @@ AUTO_ZIP_FALLBACK = True
 LARGE_FILE_WARN_MB = 50
 
 # 展示/搜索限制
-LS_LIMIT = 50
-FIND_DIR_LIMIT = 50
-FIND_FILE_LIMIT = 50
+LS_LIMIT = 100
+FIND_DIR_LIMIT = 100
+FIND_FILE_LIMIT = 100
 FIND_LIMIT = max(FIND_DIR_LIMIT, FIND_FILE_LIMIT)  # 兼容旧代码
 FIND_MAX_SCAN = 100000   # 最多扫描多少个文件/目录项，避免卡死
 
