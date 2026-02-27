@@ -1,7 +1,7 @@
 # permsvc.py
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 class PermService:
     """简单权限库：记录 user_id -> level。
@@ -55,3 +55,17 @@ class PermService:
     def touch_group_speaker(self, user_id: int):
         """群里出现过发言，就至少 level=1。"""
         self.bump_min(user_id, 1)
+
+    def list_users(self, min_level: int = 0) -> List[Tuple[int, int]]:
+        out: List[Tuple[int, int]] = []
+        threshold = int(min_level)
+        for uid_raw, lv_raw in self._data.items():
+            try:
+                uid = int(uid_raw)
+                lv = int(lv_raw)
+            except Exception:
+                continue
+            if lv >= threshold:
+                out.append((uid, lv))
+        out.sort(key=lambda x: (-x[1], x[0]))
+        return out

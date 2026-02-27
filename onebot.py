@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 class OneBotAPI:
@@ -43,6 +43,8 @@ class OneBotAPI:
 
         # 群名缓存：group_id -> (name, ts)
         self._group_name_cache: Dict[int, tuple[str, float]] = {}
+        # 用户昵称缓存：user_id -> (nickname, ts)
+        self._user_name_cache: Dict[int, Tuple[str, float]] = {}
 
     def _warn_throttle(self, key: str, msg: str, interval: float = 10.0):
         now = time.time()
@@ -221,6 +223,35 @@ class OneBotAPI:
             {"group_id": int(group_id), "no_cache": bool(no_cache)},
             timeout=6.0,
         )
+
+    async def get_stranger_info(self, user_id: int, no_cache: bool = True):
+        return await self.call(
+            "get_stranger_info",
+            {"user_id": int(user_id), "no_cache": bool(no_cache)},
+            timeout=6.0,
+        )
+
+    async def get_user_nickname(self, user_id: int, ttl_seconds: float = 6 * 3600) -> str:
+        uid = int(user_id)
+        now = time.time()
+        cached = self._user_name_cache.get(uid)
+        if cached:
+            name, ts = cached
+            if now - ts <= float(ttl_seconds) and name:
+                return str(name)
+
+        try:
+            resp = await self.get_stranger_info(uid, no_cache=True)
+            if resp and resp.get("status") == "ok":
+                data = resp.get("data") or {}
+                name = (data.get("nickname") or "").strip()
+                if name:
+                    self._user_name_cache[uid] = (str(name), now)
+                    return str(name)
+        except Exception:
+            pass
+
+        return str(uid)
 
     async def get_group_name(self, group_id: int, ttl_seconds: float = 6 * 3600) -> str:
         """获取群名（带缓存）。

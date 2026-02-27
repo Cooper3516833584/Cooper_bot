@@ -1184,8 +1184,57 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
             return
 
         parts = rest.split()
+        if len(parts) == 1 and parts[0].lower() == "list":
+            uid_to_level: Dict[int, int] = {}
+            for uid, lv in perm.list_users(min_level=1):
+                uid = int(uid)
+                eff = 3 if uid in ADMIN_USERS else int(lv)
+                if eff >= 1:
+                    uid_to_level[uid] = eff
+            for admin_uid in ADMIN_USERS:
+                uid_to_level[int(admin_uid)] = 3
+
+            if not uid_to_level:
+                await reply(api, ctx, "当前没有等级 >=1 的用户。", logsvc)
+                return
+
+            ordered = sorted(uid_to_level.items(), key=lambda x: (-x[1], x[0]))
+            sem = asyncio.Semaphore(8)
+
+            async def _fetch_nick(uid: int) -> str:
+                async with sem:
+                    try:
+                        return await api.get_user_nickname(uid)
+                    except Exception:
+                        return str(uid)
+
+            names = await asyncio.gather(*[_fetch_nick(uid) for uid, _ in ordered])
+
+            lines = [
+                f">=1 级用户共 {len(ordered)} 人",
+                "等级 | QQ号 | 昵称",
+            ]
+            for (uid, lv), name in zip(ordered, names):
+                lines.append(f"{lv} | {uid} | {name}")
+
+            # 避免消息过长导致发送失败，按长度切分多条发送
+            chunk: List[str] = []
+            cur_len = 0
+            for line in lines:
+                add_len = len(line) + 1
+                if chunk and (cur_len + add_len > 3000):
+                    await reply(api, ctx, "\n".join(chunk), logsvc)
+                    chunk = [line]
+                    cur_len = add_len
+                else:
+                    chunk.append(line)
+                    cur_len += add_len
+            if chunk:
+                await reply(api, ctx, "\n".join(chunk), logsvc)
+            return
+
         if len(parts) != 2:
-            await reply(api, ctx, "用法：/level QQ号 等级\n例如：/level 123456789 2", logsvc)
+            await reply(api, ctx, "用法：/level list\n或：/level QQ号 等级\n例如：/level 123456789 2", logsvc)
             return
 
         uid_raw = parts[0].translate(str.maketrans("０１２３４５６７８９", "0123456789"))
@@ -1227,7 +1276,7 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
             "/whoami",
         ]
         if ctx.level >= 3:
-            lines.append("/level QQ号 等级")
+            lines.append("/level list 或 /level QQ号 等级")
         if ctx.level >= 1:
             lines.extend([
                 "/ls [root/子目录]",
