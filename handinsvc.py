@@ -11,7 +11,7 @@ import urllib.parse
 import shutil
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse, unquote
 import os
 
@@ -53,6 +53,7 @@ SEPARATORS = ["-", "_", "——", "—", "–", ";", "，", ",", " "]
 _RE_STU = re.compile(r"[Uu]\d{8,12}")  # 例如 U202412743
 _RE_ENG = re.compile(r"[A-Za-z]")
 _RE_NUM = re.compile(r"[Uu]?\d{4,}")
+SUBMITTED_FILE_SUFFIXES = {".doc", ".docx", ".pdf", ".txt", ".zip", ".rar", ".7z", ".ppt", ".pptx", ".xls", ".xlsx"}
 
 def clean_filename(filename: str) -> str:
     stem = Path(filename).stem
@@ -256,6 +257,9 @@ class HandinService:
 
         # 清理节流：避免每 10 秒全盘扫描
         self._last_cleanup_ts: float = 0.0
+        # 名册缓存（按 mtime 刷新）
+        self._roster_cache_mtime: float = -1.0
+        self._roster_cache: List[Tuple[str, str]] = []
 
     def is_task_gettable(self, task: HandinTask) -> bool:
         """任务是否仍可 /handinget：归档未被清理且目录仍在。"""
@@ -370,6 +374,52 @@ class HandinService:
             tmp.replace(self.db_path)
         except Exception as e:
             self.log.warning(f"Handin DB save failed: {e}")
+
+    def _get_roster(self) -> List[Tuple[str, str]]:
+        """读取并缓存名册（文件 mtime 变化时自动刷新）。"""
+        path = Path(ROSTER_XLSX_PATH)
+        if not path.exists():
+            self._roster_cache = []
+            self._roster_cache_mtime = -1.0
+            return []
+        try:
+            mtime = float(path.stat().st_mtime)
+        except Exception:
+            mtime = -1.0
+        if mtime >= 0 and abs(mtime - float(self._roster_cache_mtime)) < 1e-6:
+            return list(self._roster_cache)
+        try:
+            data = load_roster(path)
+        except Exception:
+            data = []
+        self._roster_cache = list(data or [])
+        self._roster_cache_mtime = mtime
+        return list(self._roster_cache)
+
+    def _get_roster_names(self) -> List[str]:
+        names: List[str] = []
+        seen: Set[str] = set()
+        for _, nm in self._get_roster():
+            name = str(nm or "").strip()
+            if (not name) or (name in seen):
+                continue
+            seen.add(name)
+            names.append(name)
+        names.sort(key=lambda s: len(s), reverse=True)
+        return names
+
+    def find_roster_name_in_filename(self, filename: str, roster_names: Optional[List[str]] = None) -> str:
+        """在文件名中查找是否包含名册中的姓名，返回首个命中的姓名。"""
+        fn = str(filename or "")
+        if not fn:
+            return ""
+        stem = Path(fn).stem
+        compact = re.sub(r"\s+", "", stem)
+        names = roster_names if roster_names is not None else self._get_roster_names()
+        for nm in names:
+            if nm and (nm in stem or nm in compact):
+                return nm
+        return ""
 
     # ----- paths -----
     def _task_dir(self, group_id: int, task_name: str) -> Path:
@@ -857,27 +907,43 @@ class HandinService:
     # ----- roster compare -----
     def compute_missing(self, task: HandinTask) -> Tuple[bool, str, List[Tuple[str, str]], Dict]:
         """返回 (ok, msg, missing_list, stats)."""
-        roster = load_roster(Path(ROSTER_XLSX_PATH))
+        roster = self._get_roster()
         if not roster:
             return False, f"读取班级名册失败：{ROSTER_XLSX_PATH}（文件不存在或格式不对）", [], {}
 
-        files_dir = self._task_files_dir(task.group_id, task.name)
-        submitted_ids = set()
-        submitted_names = set()
+        submitted_ids: Set[str] = set()
+        submitted_names: Set[str] = set()
+        submitted_file_names: List[str] = []
+        unknown_name_files: List[str] = []
+        matched_name_files = 0
 
-        if files_dir.exists():
-            for p in files_dir.iterdir():
-                if not p.is_file():
-                    continue
-                # 只统计常见提交类型
-                if p.suffix.lower() not in (".doc", ".docx", ".pdf", ".txt", ".zip", ".rar", ".7z", ".ppt", ".pptx", ".xls", ".xlsx"):
-                    continue
-                sid = extract_student_id(p.name)
-                nm = extract_name_from_filename(p.name)
-                if sid:
-                    submitted_ids.add(sid)
-                if nm:
-                    submitted_names.add(nm)
+        roster_name_set = {str(nm or "").strip() for _, nm in roster if str(nm or "").strip()}
+        roster_names = sorted(roster_name_set, key=lambda s: len(s), reverse=True)
+
+        for p in self.list_submitted_files(task):
+            # 统计所有已提交文件；仅跳过隐藏文件与临时分片
+            if p.name.startswith("."):
+                continue
+            if p.suffix.lower() == ".part":
+                continue
+            submitted_file_names.append(p.name)
+
+            sid = extract_student_id(p.name)
+            if sid:
+                submitted_ids.add(sid)
+
+            nm = self.find_roster_name_in_filename(p.name, roster_names=roster_names)
+            if not nm:
+                # 兼容旧规则：先抽取姓名，再检查是否确实在名册中
+                nm_guess = extract_name_from_filename(p.name)
+                if nm_guess and (nm_guess in roster_name_set):
+                    nm = nm_guess
+
+            if nm:
+                submitted_names.add(nm)
+                matched_name_files += 1
+            else:
+                unknown_name_files.append(p.name)
 
         missing = []
         handed = 0
@@ -893,27 +959,67 @@ class HandinService:
             "missing": len(missing),
             "submitted_ids": len(submitted_ids),
             "submitted_names": len(submitted_names),
+            "submitted_files_total": len(submitted_file_names),
+            "recognized_name_files": matched_name_files,
+            "recognized_name_ratio": (float(matched_name_files) / float(len(submitted_file_names))) if submitted_file_names else 1.0,
+            "unknown_name_files": unknown_name_files,
+            "submitted_file_names": submitted_file_names,
         }
+        ratio = float(stats.get("recognized_name_ratio", 1.0))
+        total_files = int(stats.get("submitted_files_total", 0))
+        stats["use_submitted_list"] = bool(total_files > 0 and (matched_name_files <= 0 or ratio < 0.2))
         return True, "ok", missing, stats
 
     def format_missing_message(self, task: HandinTask, missing: List[Tuple[str, str]], stats: Dict, title: str) -> str:
-        lines = []
+        lines: List[str] = []
         lines.append(f"{title}\n任务：{task.name}\n群：{task.group_id}\n截止：{pretty_ts(task.deadline_ts)}")
         lines.append(f"已交/总人数：{stats.get('handed_in',0)}/{stats.get('roster_total',0)}；未交：{stats.get('missing',0)}")
-        if not missing:
-            lines.append("✅ 全部已提交。")
+        total_files = int(stats.get("submitted_files_total", 0) or 0)
+        matched_name_files = int(stats.get("recognized_name_files", 0) or 0)
+        ratio = float(stats.get("recognized_name_ratio", 0.0) or 0.0)
+        if total_files > 0:
+            lines.append(f"姓名识别文件占比：{matched_name_files}/{total_files}（{ratio * 100:.1f}%）")
+
+        submitted_file_names = list(stats.get("submitted_file_names") or [])
+        unknown_name_files = list(stats.get("unknown_name_files") or [])
+        use_submitted_list = bool(stats.get("use_submitted_list"))
+
+        # 文件名识别率太低时，未交名单准确性不足，改发已交文件列表
+        if use_submitted_list:
+            lines.append("⚠️ 姓名识别率过低（<20%）或未识别到名册姓名，改为发送已提交文件列表。")
+            if not submitted_file_names:
+                lines.append("当前没有已提交文件。")
+                return "\n".join(lines)
+            lines.append("已提交文件列表：")
+            limit_files = 120
+            for i, fn in enumerate(submitted_file_names[:limit_files], 1):
+                lines.append(f"{i}. {fn}")
+            if len(submitted_file_names) > limit_files:
+                lines.append(f"...（共 {len(submitted_file_names)} 个，已截断显示前 {limit_files} 个）")
             return "\n".join(lines)
 
-        lines.append("未交名单：")
-        # 防止过长
-        limit = 120
-        for i, (sid, nm) in enumerate(missing[:limit], 1):
-            if nm:
-                lines.append(f"{i}. {nm}")
-            else:
-                lines.append(f"{i}. （未知）")
-        if len(missing) > limit:
-            lines.append(f"...（共 {len(missing)} 人，已截断显示前 {limit} 人）")
+        if not missing:
+            lines.append("✅ 全部已提交。")
+        else:
+            lines.append("未交名单：")
+            limit = 120
+            for i, (sid, nm) in enumerate(missing[:limit], 1):
+                if nm:
+                    lines.append(f"{i}. {nm}")
+                else:
+                    lines.append(f"{i}. （未知）")
+            if len(missing) > limit:
+                lines.append(f"...（共 {len(missing)} 人，已截断显示前 {limit} 人）")
+
+        # 额外列出“已提交但未识别出姓名信息”的文件名
+        if unknown_name_files:
+            lines.append("")
+            lines.append("未识别到姓名信息的已提交文件：")
+            limit_unknown = 80
+            for i, fn in enumerate(unknown_name_files[:limit_unknown], 1):
+                lines.append(f"{i}. {fn}")
+            if len(unknown_name_files) > limit_unknown:
+                lines.append(f"...（共 {len(unknown_name_files)} 个，已截断显示前 {limit_unknown} 个）")
         return "\n".join(lines)
 
     # ----- scheduler -----
