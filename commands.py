@@ -230,6 +230,37 @@ def _split_args(text: str):
     return cmd, rest
 
 
+def _parse_find_args(rest: str, filesvc: FileService) -> Tuple[str, Optional[str]]:
+    """
+    Parse /find arguments.
+    Supports:
+    - /find <keyword>
+    - /find <keyword...> <root/subdir>
+    """
+    s = (rest or "").strip()
+    if not s:
+        return "", None
+
+    parts = s.split()
+    if len(parts) == 1:
+        return parts[0], None
+
+    last = parts[-1].strip().strip("/")
+    if not last:
+        return s, None
+
+    known_roots = {str(r.name).strip().lower() for r in filesvc.roots}
+    known_roots.update({"group", "groups"})
+
+    head = last.split("/", 1)[0].strip().lower()
+    looks_like_dir = ("/" in last) or (head in known_roots)
+    if looks_like_dir:
+        kw = " ".join(parts[:-1]).strip()
+        if kw:
+            return kw, last
+    return s, None
+
+
 def _parse_indices(arg: str) -> List[int]:
     """
     支持：
@@ -1687,14 +1718,10 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
         return
 
     if cmd == "find":
-        # 支持：/find 关键词   或  /find 关键词 public/xxx
-        kw = rest
-        in_dir: Optional[str] = None
-        if rest:
-            parts = rest.split()
-            kw = parts[0]
-            if len(parts) >= 2:
-                in_dir = parts[1]
+        # 支持：
+        # /find 关键词
+        # /find 多词 关键词 public/子目录
+        kw, in_dir = _parse_find_args(rest, filesvc)
 
         hits = filesvc.find(ctx, kw, in_dir=in_dir)
         k = conv_key(ctx)
