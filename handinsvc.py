@@ -31,6 +31,7 @@ from config import (
     HANDIN_INBOX_KEEP_DAYS,
 )
 from logger import Logger
+from ziputil import open_fast_zip, write_path as zip_write_path
 
 try:
     from zoneinfo import ZoneInfo
@@ -577,14 +578,13 @@ class HandinService:
         """将某任务已提交文件全部打包为 zip。"""
         if getattr(task, "purged", False) or (not self._task_files_dir(task.group_id, task.name).exists()):
             return False, "该任务归档已超过保留期（最后一次 /handinget 后已清理），无法再导出。如需长期保留请及时备份。", None
-        import zipfile
         files = self.list_submitted_files(task)
         out_zip = Path(out_zip)
         out_zip.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            with open_fast_zip(out_zip) as z:
                 for p in files:
-                    z.write(p, arcname=p.name)
+                    zip_write_path(z, p, arcname=p.name)
             return True, f"已打包 {len(files)} 个文件：{out_zip.name}", out_zip
         except Exception as e:
             return False, f"打包失败：{e}", None

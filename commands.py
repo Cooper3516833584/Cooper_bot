@@ -11,11 +11,11 @@ import time
 import shutil
 import uuid
 import unicodedata
-import zipfile
 from filesvc import FileService
 from logsvc import LogService
 from handinsvc import HandinService, parse_mmdd_hhmm, pretty_ts, extract_name_from_filename, extract_student_id
 from router import get_files
+from ziputil import open_fast_zip, write_path as zip_write_path
 from config import (
     ADMIN_USERS,
     DATA_DIR,
@@ -387,14 +387,16 @@ def _cleanup_temp_files(paths: List[Path]) -> None:
 def _zip_directory(src_dir: Path, out_zip: Path) -> Tuple[bool, str]:
     try:
         out_zip.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            files = [p for p in src_dir.rglob("*") if p.is_file()]
-            if not files:
+        with open_fast_zip(out_zip) as zf:
+            packed = 0
+            for p in src_dir.rglob("*"):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(src_dir).as_posix()
+                zip_write_path(zf, p, arcname=f"{src_dir.name}/{rel}")
+                packed += 1
+            if packed <= 0:
                 zf.writestr(f"{src_dir.name}/", "")
-            else:
-                for p in files:
-                    rel = p.relative_to(src_dir).as_posix()
-                    zf.write(p, arcname=f"{src_dir.name}/{rel}")
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -410,7 +412,7 @@ def _zip_pending_files(items: List[dict], out_zip: Path) -> Tuple[bool, str, int
         packed = 0
         missing = 0
         name_count: Dict[str, int] = {}
-        with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        with open_fast_zip(out_zip) as zf:
             for idx, it in enumerate(items, 1):
                 p = Path(str(it.get("path") or ""))
                 if (not p.exists()) or (not p.is_file()):
@@ -421,7 +423,7 @@ def _zip_pending_files(items: List[dict], out_zip: Path) -> Tuple[bool, str, int
                 name_count[arc0] = name_count.get(arc0, 0) + 1
                 if name_count[arc0] > 1:
                     arc = f"{idx}_{arc0}"
-                zf.write(p, arcname=arc)
+                zip_write_path(zf, p, arcname=arc)
                 packed += 1
         if packed <= 0:
             try:
@@ -1840,7 +1842,7 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
                 packed = 0
                 name_count: dict[str, int] = {}
                 try:
-                    with zipfile.ZipFile(outer_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    with open_fast_zip(outer_zip) as zf:
                         for idx2, p, arc0 in prepared_items:
                             if (not p.exists()) or (not p.is_file()):
                                 bad_list.append(f"{idx2}({arc0}:不存在)")
@@ -1849,7 +1851,7 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
                             name_count[arc] = name_count.get(arc, 0) + 1
                             if name_count[arc] > 1:
                                 arc = f"{idx2}_{arc0}"
-                            zf.write(p, arcname=arc)
+                            zip_write_path(zf, p, arcname=arc)
                             packed += 1
                 except Exception as e:
                     await reply(api, ctx, f"打包失败：{e}", logsvc)
@@ -1927,8 +1929,8 @@ async def dispatch(api, ctx, evt: dict, text: str, filesvc: FileService, logsvc:
 
                                 safe_stem = Path(_sanitize_ascii_filename(p.name)).stem[:40].strip("._-") or "file"
                                 zpath = fb_dir / f"{safe_stem}_{int(time.time())}.zip"
-                                with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                                    zf.write(p, arcname=p.name)
+                                with open_fast_zip(zpath) as zf:
+                                    zip_write_path(zf, p, arcname=p.name)
                                 temp_artifacts.append(zpath)
 
                                 try:
