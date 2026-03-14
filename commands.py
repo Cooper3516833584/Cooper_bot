@@ -182,11 +182,40 @@ def conv_key(ctx) -> str:
 
 
 async def reply(api, ctx, text: str, logsvc: LogService):
-    if ctx.scene == "group" and ctx.group_id is not None:
-        await api.send_group_msg(ctx.group_id, text)
+    async def _send_once():
+        if ctx.scene == "group" and ctx.group_id is not None:
+            return await api.send_group_msg(ctx.group_id, text)
+        return await api.send_private_msg(ctx.user_id, text)
+
+    def _ok(resp) -> bool:
+        if not isinstance(resp, dict):
+            return False
+        try:
+            return resp.get("status") == "ok" and int(resp.get("retcode", 0) or 0) == 0
+        except Exception:
+            return False
+
+    def _detail(resp) -> str:
+        if not isinstance(resp, dict):
+            return "no response"
+        rc = resp.get("retcode", "")
+        msg = (resp.get("wording") or resp.get("message") or "").strip()
+        if msg:
+            return f"retcode={rc} {msg}"
+        return f"retcode={rc}" if rc != "" else "send failed"
+
+    resp = await _send_once()
+    if not _ok(resp):
+        # transient network / bridge timeout retry once
+        await asyncio.sleep(0.35)
+        resp = await _send_once()
+
+    if _ok(resp):
+        logsvc.log_out(ctx, text)
     else:
-        await api.send_private_msg(ctx.user_id, text)
-    logsvc.log_out(ctx, text)
+        logsvc.log.warning(
+            f"reply send failed: scene={ctx.scene}, group={ctx.group_id}, user={ctx.user_id}, detail={_detail(resp)}"
+        )
 
 
 async def reply_private(api, user_id: int, text: str):
@@ -281,11 +310,15 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
     msg = str(text or "").strip()
     scene = str(getattr(ctx, "scene", "") or "")
     if scene == "group":
-        has_nick_mention = bool(re.search(rf"@\s*{re.escape(bot_nick)}", msg, flags=re.IGNORECASE))
+        nick_aliases = [x for x in {str(bot_nick or "").strip(), "Cooper_bot", "Cooepr_bot"} if x]
+        has_nick_mention = False
+        for nick in nick_aliases:
+            pat = rf"[@\uFF20]\s*{re.escape(nick)}"
+            if re.search(pat, msg, flags=re.IGNORECASE):
+                has_nick_mention = True
+                msg = re.sub(pat, "", msg, flags=re.IGNORECASE).strip()
         if not (_evt_mentions_me(evt) or has_nick_mention):
             return None
-        if has_nick_mention:
-            msg = re.sub(rf"@\s*{re.escape(bot_nick)}", "", msg, flags=re.IGNORECASE).strip()
         return msg
     if scene.startswith("private"):
         m = re.match(r"^[cC](.*)$", msg)
