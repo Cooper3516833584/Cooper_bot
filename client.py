@@ -21,6 +21,7 @@ from logsvc import LogService
 from commands import dispatch, BotState, conv_key
 from permsvc import PermService
 from handinsvc import HandinService
+from aisvc import AIService
 
 log = Logger("bot", "INFO")
 
@@ -33,6 +34,12 @@ async def run_forever():
     state = BotState()
     perm = PermService(PERM_DB_PATH)
     handin = HandinService(log)
+    aisvc = AIService(log)
+
+    try:
+        await aisvc.bootstrap_sync()
+    except Exception as e:
+        log.warning(f"AI 初始化失败（将继续运行基础功能）: {e}")
 
     while True:
         try:
@@ -61,7 +68,7 @@ async def run_forever():
                     async with dispatch_sem:
                         async with lock:
                             try:
-                                await dispatch(api, ctx, data, text, filesvc, logsvc, state, handin, perm)
+                                await dispatch(api, ctx, data, text, filesvc, logsvc, state, handin, perm, aisvc)
                             except Exception as e:
                                 log.exception(f"dispatch 异常: {e}")
 

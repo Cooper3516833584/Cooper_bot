@@ -1,0 +1,4 @@
+https://api.deepseek.com/v1
+sk-c92f0cce25a14a68bdcef35135a205e7
+https://api.siliconflow.cn/v1
+sk-fhctonuoxxowrmhhfxxhmpulpirgjpqelqpuwzcpnylpzmta
