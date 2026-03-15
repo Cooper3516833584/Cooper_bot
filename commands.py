@@ -42,6 +42,22 @@ _GROUP_NOTICE_FILE_SUFFIXES = {".pdf", ".docx"}
 _URL_RE = re.compile(r"(https?://[^\s<>\"]+)", flags=re.IGNORECASE)
 _GROUP_NOTICE_MAX_CANDIDATES = 3
 _GROUP_NOTICE_DEDUP_SECONDS = 60.0
+_RECENT_REPLY_DEDUP_SECONDS = 2.0
+_RECENT_REPLY_KEYS: Dict[str, float] = {}
+
+
+def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECONDS) -> bool:
+    now = time.time()
+    stale_before = now - max(float(ttl_seconds) * 4.0, 30.0)
+    for k, ts in list(_RECENT_REPLY_KEYS.items()):
+        if float(ts) < stale_before:
+            _RECENT_REPLY_KEYS.pop(k, None)
+
+    prev = _RECENT_REPLY_KEYS.get(key)
+    if prev is not None and (now - float(prev) < float(ttl_seconds)):
+        return False
+    _RECENT_REPLY_KEYS[key] = now
+    return True
 def _normalize_answer_q(s: str) -> str:
     # 触发词匹配：忽略首尾空白、大小写，内部连续空白视为一个空格
     return re.sub(r"\s+", " ", (s or "").strip()).casefold()
@@ -226,7 +242,18 @@ async def reply(api, ctx, text: str, logsvc: LogService):
             return f"retcode={rc} {msg}"
         return f"retcode={rc}" if rc != "" else "send failed"
 
+    target = f"g:{ctx.group_id}" if ctx.scene == "group" and ctx.group_id is not None else f"u:{ctx.user_id}"
+    reply_key = f"{ctx.scene}:{target}:{text.strip()}"
+    if not _claim_recent_reply(reply_key):
+        logsvc.log.info(f"消息发送去重：已拦截重复回复 target={target}")
+        return
+
     resp = await _send_once()
+    if resp is None:
+        logsvc.log.info(
+            f"消息发送未确认：scene={ctx.scene}, group={ctx.group_id}, user={ctx.user_id}，为避免重复发送不再重试"
+        )
+        return
     if not _ok(resp):
         # transient network / bridge timeout retry once
         await asyncio.sleep(0.35)
@@ -473,6 +500,11 @@ async def _extract_notice_text_from_group_file(
         expected_size = None
 
     big = _is_large(expected_size)
+    if logsvc is not None:
+        pages_txt = "all" if int(max_pages) <= 0 else str(int(max_pages))
+        logsvc.log.info(
+            f"群通知解析：开始提取文件 file={fname} max_chars={int(max_chars)} max_pages={pages_txt}"
+        )
     src = url
     if (not src) and file_id:
         src = await _resolve_src_by_get_file_for_notice(
@@ -484,7 +516,7 @@ async def _extract_notice_text_from_group_file(
         )
     if not src:
         if logsvc is not None:
-            logsvc.log.warning(f"group notice: resolve source failed for file={fname} file_id={file_id}")
+            logsvc.log.warning(f"群通知解析：文件源地址解析失败 file={fname} file_id={file_id}")
         return ""
 
     dl_timeout = 600.0 if big else 180.0
@@ -517,13 +549,15 @@ async def _extract_notice_text_from_group_file(
 
     if (not ok) or (not p):
         if logsvc is not None:
-            logsvc.log.warning(f"group notice: download failed for file={fname}: {_msg}")
+            logsvc.log.warning(f"群通知解析：文件下载失败 file={fname}: {_msg}")
         return ""
 
     try:
         out = await aisvc.extract_notice_file_head(Path(p), max_chars=int(max_chars), max_pages=int(max_pages))
         if (not out) and (logsvc is not None):
-            logsvc.log.warning(f"group notice: extracted empty text for file={fname}")
+            logsvc.log.warning(f"群通知解析：文件提取结果为空 file={fname}")
+        elif logsvc is not None:
+            logsvc.log.info(f"群通知解析：文件提取完成 file={fname} chars={len(out)}")
         return out
     finally:
         try:
@@ -553,10 +587,25 @@ async def _run_group_notice_digest(
     if files:
         urls = []
     if (not files) and (not urls):
+        msg = evt.get("message")
+        if isinstance(msg, list):
+            seg_types = [
+                str(seg.get("type") or "").lower()
+                for seg in msg
+                if isinstance(seg, dict)
+            ]
+            unsupported = sorted({tp for tp in seg_types if tp in ("json", "xml")})
+            if unsupported:
+                logsvc.log.info(
+                    f"群通知解析：未从当前消息中提取到链接，不支持的消息段类型={','.join(unsupported)}"
+                )
         return
 
     # A command like /find URL should not trigger auto-digest unless a file is attached.
     t = (text or "").strip()
+    if (not files) and urls and (t.startswith("/") or t.startswith("／")):
+        logsvc.log.info("群通知解析：消息看起来像命令，跳过链接自动解析")
+        return
     if (not files) and (t.startswith("/") or t.startswith("／")):
         return
 
@@ -567,28 +616,36 @@ async def _run_group_notice_digest(
         candidates.append(("url", item))
     if not candidates:
         return
+    logsvc.log.info(
+        f"群通知解析：发现候选内容 files={len(files)} urls={len(urls)} total={len(candidates)}"
+    )
 
     for kind, payload in candidates[:_GROUP_NOTICE_MAX_CANDIDATES]:
         try:
             source = ""
             dedup_key = ""
             preview = ""
+            debug_target = ""
             if kind == "file":
                 f = payload if isinstance(payload, dict) else {}
                 fname = str(f.get("name") or "未命名文件").strip() or "未命名文件"
                 fsize = str(f.get("size") or "").strip()
                 fid = str(f.get("file_id") or "").strip()
                 busid = str(f.get("busid") or "").strip()
+                debug_target = fname
                 source = f"群文件：{fname}"
                 # 跨 message/file 与 notice/group_upload 去重：优先稳定字段（文件名+大小+上传者+群）
                 name_norm = re.sub(r"\s+", "", fname).casefold()
                 dedup_key = f"g{ctx.group_id}:file:{name_norm}:{fsize}:{ctx.user_id}"
             else:
                 u = str(payload or "").strip()
+                debug_target = u
                 source = f"群链接：{u}"
                 dedup_key = f"g{ctx.group_id}:url:{u.casefold()}"
 
+            logsvc.log.info(f"群通知解析：开始处理 kind={kind} target={debug_target[:160]}")
             if dedup_key and (not _claim_group_notice_key(state, dedup_key)):
+                logsvc.log.info(f"群通知解析：命中去重，跳过处理 kind={kind} target={debug_target[:160]}")
                 continue
 
             # Step 1: 小窗口预判是否为“需要动作的通知”
@@ -610,11 +667,17 @@ async def _run_group_notice_digest(
 
             preview = str(preview or "").strip()
             if not preview:
+                logsvc.log.info(f"群通知解析：预览内容为空 kind={kind} target={debug_target[:160]}")
                 continue
+            logsvc.log.info(
+                f"群通知解析：预览内容已就绪 kind={kind} chars={len(preview)} target={debug_target[:160]}"
+            )
 
-            is_notice = await aisvc.classify_notice(source, preview)
+            is_notice = await aisvc.classify_notice(source, preview, group_id=ctx.group_id, kind=kind)
             if not is_notice:
+                logsvc.log.info(f"群通知解析：分类结果为不回复 kind={kind} target={debug_target[:160]}")
                 continue
+            logsvc.log.info(f"群通知解析：分类结果为需要回复 kind={kind} target={debug_target[:160]}")
 
             # Step 2: 对通知做更完整文本提取，再生成更详细省流
             material = preview
@@ -637,13 +700,18 @@ async def _run_group_notice_digest(
                 full_text = await aisvc.extract_notice_url_head(u, max_chars=25000)
                 if full_text:
                     material = full_text
+            logsvc.log.info(
+                f"群通知解析：开始生成省流内容 kind={kind} chars={len(str(material or ''))} target={debug_target[:160]}"
+            )
 
-            out = await aisvc.reason_notice(source, material)
+            out = await aisvc.reason_notice(source, material, group_id=ctx.group_id, kind=kind)
             out = aisvc.sanitize_reasoner_output(out)
             if (not out) or aisvc.is_notice_silent(out):
+                logsvc.log.info(f"群通知解析：生成结果为静默或空内容 kind={kind} target={debug_target[:160]}")
                 continue
 
             await reply(api, ctx, out, logsvc)
+            logsvc.log.info(f"群通知解析：已发送回复 kind={kind} target={debug_target[:160]}")
             return
         except Exception as e:
             logsvc.log.warning(f"group notice digest failed: {e}")

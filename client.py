@@ -1,7 +1,9 @@
 # client.py
+import os
 import asyncio
 import json
 import websockets
+from pathlib import Path
 from typing import Dict, Set
 
 from logger import Logger
@@ -9,6 +11,7 @@ from config import (
     WS_URI,
     HTTP_BASE,
     HTTP_TOKEN,
+    DATA_DIR,
     LOG_DIR,
     PERM_DB_PATH,
     AUTO_APPROVE_FRIEND_REQUEST,
@@ -27,8 +30,48 @@ log = Logger("bot", "INFO")
 
 # 允许不同会话并发处理，避免大文件发送阻塞全局。
 MAX_DISPATCH_CONCURRENCY = 32
+_INSTANCE_LOCK_HANDLE = None
+
+
+def _acquire_single_instance_lock() -> bool:
+    global _INSTANCE_LOCK_HANDLE
+    if _INSTANCE_LOCK_HANDLE is not None:
+        return True
+
+    lock_path = Path(DATA_DIR) / "_client.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        fh.seek(0)
+        fh.truncate()
+        fh.write(f"{os.getpid()}\n".encode("ascii", errors="ignore"))
+        fh.flush()
+    except Exception:
+        fh.close()
+        return False
+
+    _INSTANCE_LOCK_HANDLE = fh
+    return True
+
+
+def _lock_path_text() -> str:
+    return str((Path(DATA_DIR) / "_client.lock").resolve())
 
 async def run_forever():
+    if not _acquire_single_instance_lock():
+        log.warning(f"检测到已有其他 bot 实例在运行，当前进程退出。lock={_lock_path_text()}")
+        return
+
+    log.info(f"Bot 启动：pid={os.getpid()} lock={_lock_path_text()}")
     filesvc = FileService()
     filesvc.ensure_dirs()
     state = BotState()

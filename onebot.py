@@ -166,16 +166,22 @@ class OneBotAPI:
         # 2) 兜底 WS（仍然用较短超时，避免再次卡顿）
         return await self._call_ws(action, params, timeout=min(timeout, 8.0))
 
+    async def _call_prefer_http_no_ws_fallback(self, action: str, params: dict, timeout: float = 8.0) -> Optional[dict]:
+        # Avoid double-send for actions that may already succeed before an HTTP timeout is observed.
+        if self.http_base:
+            return await self._call_http(action, params, timeout=timeout)
+        return await self._call_ws(action, params, timeout=min(timeout, 8.0))
+
     # ========= 业务封装 =========
     async def send_group_msg(self, group_id: int, text: str):
-        return await self.call(
+        return await self._call_prefer_http_no_ws_fallback(
             "send_group_msg",
             {"group_id": int(group_id), "message": text},
             timeout=6.0,
         )
 
     async def send_private_msg(self, user_id: int, text: str):
-        return await self.call(
+        return await self._call_prefer_http_no_ws_fallback(
             "send_private_msg",
             {"user_id": int(user_id), "message": text},
             timeout=6.0,
@@ -198,7 +204,7 @@ class OneBotAPI:
             params["folder"] = str(folder)
         # 上传可能更久一些，但这里不硬等太久：
         # - 超时则返回 None，由上层标记“未确认”避免误报失败
-        return await self.call("upload_group_file", params, timeout=300.0)
+        return await self._call_prefer_http_no_ws_fallback("upload_group_file", params, timeout=300.0)
 
     async def upload_private_file(self, user_id: int, file: str, name: str, group_id: Optional[int] = None):
         """私聊发文件。file 必须是 NapCat 容器内可访问的本地路径。
@@ -208,7 +214,7 @@ class OneBotAPI:
         params = {"user_id": int(user_id), "file": self._file_uri(file), "name": str(name)}
         if group_id is not None:
             params["group_id"] = int(group_id)
-        return await self.call("upload_private_file", params, timeout=300.0)
+        return await self._call_prefer_http_no_ws_fallback("upload_private_file", params, timeout=300.0)
 
 
 

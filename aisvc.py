@@ -81,6 +81,7 @@ class AIService:
         self.index_path = Path(AI_INDEX_PATH)
         self.metadata_path = Path(AI_METADATA_PATH)
         self.vectors_path = Path(AI_VECTORS_PATH)
+        self.notice_prompt_config_path = Path(__file__).resolve().parent / "group_notice_prompts.json"
 
         self.bot_nick = str(AI_BOT_NICK or "Cooepr_bot")
         self.chat_model = str(AI_CHAT_MODEL or "deepseek-chat")
@@ -101,6 +102,8 @@ class AIService:
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
         self._rapid_ocr = None
+        self._notice_prompt_cache_mtime: Optional[float] = None
+        self._notice_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
 
     @property
     def chat_ready(self) -> bool:
@@ -141,11 +144,35 @@ class AIService:
     async def extract_notice_url_head(self, url: str, max_chars: int = 4000) -> str:
         return await self._extract_notice_url_head_async(str(url or "").strip(), int(max_chars))
 
-    async def classify_notice(self, source: str, snippet: str) -> bool:
-        return await asyncio.to_thread(self._classify_notice_sync, str(source or ""), str(snippet or ""))
+    async def classify_notice(
+        self,
+        source: str,
+        snippet: str,
+        group_id: Optional[int] = None,
+        kind: str = "notice",
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._classify_notice_sync_v2,
+            str(source or ""),
+            str(snippet or ""),
+            group_id,
+            str(kind or "notice"),
+        )
 
-    async def reason_notice(self, source: str, snippet: str) -> str:
-        return await asyncio.to_thread(self._reason_notice_sync, str(source or ""), str(snippet or ""))
+    async def reason_notice(
+        self,
+        source: str,
+        snippet: str,
+        group_id: Optional[int] = None,
+        kind: str = "notice",
+    ) -> str:
+        return await asyncio.to_thread(
+            self._reason_notice_sync_v2,
+            str(source or ""),
+            str(snippet or ""),
+            group_id,
+            str(kind or "notice"),
+        )
 
     @classmethod
     def is_notice_silent(cls, text: str) -> bool:
@@ -173,6 +200,167 @@ class AIService:
             kept.append(line)
         s = "\n".join(kept).strip()
         return s.strip()
+
+    @staticmethod
+    def _normalize_notice_prompt_lines(value: object) -> List[str]:
+        if isinstance(value, str):
+            s = value.strip()
+            return [s] if s else []
+        if isinstance(value, list):
+            out: List[str] = []
+            for item in value:
+                s = str(item or "").strip()
+                if s:
+                    out.append(s)
+            return out
+        return []
+
+    def _builtin_notice_prompt_config(self) -> Dict[str, object]:
+        return {
+            "default": {
+                "classify_prompt_lines": [
+                    "【角色设定】",
+                    "你是 QQ 群里的通知过滤助手。",
+                    "",
+                    "【任务】",
+                    "请判断下面内容是否属于“需要群成员采取动作、流程、报名、缴费、开会、填写、提交、关注截止时间”的通知。",
+                    "如果只是学习资料、课程介绍、科普文章、普通新闻、经验分享、宣传内容、无明确行动要求的参考材料，请判定为静默。",
+                    "如果内容和本群成员关系不大，或无法明确看出需要本群成员行动，也请判定为静默。",
+                    "",
+                    "【输出要求】",
+                    "如果应该静默，只输出：{{silent_token}}",
+                    "如果应该回复，只输出：[通知]",
+                    "不要输出任何其他字符。",
+                    "",
+                    "【来源】",
+                    "{{source}}",
+                    "",
+                    "【内容片段】",
+                    "{{content}}",
+                ],
+                "reason_prompt_lines": [
+                    "【角色设定】",
+                    "你是 QQ 群里的 AI 助手，请基于通知全文生成一份给本群成员看的简洁省流说明。",
+                    "",
+                    "【要求】",
+                    "只提取原文明确出现的信息，不要补充、猜测、外推或编造。",
+                    "报名方式、费用、地点、对象、截止时间等字段，只有原文明确写到才允许写入。",
+                    "如果某项信息原文没写，就直接省略，不要写“未知”“暂未提及”“待通知”之类占位话术。",
+                    "",
+                    "【输出格式】",
+                    "📢 【省流通知】[核心标题]",
+                    "🎯 核心事由：[一句话概括]",
+                    "🙋 涉及人员：[按原文填写]",
+                    "✅ 需要做什么：",
+                    "1. ...",
+                    "2. ...",
+                    "3. ...",
+                    "⏰ 截止时间：[若无则写“无明确截止时间”]",
+                    "",
+                    "【风格】",
+                    "控制在 6 到 10 行。",
+                    "可以用 emoji。",
+                    "不要 Markdown 星号，不要代码块，不要额外添加模板外字段。",
+                    "",
+                    "【输入来源】",
+                    "{{source}}",
+                    "",
+                    "【通知全文/片段】",
+                    "{{content}}",
+                ],
+            },
+            "groups": {},
+        }
+
+    def _load_notice_prompt_config(self) -> Dict[str, object]:
+        path = self.notice_prompt_config_path
+        fallback = self._builtin_notice_prompt_config()
+        try:
+            mtime = path.stat().st_mtime
+        except Exception:
+            return fallback
+
+        with self._lock:
+            if self._notice_prompt_cache_mtime == float(mtime):
+                return self._notice_prompt_cache
+
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("prompt config root must be an object")
+                default_cfg = data.get("default") or {}
+                groups_cfg = data.get("groups") or {}
+                if not isinstance(default_cfg, dict):
+                    default_cfg = {}
+                if not isinstance(groups_cfg, dict):
+                    groups_cfg = {}
+                normalized = {"default": default_cfg, "groups": groups_cfg}
+                self._notice_prompt_cache = normalized
+                self._notice_prompt_cache_mtime = float(mtime)
+                self.log.info(f"群通知解析：已加载群提示词配置 {path.name}")
+                return normalized
+            except Exception as e:
+                self.log.warning(f"群通知解析：读取群提示词配置失败 {path.name}: {e}")
+                self._notice_prompt_cache = fallback
+                self._notice_prompt_cache_mtime = float(mtime)
+                return fallback
+
+    def _select_notice_prompt_lines(
+        self,
+        group_id: Optional[int],
+        kind: str,
+        stage: str,
+    ) -> List[str]:
+        cfg = self._load_notice_prompt_config()
+        default_cfg = cfg.get("default") if isinstance(cfg, dict) else {}
+        groups_cfg = cfg.get("groups") if isinstance(cfg, dict) else {}
+        if not isinstance(default_cfg, dict):
+            default_cfg = {}
+        if not isinstance(groups_cfg, dict):
+            groups_cfg = {}
+
+        group_cfg = groups_cfg.get(str(group_id), {}) if group_id is not None else {}
+        if not isinstance(group_cfg, dict):
+            group_cfg = {}
+
+        kind_name = str(kind or "").strip().lower()
+        kind_field = f"{kind_name}_{stage}_prompt_lines" if kind_name else ""
+        generic_field = f"{stage}_prompt_lines"
+
+        candidates = []
+        if kind_field:
+            candidates.append(group_cfg.get(kind_field))
+        candidates.append(group_cfg.get(generic_field))
+        if kind_field:
+            candidates.append(default_cfg.get(kind_field))
+        candidates.append(default_cfg.get(generic_field))
+
+        for item in candidates:
+            lines = self._normalize_notice_prompt_lines(item)
+            if lines:
+                return lines
+
+        builtin = self._builtin_notice_prompt_config().get("default", {})
+        if isinstance(builtin, dict):
+            for item in (builtin.get(kind_field), builtin.get(generic_field)):
+                lines = self._normalize_notice_prompt_lines(item)
+                if lines:
+                    return lines
+        return []
+
+    def _render_notice_prompt(
+        self,
+        lines: List[str],
+        source: str,
+        content: str,
+    ) -> str:
+        template = "\n".join(lines).strip()
+        return (
+            template
+            .replace("{{source}}", str(source or "未知来源"))
+            .replace("{{content}}", str(content or ""))
+            .replace("{{silent_token}}", self._NOTICE_SILENT_TOKEN)
+        )
 
     def _bootstrap_sync_sync(self) -> None:
         self.material_dir.mkdir(parents=True, exist_ok=True)
@@ -426,6 +614,7 @@ class AIService:
             async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
                 async with session.get(url, allow_redirects=True) as resp:
                     if int(resp.status) >= 400:
+                        self.log.warning(f"群通知解析：链接抓取返回状态码={int(resp.status)} url={url[:160]}")
                         return ""
                     content_type = str(resp.headers.get("Content-Type") or "").lower()
                     html = await resp.text(errors="ignore")
@@ -434,6 +623,7 @@ class AIService:
             return await asyncio.to_thread(self._extract_notice_url_head_urllib_sync, url, int(max_chars))
 
         if not html:
+            self.log.info(f"群通知解析：链接响应正文为空 url={url[:160]}")
             return ""
 
         if "text/plain" in content_type and "<html" not in html[:500].lower():
@@ -448,6 +638,8 @@ class AIService:
             text = body.get_text(separator="\n", strip=True)
             text = re.sub(r"[ \t]+", " ", text)
             text = re.sub(r"\n{2,}", "\n", text).strip()
+            if not text:
+                self.log.info(f"群通知解析：网页正文提取为空 url={url[:160]}")
             return text[:max_chars]
         except Exception as e:
             self.log.warning(f"群通知解析：网页正文提取失败 {url[:120]}: {e}")
@@ -527,10 +719,17 @@ class AIService:
                 raw = ""
             out = self.sanitize_reasoner_output(raw)
             if out == "[通知]":
+                self.log.info(f"群通知解析：分类结果=通知 source={source[:120]}")
                 return True
+            if out == self._NOTICE_SILENT_TOKEN:
+                self.log.info(f"群通知解析：分类结果=静默 source={source[:120]}")
+            elif out:
+                self.log.info(f"群通知解析：分类结果=非标准输出但放行 source={source[:120]} output={out[:80]}")
+            else:
+                self.log.info(f"群通知解析：分类结果=空输出 source={source[:120]}")
             return (out != self._NOTICE_SILENT_TOKEN) and bool(out)
-        except Exception:
-            # 分类失败时保守处理：不打扰群聊
+        except Exception as e:
+            self.log.warning(f"群通知解析：分类调用失败 source={source[:120]} err={e}")
             return False
 
     def _reason_notice_sync(self, source: str, snippet: str) -> str:
@@ -577,6 +776,94 @@ class AIService:
             f"{content}"
         )
 
+        resp = client.chat.completions.create(
+            model="deepseek-reasoner",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+
+        raw = ""
+        try:
+            raw = str(resp.choices[0].message.content or "").strip()
+        except Exception:
+            raw = ""
+        if (not raw) and hasattr(resp, "model_dump"):
+            raw = self._extract_chat_text(resp.model_dump())
+        out = self.sanitize_reasoner_output(raw)
+        return out or self._NOTICE_SILENT_TOKEN
+
+    def _classify_notice_sync_v2(
+        self,
+        source: str,
+        snippet: str,
+        group_id: Optional[int] = None,
+        kind: str = "notice",
+    ) -> bool:
+        if not self.deepseek_api_key:
+            return False
+        if OpenAI is None:
+            return False
+
+        content = str(snippet or "").strip()
+        if not content:
+            return False
+        if len(content) > 6000:
+            content = content[:6000]
+
+        lines = self._select_notice_prompt_lines(group_id, kind, "classify")
+        prompt = self._render_notice_prompt(lines, source, content)
+
+        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
+        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+        try:
+            resp = client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            raw = ""
+            try:
+                raw = str(resp.choices[0].message.content or "").strip()
+            except Exception:
+                raw = ""
+            out = self.sanitize_reasoner_output(raw)
+            if out == "[通知]":
+                self.log.info(f"群通知解析：分类结果=通知 source={source[:120]}")
+                return True
+            if out == self._NOTICE_SILENT_TOKEN:
+                self.log.info(f"群通知解析：分类结果=静默 source={source[:120]}")
+            elif out:
+                self.log.info(f"群通知解析：分类结果=非标准输出但放行 source={source[:120]} output={out[:80]}")
+            else:
+                self.log.info(f"群通知解析：分类结果=空输出 source={source[:120]}")
+            return (out != self._NOTICE_SILENT_TOKEN) and bool(out)
+        except Exception as e:
+            self.log.warning(f"群通知解析：分类调用失败 source={source[:120]} err={e}")
+            return False
+
+    def _reason_notice_sync_v2(
+        self,
+        source: str,
+        snippet: str,
+        group_id: Optional[int] = None,
+        kind: str = "notice",
+    ) -> str:
+        if not self.deepseek_api_key:
+            raise RuntimeError("deepseek api key not ready")
+        if OpenAI is None:
+            raise RuntimeError("openai sdk is not installed")
+
+        content = str(snippet or "").strip()
+        if not content:
+            return self._NOTICE_SILENT_TOKEN
+        if len(content) > 120000:
+            content = content[:120000]
+
+        lines = self._select_notice_prompt_lines(group_id, kind, "reason")
+        prompt = self._render_notice_prompt(lines, source, content)
+
+        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
+        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
         resp = client.chat.completions.create(
             model="deepseek-reasoner",
             messages=[{"role": "user", "content": prompt}],
