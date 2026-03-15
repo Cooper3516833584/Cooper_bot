@@ -99,7 +99,7 @@ IDLE_SPLIT_SECONDS = 1800
 
 # 权限等级：0游客 1临时 2好友 3管理员
 # 管理员 QQ 号（/whoami 里显示的 user_id）
-ADMIN_USERS = _parse_int_set(_get_env("ADMIN_USERS", "")) or {3516833584}
+ADMIN_USERS = _parse_int_set(_get_env("ADMIN_USERS", ""))
 
 # 群权限：可选的群级别“下限”（通常不需要；你也可以留空）
 GROUP_LEVEL = {
