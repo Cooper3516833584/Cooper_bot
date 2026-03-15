@@ -44,6 +44,10 @@ _GROUP_NOTICE_MAX_CANDIDATES = 3
 _GROUP_NOTICE_DEDUP_SECONDS = 60.0
 _RECENT_REPLY_DEDUP_SECONDS = 2.0
 _RECENT_REPLY_KEYS: Dict[str, float] = {}
+_STATE_SWEEP_MIN_INTERVAL_SECONDS = 30.0
+_STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
+_STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
+_STATE_TTL_GROUP_NOTICE_SECONDS = 10.0 * 60.0
 
 
 def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECONDS) -> bool:
@@ -182,6 +186,7 @@ async def _warn_large_if_needed(api, ctx, logsvc: LogService, filename: str, n_b
 class BotState:
     last_find: Dict[str, List[Path]] = field(default_factory=dict)  # conv_key -> paths (for /get)
     last_find_label: Dict[str, str] = field(default_factory=dict)   # conv_key -> keyword/task-name (for zip naming)
+    last_find_ts: Dict[str, float] = field(default_factory=dict)    # conv_key -> last update ts
     # Handin: user_id -> queue of inbox files
     pending_handin_files: Dict[int, List[dict]] = field(default_factory=dict)
     # Handin: user_id -> {"ts": float}（检测到多文件后，等待用户回复 done 再打包）
@@ -196,6 +201,106 @@ class BotState:
     pending_handin_overwrite: Dict[int, dict] = field(default_factory=dict)
     # Group notice digest dedup cache: notice_key -> ts
     recent_group_notice_keys: Dict[str, float] = field(default_factory=dict)
+    # Opportunistic cleanup guard.
+    last_state_sweep_ts: float = 0.0
+
+
+def _mark_last_find_cache(state: BotState, key: str, hits: List[Path], label: str) -> None:
+    state.last_find[key] = hits
+    state.last_find_label[key] = label
+    state.last_find_ts[key] = time.time()
+
+
+def _entry_ts(item: object) -> float:
+    if not isinstance(item, dict):
+        return 0.0
+    try:
+        return float(item.get("ts") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _files_entry_latest_ts(items: object) -> float:
+    if not isinstance(items, list):
+        return 0.0
+    latest = 0.0
+    for it in items:
+        ts = _entry_ts(it)
+        if ts > latest:
+            latest = ts
+    return latest
+
+
+def _clear_pending_handin_user(state: BotState, user_id: int) -> None:
+    state.pending_handin_files.pop(user_id, None)
+    state.pending_handin_wait_done.pop(user_id, None)
+    state.pending_handin_zip_name.pop(user_id, None)
+    state.pending_handin_name_input.pop(user_id, None)
+    state.pending_handin_choose.pop(user_id, None)
+    state.pending_handin_overwrite.pop(user_id, None)
+
+
+def _sweep_bot_state_ttl(state: BotState, *, now: Optional[float] = None, force: bool = False) -> None:
+    now_ts = float(now if now is not None else time.time())
+    try:
+        last_sweep = float(state.last_state_sweep_ts or 0.0)
+    except Exception:
+        last_sweep = 0.0
+    if (not force) and ((now_ts - last_sweep) < _STATE_SWEEP_MIN_INTERVAL_SECONDS):
+        return
+    state.last_state_sweep_ts = now_ts
+
+    stale_find_before = now_ts - _STATE_TTL_LAST_FIND_SECONDS
+    for k in list(state.last_find.keys()):
+        try:
+            ts = float(state.last_find_ts.get(k, now_ts))
+        except Exception:
+            ts = now_ts
+        if ts < stale_find_before:
+            state.last_find.pop(k, None)
+            state.last_find_label.pop(k, None)
+            state.last_find_ts.pop(k, None)
+    for k in list(state.last_find_label.keys()):
+        if k not in state.last_find:
+            state.last_find_label.pop(k, None)
+            state.last_find_ts.pop(k, None)
+    for k in list(state.last_find_ts.keys()):
+        if k not in state.last_find:
+            state.last_find_ts.pop(k, None)
+
+    stale_pending_before = now_ts - _STATE_TTL_PENDING_HANDIN_SECONDS
+    pending_uids = set(state.pending_handin_files.keys())
+    pending_uids.update(state.pending_handin_wait_done.keys())
+    pending_uids.update(state.pending_handin_zip_name.keys())
+    pending_uids.update(state.pending_handin_name_input.keys())
+    pending_uids.update(state.pending_handin_choose.keys())
+    pending_uids.update(state.pending_handin_overwrite.keys())
+    for uid in list(pending_uids):
+        latest = _files_entry_latest_ts(state.pending_handin_files.get(uid))
+        for m in (
+            state.pending_handin_wait_done,
+            state.pending_handin_zip_name,
+            state.pending_handin_name_input,
+            state.pending_handin_choose,
+            state.pending_handin_overwrite,
+        ):
+            ts = _entry_ts(m.get(uid))
+            if ts > latest:
+                latest = ts
+        if latest <= 0.0:
+            latest = now_ts
+        if latest < stale_pending_before:
+            _clear_pending_handin_user(state, uid)
+
+    stale_notice_before = now_ts - _STATE_TTL_GROUP_NOTICE_SECONDS
+    for k, ts in list(state.recent_group_notice_keys.items()):
+        try:
+            if float(ts) < stale_notice_before:
+                state.recent_group_notice_keys.pop(k, None)
+        except Exception:
+            state.recent_group_notice_keys.pop(k, None)
+
+
 def conv_key(ctx) -> str:
     # 文件检索结果最好按“人”隔离，避免群里互相覆盖
     if ctx.scene == "group" and ctx.group_id is not None:
@@ -219,11 +324,21 @@ def _claim_group_notice_key(state: BotState, key: str, ttl_seconds: float = _GRO
     return True
 
 
-async def reply(api, ctx, text: str, logsvc: LogService):
+async def reply(
+    api,
+    ctx,
+    text: str,
+    logsvc: LogService,
+    force_private_user_id: Optional[int] = None,
+):
+    send_user_id = int(force_private_user_id) if force_private_user_id is not None else ctx.user_id
+    send_scene = "private" if force_private_user_id is not None else ctx.scene
+    send_group_id = None if force_private_user_id is not None else ctx.group_id
+
     async def _send_once():
-        if ctx.scene == "group" and ctx.group_id is not None:
-            return await api.send_group_msg(ctx.group_id, text)
-        return await api.send_private_msg(ctx.user_id, text)
+        if send_scene == "group" and send_group_id is not None:
+            return await api.send_group_msg(send_group_id, text)
+        return await api.send_private_msg(send_user_id, text)
 
     def _ok(resp) -> bool:
         if not isinstance(resp, dict):
@@ -242,8 +357,8 @@ async def reply(api, ctx, text: str, logsvc: LogService):
             return f"retcode={rc} {msg}"
         return f"retcode={rc}" if rc != "" else "send failed"
 
-    target = f"g:{ctx.group_id}" if ctx.scene == "group" and ctx.group_id is not None else f"u:{ctx.user_id}"
-    reply_key = f"{ctx.scene}:{target}:{text.strip()}"
+    target = f"g:{send_group_id}" if send_scene == "group" and send_group_id is not None else f"u:{send_user_id}"
+    reply_key = f"{send_scene}:{target}:{text.strip()}"
     if not _claim_recent_reply(reply_key):
         logsvc.log.info(f"消息发送去重：已拦截重复回复 target={target}")
         return
@@ -251,7 +366,7 @@ async def reply(api, ctx, text: str, logsvc: LogService):
     resp = await _send_once()
     if resp is None:
         logsvc.log.info(
-            f"消息发送未确认：scene={ctx.scene}, group={ctx.group_id}, user={ctx.user_id}，为避免重复发送不再重试"
+            f"消息发送未确认：scene={send_scene}, group={send_group_id}, user={send_user_id}，为避免重复发送不再重试"
         )
         return
     if not _ok(resp):
@@ -263,13 +378,8 @@ async def reply(api, ctx, text: str, logsvc: LogService):
         logsvc.log_out(ctx, text)
     else:
         logsvc.log.warning(
-            f"reply send failed: scene={ctx.scene}, group={ctx.group_id}, user={ctx.user_id}, detail={_detail(resp)}"
+            f"reply send failed: scene={send_scene}, group={send_group_id}, user={send_user_id}, detail={_detail(resp)}"
         )
-
-
-async def reply_private(api, user_id: int, text: str):
-    # ???????????????????fake ctx??
-    await api.send_private_msg(int(user_id), text)
 
 
 def _split_args(text: str):
@@ -837,12 +947,13 @@ def _rename_pending_file_with_submitter(item: dict, submitter_name: str) -> Tupl
         return True, dst.name
     except Exception as e:
         return False, f"重命名失败：{e}"
-def _cleanup_temp_files(paths: List[Path]) -> None:
+def _cleanup_temp_files(paths: List[Path], logsvc: Optional[LogService] = None) -> None:
     for p in paths:
         try:
             Path(p).unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            if logsvc is not None:
+                logsvc.log.warning(f"cleanup temp file failed: path={p} err={e}")
 def _zip_directory(src_dir: Path, out_zip: Path) -> Tuple[bool, str]:
     try:
         out_zip.parent.mkdir(parents=True, exist_ok=True)
@@ -859,7 +970,7 @@ def _zip_directory(src_dir: Path, out_zip: Path) -> Tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, str(e)
-def _zip_pending_files(items: List[dict], out_zip: Path) -> Tuple[bool, str, int, int]:
+def _zip_pending_files(items: List[dict], out_zip: Path, logsvc: Optional[LogService] = None) -> Tuple[bool, str, int, int]:
     """把待提交队列里的多个文件打成一个 zip。
     返回：(ok, msg, packed_count, missing_count)
     """
@@ -884,8 +995,9 @@ def _zip_pending_files(items: List[dict], out_zip: Path) -> Tuple[bool, str, int
         if packed <= 0:
             try:
                 out_zip.unlink(missing_ok=True)
-            except Exception:
-                pass
+            except Exception as e:
+                if logsvc is not None:
+                    logsvc.log.warning(f"remove empty zip failed: path={out_zip} err={e}")
             return False, "打包失败：没有可用文件。", 0, missing
         return True, "", packed, missing
     except Exception as e:
@@ -904,7 +1016,12 @@ def _suggest_batch_zip_basename(items: List[dict], user_id: int) -> str:
             break
     base = f"{nm}-{sid}" if (nm and sid) else (sid or nm or f"handin_u{user_id}")
     return _safe_zip_label(base, default=f"handin_u{user_id}")[:60].strip("._-") or f"handin_u{user_id}"
-def _stage_for_napcat(ctx, src: Path, display_name: Optional[str] = None) -> tuple[Optional[str], Optional[str], str]:
+def _stage_for_napcat(
+    ctx,
+    src: Path,
+    display_name: Optional[str] = None,
+    logsvc: Optional[LogService] = None,
+) -> tuple[Optional[str], Optional[str], str]:
     """把要发送的文件复制到 NapCat 专用上传目录，再返回容器内路径。
     返回：(container_path, send_name, msg)
     - container_path: 例如 /data/upload_group_file/xxx （OneBotAPI 会自动转为 file:///）
@@ -938,14 +1055,16 @@ def _stage_for_napcat(ctx, src: Path, display_name: Optional[str] = None) -> tup
         if mirror_dir is not None:
             try:
                 shutil.copy2(src, mirror_dir / staged_name)
-            except Exception:
-                pass
+            except Exception as e:
+                if logsvc is not None:
+                    logsvc.log.warning(f"mirror staged file failed: src={src} mirror={mirror_dir / staged_name} err={e}")
         # 基本校验：避免拷贝出空文件（例如源文件被占用/权限问题）
         try:
             if dst.stat().st_size <= 0 and src.stat().st_size > 0:
                 return None, None, "staging 失败：复制后文件大小为 0"
-        except Exception:
-            pass
+        except Exception as e:
+            if logsvc is not None:
+                logsvc.log.warning(f"validate staged file size failed: src={src} dst={dst} err={e}")
         # 展示名：默认使用原文件名；如上层指定 display_name，则以其为准
         send_name = (display_name or src.name)
         if SEND_FILENAME_ASCII_SAFE:
@@ -1235,8 +1354,8 @@ async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogServic
         # 任务不可用，丢弃该文件
         try:
             Path(item.get("path")).unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logsvc.log.warning(f"cleanup stale pending file failed: user={ctx.user_id} item={item} err={e}")
         q.pop(item_idx)
         state.pending_handin_files[ctx.user_id] = q
         state.pending_handin_overwrite.pop(ctx.user_id, None)
@@ -1247,8 +1366,8 @@ async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogServic
         # 不覆盖：删除临时文件
         try:
             Path(item.get("path")).unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logsvc.log.warning(f"cleanup non-overwrite file failed: user={ctx.user_id} item={item} err={e}")
         q.pop(item_idx)
         state.pending_handin_files[ctx.user_id] = q
         state.pending_handin_overwrite.pop(ctx.user_id, None)
@@ -1378,8 +1497,8 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
                 for it in q:
                     try:
                         Path(str(it.get("path") or "")).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logsvc.log.warning(f"cleanup batch pending file failed: user={ctx.user_id} item={it} err={e}")
                 state.pending_handin_files[ctx.user_id] = []
                 state.pending_handin_wait_done.pop(ctx.user_id, None)
                 state.pending_handin_zip_name.pop(ctx.user_id, None)
@@ -1394,8 +1513,8 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
             state.pending_handin_files[ctx.user_id] = q
             try:
                 Path(item["path"]).unlink(missing_ok=True)
-            except Exception:
-                pass
+            except Exception as e:
+                logsvc.log.warning(f"cleanup dropped pending file failed: user={ctx.user_id} item={item} err={e}")
             state.pending_handin_wait_done.pop(ctx.user_id, None)
             state.pending_handin_zip_name.pop(ctx.user_id, None)
             state.pending_handin_name_input.pop(ctx.user_id, None)
@@ -1483,8 +1602,7 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
             return True
         files = handin.list_submitted_files(task)
         k = conv_key(ctx)
-        state.last_find[k] = files
-        state.last_find_label[k] = task.name
+        _mark_last_find_cache(state, k, files, task.name)
         if not files:
             await reply(api, ctx, f"任务「{task.name}」当前还没有提交文件。", logsvc)
         else:
@@ -1520,10 +1638,10 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
         # 大文件提示（打包后的 zip 将要发送）
         try:
             await _warn_large_if_needed(api, ctx, logsvc, f"{task.name}.zip", int(Path(zpath).stat().st_size), mode="zip")
-        except Exception:
-            pass
+        except Exception as e:
+            logsvc.log.warning(f"warn large zip failed: task={task.task_id} zip={zpath} err={e}")
         # 发送 zip：先 staging 到 NapCat 专用上传目录（/data/upload_*），再上传
-        cpath, send_name, stage_msg = _stage_for_napcat(ctx, zpath, display_name=f"{task.name}.zip")
+        cpath, send_name, stage_msg = _stage_for_napcat(ctx, zpath, display_name=f"{task.name}.zip", logsvc=logsvc)
         if not cpath:
             await reply(api, ctx, f"staging 失败：{stage_msg}", logsvc)
             state.pending_handin_choose.pop(ctx.user_id, None)
@@ -1540,8 +1658,8 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
             try:
                 task.last_handinget_ts = time.time()
                 handin._save()
-            except Exception:
-                pass
+            except Exception as e:
+                logsvc.log.warning(f"update last_handinget_ts failed: task={task.task_id} err={e}")
         state.pending_handin_choose.pop(ctx.user_id, None)
         return True
     return False
@@ -1618,8 +1736,7 @@ async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogServ
     has_more = len(entries) > int(LS_LIMIT)
     entries = entries[: int(LS_LIMIT)]
     # 下钻后刷新 /get 的候选列表，支持继续按数字进入下一层目录。
-    state.last_find[k] = entries
-    state.last_find_label[k] = p.name
+    _mark_last_find_cache(state, k, entries, p.name)
     if not entries:
         await reply(api, ctx, f"📁 {p.name}/ 目录为空。", logsvc)
         return True
@@ -1642,16 +1759,14 @@ async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogServ
     lines.append("也可用 /get 序号（如/get 1 2 3 4）获取当前列表中的文件/文件夹。")
     await reply(api, ctx, "\n".join(lines), logsvc)
     return True
-async def dispatch(
+async def _ensure_group_context_and_schedule_digest(
     api,
     ctx,
     evt: dict,
     text: str,
-    filesvc: FileService,
     logsvc: LogService,
     state: BotState,
     handin: HandinService,
-    perm=None,
     aisvc: Optional["AIService"] = None,
 ):
     # ========== group_name 兜底 ==========
@@ -1668,42 +1783,58 @@ async def dispatch(
         _schedule_group_notice_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
     # ========== Handin: 文件提交 / 数字选择（优先） ==========
     # 私聊文件 / 覆盖确认 / 数字选择（优先）
+
+async def _handle_pre_dispatch_state(
+    api,
+    ctx,
+    evt: dict,
+    text: str,
+    logsvc: LogService,
+    state: BotState,
+    handin: HandinService,
+    filesvc: FileService,
+):
     if ctx.scene.startswith("private"):
         handled = await _handle_private_file(api, ctx, evt, logsvc, state, handin)
         if handled:
-            return
+            return True
         handled = await _handle_private_overwrite_yesno(api, ctx, text, logsvc, state, handin)
         if handled:
-            return
+            return True
         handled = await _handle_private_done_batch(api, ctx, text, logsvc, state, handin)
         if handled:
-            return
+            return True
         handled = await _handle_private_zip_name_input(api, ctx, text, logsvc, state, handin)
         if handled:
-            return
+            return True
         handled = await _handle_private_name_input(api, ctx, text, logsvc, state, handin)
         if handled:
-            return
+            return True
         handled = await _handle_private_number_choice(api, ctx, text, logsvc, state, handin, filesvc)
         if handled:
-            return
+            return True
     handled = await _handle_cancel_number_choice(api, ctx, text, logsvc, state, handin)
     if handled:
-        return
+        return True
     # ========== 原有文字命令体系 ==========
-    t = (text or "").strip()
-    if not t:
-        return
-    # 记录 IN（只有最终 log_out 才会落盘）
-    logsvc.log_in(ctx, t)
+    return False
+
+async def _handle_ai_chat_trigger(
+    api,
+    ctx,
+    evt: dict,
+    t: str,
+    logsvc: LogService,
+    aisvc: Optional["AIService"] = None,
+):
     ai_input = _extract_ai_chat_input(ctx, evt, t, bot_nick=(aisvc.bot_nick if aisvc else AI_BOT_NICK))
     if ai_input is not None:
         if not ai_input:
             await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊消息前加 C。", logsvc)
-            return
+            return True
         if (aisvc is None) or (not aisvc.chat_ready):
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
-            return
+            return True
         try:
             out = (await aisvc.chat(ai_input)).strip()
             if not out:
@@ -1711,17 +1842,39 @@ async def dispatch(
             await reply(api, ctx, out, logsvc)
         except Exception:
             await reply(api, ctx, aisvc.fallback_error_reply, logsvc)
-        return
+        return True
+    return False
+
+async def _handle_plain_text_input(
+    api,
+    ctx,
+    t: str,
+    logsvc: LogService,
+    state: BotState,
+):
     if not (t.startswith("/") or t.startswith("／")):
         handled = await _handle_find_folder_number_choice(api, ctx, t, logsvc, state)
         if handled:
-            return
+            return True
         fixed_answers = _lookup_fixed_answers(t)
         if fixed_answers:
             for msg in fixed_answers:
                 await reply(api, ctx, msg, logsvc)
-            return
-        return
+            return True
+        return True
+    return False
+
+async def _handle_explicit_command(
+    api,
+    ctx,
+    t: str,
+    filesvc: FileService,
+    logsvc: LogService,
+    state: BotState,
+    handin: HandinService,
+    perm=None,
+    aisvc: Optional["AIService"] = None,
+):
     t = t[1:]  # 去掉 /
     cmd, rest = _split_args(t)
     cmd = cmd.lower()
@@ -1926,7 +2079,7 @@ async def dispatch(
         # 若在群里发，群里提示，列表私聊
         if ctx.scene == "group":
             await reply(api, ctx, "已私聊你提交任务列表，请在私聊里回复数字选择。", logsvc)
-            await reply_private(api, ctx.user_id, "\n".join(text_list))
+            await reply(api, ctx, "\n".join(text_list), logsvc, force_private_user_id=ctx.user_id)
         else:
             await reply(api, ctx, "\n".join(text_list), logsvc)
         state.pending_handin_choose[ctx.user_id] = {"mode": "status", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
@@ -1957,7 +2110,7 @@ async def dispatch(
         text_list.append("回复数字选择任务（回复 0 取消），我会列出已提交文件列表（已截止任务也可查看）。")
         if ctx.scene == "group":
             await reply(api, ctx, "已私聊你任务列表，请在私聊里回复数字选择。", logsvc)
-            await reply_private(api, ctx.user_id, "\n".join(text_list))
+            await reply(api, ctx, "\n".join(text_list), logsvc, force_private_user_id=ctx.user_id)
         else:
             await reply(api, ctx, "\n".join(text_list), logsvc)
         state.pending_handin_choose[ctx.user_id] = {"mode": "check", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
@@ -1988,7 +2141,7 @@ async def dispatch(
         text_list.append("回复数字选择任务（回复 0 取消），我会把已提交文件打包为 zip 并发送（已截止任务也可导出）。")
         if ctx.scene == "group":
             await reply(api, ctx, "已私聊你任务列表，请在私聊里回复数字选择。", logsvc)
-            await reply_private(api, ctx.user_id, "\n".join(text_list))
+            await reply(api, ctx, "\n".join(text_list), logsvc, force_private_user_id=ctx.user_id)
         else:
             await reply(api, ctx, "\n".join(text_list), logsvc)
         state.pending_handin_choose[ctx.user_id] = {"mode": "getzip", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
@@ -2048,10 +2201,14 @@ async def dispatch(
                 return
         else:
             kw, in_dir = _parse_find_args(rest, filesvc)
-            hits = filesvc.find(ctx, kw, in_dir=in_dir)
+            try:
+                hits = await asyncio.to_thread(filesvc.find, ctx, kw, in_dir=in_dir)
+            except Exception as e:
+                logsvc.log.exception(f"/find failed: kw={kw!r} in_dir={in_dir!r} err={e}")
+                await reply(api, ctx, "搜索失败，请稍后再试。", logsvc)
+                return
         k = conv_key(ctx)
-        state.last_find[k] = hits
-        state.last_find_label[k] = kw
+        _mark_last_find_cache(state, k, hits, kw)
         if not hits:
             if semantic_mode:
                 await reply(api, ctx, "没找到符合语义的文件，试试换个说法或用普通关键词 /find。", logsvc)
@@ -2071,8 +2228,8 @@ async def dispatch(
                 if _is_large(sz):
                     suffix = f" （{_fmt_mb(sz)}，大文件）"
                     has_large = True
-            except Exception:
-                pass
+            except Exception as e:
+                logsvc.log.warning(f"/find stat failed: path={p} err={e}")
             file_lines.append(f"{i}. 📄 {p.name}{suffix}")
         lines = ["语义检索结果：" if semantic_mode else "搜索结果："]
         lines.append(f"📁 文件夹命中：")
@@ -2177,9 +2334,9 @@ async def dispatch(
                 display_name = f"{label}.zip"
                 try:
                     await _warn_large_if_needed(api, ctx, logsvc, display_name, int(outer_zip.stat().st_size), mode="zip")
-                except Exception:
-                    pass
-                cpath, send_name, stage_msg = _stage_for_napcat(ctx, outer_zip, display_name=display_name)
+                except Exception as e:
+                    logsvc.log.warning(f"warn large outer zip failed: zip={outer_zip} err={e}")
+                cpath, send_name, stage_msg = _stage_for_napcat(ctx, outer_zip, display_name=display_name, logsvc=logsvc)
                 if not cpath:
                     await reply(api, ctx, f"staging 失败：{stage_msg}", logsvc)
                     return
@@ -2207,9 +2364,9 @@ async def dispatch(
             for idx, p, shown_name in prepared_items:
                 try:
                     await _warn_large_if_needed(api, ctx, logsvc, shown_name, int(p.stat().st_size), mode="send")
-                except Exception:
-                    pass
-                cpath, send_name, stage_msg = _stage_for_napcat(ctx, p, display_name=shown_name)
+                except Exception as e:
+                    logsvc.log.warning(f"warn large send file failed: file={p} shown_name={shown_name} err={e}")
+                cpath, send_name, stage_msg = _stage_for_napcat(ctx, p, display_name=shown_name, logsvc=logsvc)
                 if not cpath:
                     bad_list.append(f"{idx}({shown_name}:{stage_msg or 'staging失败'})")
                     continue
@@ -2235,9 +2392,9 @@ async def dispatch(
                                 temp_artifacts.append(zpath)
                                 try:
                                     await _warn_large_if_needed(api, ctx, logsvc, zpath.name, int(zpath.stat().st_size), mode="zip")
-                                except Exception:
-                                    pass
-                                cpath2, _send_name2, stage_msg2 = _stage_for_napcat(ctx, zpath)
+                                except Exception as e:
+                                    logsvc.log.warning(f"warn large fallback zip failed: zip={zpath} err={e}")
+                                cpath2, _send_name2, stage_msg2 = _stage_for_napcat(ctx, zpath, logsvc=logsvc)
                                 if not cpath2:
                                     bad_list.append(f"{idx}({shown_name}:zip staging失败:{stage_msg2})")
                                     did_zip_fallback = True
@@ -2253,7 +2410,8 @@ async def dispatch(
                                     else:
                                         bad_list.append(f"{idx}({shown_name}:zip发送失败:" + (detailz or "失败") + ")")
                                         did_zip_fallback = True
-                            except Exception:
+                            except Exception as e:
+                                logsvc.log.warning(f"zip fallback failed: file={p} shown_name={shown_name} err={e}")
                                 did_zip_fallback = False
                     if not did_zip_fallback:
                         bad_list.append(f"{idx}({shown_name}:" + (detail or "失败") + ")")
@@ -2275,9 +2433,37 @@ async def dispatch(
             await reply(api, ctx, "\n".join(msg_lines) if msg_lines else "没有发送任何文件。", logsvc)
             return
         finally:
-            _cleanup_temp_files(temp_artifacts)
+            _cleanup_temp_files(temp_artifacts, logsvc=logsvc)
     # 未知命令
     await reply(api, ctx, f"未知命令：/{cmd}（用 /help 查看）", logsvc)
+
+async def dispatch(
+    api,
+    ctx,
+    evt: dict,
+    text: str,
+    filesvc: FileService,
+    logsvc: LogService,
+    state: BotState,
+    handin: HandinService,
+    perm=None,
+    aisvc: Optional["AIService"] = None,
+):
+    _sweep_bot_state_ttl(state)
+    await _ensure_group_context_and_schedule_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
+    if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc):
+        return
+    t = (text or "").strip()
+    if not t:
+        return
+    # 记录 IN（只有最终 log_out 才会落盘）
+    logsvc.log_in(ctx, t)
+    if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc):
+        return
+    if await _handle_plain_text_input(api, ctx, t, logsvc, state):
+        return
+    await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc)
+
 async def _handle_private_done_batch(api, ctx, text: str, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
     """处理私聊批量文件的 done 指令：进入“等待 zip 命名”阶段。"""
     t = (text or "").strip()
@@ -2347,8 +2533,8 @@ async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService
         for it in q_cancel:
             try:
                 Path(str(it.get("path") or "")).unlink(missing_ok=True)
-            except Exception:
-                pass
+            except Exception as e:
+                logsvc.log.warning(f"cleanup pending handin file failed: user={ctx.user_id} item={it} err={e}")
         state.pending_handin_files[ctx.user_id] = []
         state.pending_handin_wait_done.pop(ctx.user_id, None)
         state.pending_handin_zip_name.pop(ctx.user_id, None)
@@ -2382,7 +2568,7 @@ async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService
                 out_zip = p2
                 break
             i += 1
-    ok_zip, msg_zip, packed, missing = _zip_pending_files(q, out_zip)
+    ok_zip, msg_zip, packed, missing = _zip_pending_files(q, out_zip, logsvc=logsvc)
     if not ok_zip:
         await reply(api, ctx, msg_zip, logsvc)
         return True
@@ -2390,8 +2576,8 @@ async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService
     for it in q:
         try:
             Path(str(it.get("path") or "")).unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logsvc.log.warning(f"remove source after zip failed: user={ctx.user_id} item={it} err={e}")
     state.pending_handin_files[ctx.user_id] = [{
         "path": str(out_zip),
         "name": out_zip.name,

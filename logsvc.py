@@ -129,7 +129,6 @@ class LogService:
 
             folder = self.group_dir / folder_name
             folder.mkdir(parents=True, exist_ok=True)
-            folder.mkdir(parents=True, exist_ok=True)
 
             fname = f"session_{_ts(start_ts)}.txt"
             return folder / fname

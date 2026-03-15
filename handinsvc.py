@@ -279,8 +279,11 @@ class HandinService:
             tdir = self._task_dir(task.group_id, task.name)
             if tdir.exists():
                 shutil.rmtree(tdir, ignore_errors=True)
-        except Exception:
-            pass
+        except Exception as e:
+            self.log.warning(
+                f"[handin] purge archive dir failed: task={task.task_id} group={task.group_id} "
+                f"name={task.name} err={e}"
+            )
         changed = False
         if not getattr(task, "purged", False):
             task.purged = True
@@ -322,10 +325,11 @@ class HandinService:
                     try:
                         if now - float(p.stat().st_mtime) >= inbox_keep:
                             p.unlink(missing_ok=True)
-                    except Exception:
+                    except Exception as e:
+                        self.log.warning(f"[handin] inbox cleanup item failed: path={p} err={e}")
                         continue
-        except Exception:
-            pass
+        except Exception as e:
+            self.log.warning(f"[handin] inbox cleanup failed: root={self.inbox_dir} err={e}")
 
         return changed
 
@@ -839,8 +843,8 @@ class HandinService:
                 if dst_part.exists():
                     try:
                         dst_part.unlink()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.log.warning(f"[handin] remove stale partial file failed: path={dst_part} err={e}")
 
                 with urllib.request.urlopen(req, timeout=float(timeout)) as resp, open(dst_part, "wb") as f:
                     downloaded = 0
@@ -874,8 +878,8 @@ class HandinService:
                 try:
                     if dst_part.exists():
                         dst_part.unlink()
-                except Exception:
-                    pass
+                except Exception as e2:
+                    self.log.warning(f"[handin] cleanup partial file after download error failed: path={dst_part} err={e2}")
                 return False, f"下载文件失败：网络下载异常：{e}", None
 
         return False, f"不支持的下载来源：{raw}", None
@@ -1037,8 +1041,8 @@ class HandinService:
                         if self.cleanup_archives_and_inbox(now=now):
                             changed = True
                         self._last_cleanup_ts = now
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.log.warning(f"[handin] periodic cleanup failed: err={e}")
                 for t in list(self._tasks.values()):
                     if t.closed:
                         continue
@@ -1072,5 +1076,5 @@ class HandinService:
 
                 if changed:
                     self._save()
-            except Exception as e:
-                self.log.warning(f"handin scheduler error: {e}")
+            except Exception:
+                self.log.exception("handin scheduler error")

@@ -1,6 +1,4 @@
-import asyncio
 import logging
-import websockets
 import colorlog
 from zoneinfo import ZoneInfo
 from datetime import datetime

@@ -2,6 +2,7 @@
 import os
 import asyncio
 import json
+import time
 import websockets
 from pathlib import Path
 from typing import Dict, Set
@@ -30,6 +31,8 @@ log = Logger("bot", "INFO")
 
 # 允许不同会话并发处理，避免大文件发送阻塞全局。
 MAX_DISPATCH_CONCURRENCY = 32
+CONV_LOCK_TTL_SECONDS = 30.0 * 60.0
+CONV_LOCK_SWEEP_INTERVAL_SECONDS = 60.0
 _INSTANCE_LOCK_HANDLE = None
 
 
@@ -99,21 +102,48 @@ async def run_forever():
                 logsvc = LogService(LOG_DIR, log)
                 dispatch_sem = asyncio.Semaphore(MAX_DISPATCH_CONCURRENCY)
                 conv_locks: Dict[str, asyncio.Lock] = {}
+                conv_lock_last_used: Dict[str, float] = {}
+                last_conv_lock_sweep = 0.0
                 inflight: Set[asyncio.Task] = set()
 
+                def _sweep_conv_locks(now_ts: float) -> None:
+                    nonlocal last_conv_lock_sweep
+                    if (now_ts - last_conv_lock_sweep) < CONV_LOCK_SWEEP_INTERVAL_SECONDS:
+                        return
+                    stale_before = now_ts - CONV_LOCK_TTL_SECONDS
+                    for k, ts in list(conv_lock_last_used.items()):
+                        try:
+                            ts_val = float(ts)
+                        except Exception:
+                            ts_val = 0.0
+                        if ts_val >= stale_before:
+                            continue
+                        lk = conv_locks.get(k)
+                        if lk is not None and lk.locked():
+                            continue
+                        conv_lock_last_used.pop(k, None)
+                        conv_locks.pop(k, None)
+                    last_conv_lock_sweep = now_ts
+
                 async def _handle_one_event(ctx, data: dict, text: str):
+                    now_ts = time.time()
+                    _sweep_conv_locks(now_ts)
                     key = conv_key(ctx)
                     lock = conv_locks.get(key)
                     if lock is None:
                         lock = asyncio.Lock()
                         conv_locks[key] = lock
+                    conv_lock_last_used[key] = now_ts
 
                     async with dispatch_sem:
                         async with lock:
+                            conv_lock_last_used[key] = time.time()
                             try:
                                 await dispatch(api, ctx, data, text, filesvc, logsvc, state, handin, perm, aisvc)
                             except Exception as e:
                                 log.exception(f"dispatch 异常: {e}")
+                            finally:
+                                conv_lock_last_used[key] = time.time()
 
                 log.info("已连接至服务器")
                 cleanup_task = asyncio.create_task(logsvc.cleanup_loop())
@@ -121,41 +151,67 @@ async def run_forever():
 
                 try:
                     async for message in ws:
-                        data = json.loads(message)
-
-                        # ===== 自动通过好友申请（post_type=request）=====
-                        if data.get("post_type") == "request" and data.get("request_type") == "friend":
-                            if AUTO_APPROVE_FRIEND_REQUEST:
-                                flag = data.get("flag")
-                                req_uid = int(data.get("user_id") or 0)
-                                comment = str(data.get("comment") or "").strip()
-                                if flag:
-                                    log.info(f"收到好友申请：user_id={req_uid} comment={comment!r} -> 自动通过")
-                                    asyncio.create_task(
-                                        api.set_friend_add_request(
-                                            flag=str(flag),
-                                            approve=True,
-                                            remark=AUTO_APPROVE_FRIEND_REMARK,
-                                        )
-                                    )
-                                else:
-                                    log.warning(f"收到好友申请但缺少 flag：{data}")
-                            continue
-
-                        # action 回包
-                        if "echo" in data:
-                            api.feed_response(data)
-                            if "post_type" not in data:
+                        data = None
+                        try:
+                            try:
+                                data = json.loads(message)
+                            except Exception as e:
+                                raw_preview = str(message)
+                                if len(raw_preview) > 240:
+                                    raw_preview = raw_preview[:240] + "...(truncated)"
+                                log.warning(f"WS message parse failed: err={e}; raw={raw_preview!r}")
                                 continue
 
-                        ctx = build_ctx(data, perm=perm)
-                        if not ctx:
-                            continue
+                            if not isinstance(data, dict):
+                                log.warning(f"WS message ignored: expected JSON object, got {type(data).__name__}")
+                                continue
 
-                        text = get_text(data)
-                        task = asyncio.create_task(_handle_one_event(ctx, data, text))
-                        inflight.add(task)
-                        task.add_done_callback(lambda t: inflight.discard(t))
+                            # ===== 自动通过好友申请（post_type=request）=====
+                            if data.get("post_type") == "request" and data.get("request_type") == "friend":
+                                if AUTO_APPROVE_FRIEND_REQUEST:
+                                    flag = data.get("flag")
+                                    req_uid = int(data.get("user_id") or 0)
+                                    comment = str(data.get("comment") or "").strip()
+                                    if flag:
+                                        log.info(f"收到好友申请：user_id={req_uid} comment={comment!r} -> 自动通过")
+                                        asyncio.create_task(
+                                            api.set_friend_add_request(
+                                                flag=str(flag),
+                                                approve=True,
+                                                remark=AUTO_APPROVE_FRIEND_REMARK,
+                                            )
+                                        )
+                                    else:
+                                        log.warning(f"收到好友申请但缺少 flag：{data}")
+                                continue
+
+                            # action 回包
+                            if "echo" in data:
+                                api.feed_response(data)
+                                if "post_type" not in data:
+                                    continue
+
+                            ctx = build_ctx(data, perm=perm)
+                            if not ctx:
+                                continue
+
+                            text = get_text(data)
+                            task = asyncio.create_task(_handle_one_event(ctx, data, text))
+                            inflight.add(task)
+                            task.add_done_callback(lambda t: inflight.discard(t))
+                        except Exception as e:
+                            post_type = data.get("post_type") if isinstance(data, dict) else None
+                            request_type = data.get("request_type") if isinstance(data, dict) else None
+                            notice_type = data.get("notice_type") if isinstance(data, dict) else None
+                            message_type = data.get("message_type") if isinstance(data, dict) else None
+                            has_echo = ("echo" in data) if isinstance(data, dict) else False
+                            log.exception(
+                                "WS message handling failed: "
+                                f"post_type={post_type!r} request_type={request_type!r} "
+                                f"notice_type={notice_type!r} message_type={message_type!r} "
+                                f"has_echo={has_echo} err={e}"
+                            )
+                            continue
                 finally:
                     for t in (cleanup_task, scheduler_task):
                         t.cancel()

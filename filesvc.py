@@ -127,7 +127,7 @@ class FileService:
             base_res = base.resolve()
             p.relative_to(base_res)
             return p
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
             return None
 
     def list_dir(self, ctx, arg: Optional[str]) -> Tuple[bool, str]:
@@ -276,7 +276,7 @@ class FileService:
     def _depth_under(base: Path, p: Path) -> int:
         try:
             return len(p.relative_to(base).parts)
-        except Exception:
+        except ValueError:
             return len(p.parts)
 
     def _score_candidate(self, p: Path, base: Path, is_file: bool, query_compact: str, query_groups: List[List[str]]) -> float:
@@ -284,7 +284,7 @@ class FileService:
         stem = Path(name).stem if is_file else name
         try:
             rel = p.relative_to(base).as_posix()
-        except Exception:
+        except ValueError:
             rel = name
 
         forms = []
@@ -401,7 +401,7 @@ class FileService:
                         continue
                     try:
                         key = os.path.normcase(str(p.resolve()))
-                    except Exception:
+                    except (OSError, RuntimeError):
                         key = os.path.normcase(str(p))
                     if key in seen:
                         continue
@@ -423,7 +423,7 @@ class FileService:
                         continue
                     try:
                         key = os.path.normcase(str(p.resolve()))
-                    except Exception:
+                    except (OSError, RuntimeError):
                         key = os.path.normcase(str(p))
                     if key in seen:
                         continue
@@ -444,7 +444,7 @@ class FileService:
         try:
             rel = p.resolve().relative_to(DATA_DIR.resolve())
             return rel.as_posix()
-        except Exception:
+        except (OSError, RuntimeError, ValueError):
             return p.name
 
     def to_container_path(self, p: Path) -> str:
