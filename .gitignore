@@ -1,6 +1,7 @@
 # secrets
 secrets.env
 *.env
+api_key.txt
 
 # runtime folders (不上传这些目录)
 __pycache__/
