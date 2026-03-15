@@ -41,18 +41,24 @@ def get_text(evt: dict) -> str:
     return ""
 
 def build_ctx(evt: dict, perm: Optional[PermService] = None) -> Optional[Ctx]:
-    if evt.get("post_type") != "message":
+    post_type = str(evt.get("post_type") or "").lower()
+    if post_type == "message":
+        mtype = evt.get("message_type")
+        sender = evt.get("sender") or {}
+    elif post_type == "notice" and str(evt.get("notice_type") or "").lower() == "group_upload":
+        # 群文件上传事件没有 message_type/sender，按群消息上下文处理。
+        mtype = "group"
+        sender = {}
+    else:
         return None
 
-    mtype = evt.get("message_type")
-    sender = evt.get("sender") or {}
     user_id = int(sender.get("user_id") or evt.get("user_id") or 0)
     if not user_id:
         return None
 
     # QQ 昵称（全局）与群名片（群昵称）分开存
-    nickname = str(sender.get("nickname") or "").strip() or str(user_id)
-    card = str(sender.get("card") or "").strip()
+    nickname = str(sender.get("nickname") or evt.get("nickname") or "").strip() or str(user_id)
+    card = str(sender.get("card") or evt.get("card") or "").strip()
     group_id = evt.get("group_id")
     if group_id is not None:
         group_id = int(group_id)
@@ -103,6 +109,23 @@ def build_ctx(evt: dict, perm: Optional[PermService] = None) -> Optional[Ctx]:
 def get_files(evt: dict) -> list[dict]:
     """提取 OneBot v11 file 段。返回 [{'name','file_id','url','size'}...]"""
     out = []
+
+    # notice/group_upload 事件（群文件上传）
+    if (
+        str(evt.get("post_type") or "").lower() == "notice"
+        and str(evt.get("notice_type") or "").lower() == "group_upload"
+    ):
+        data = evt.get("file") or {}
+        if isinstance(data, dict):
+            out.append({
+                "name": str(data.get("name") or data.get("file") or ""),
+                "file_id": str(data.get("id") or data.get("file_id") or evt.get("file_id") or ""),
+                "url": str(data.get("url") or evt.get("url") or ""),
+                "size": str(data.get("size") or data.get("file_size") or evt.get("file_size") or ""),
+                "busid": str(data.get("busid") or evt.get("busid") or ""),
+            })
+        return out
+
     msg = evt.get("message")
     # array segments
     if isinstance(msg, list):
@@ -121,6 +144,7 @@ def get_files(evt: dict) -> list[dict]:
                     "file_id": str(fid),
                     "url": str(url),
                     "size": str(size),
+                    "busid": str(data.get("busid") or ""),
                 })
         return out
 
@@ -141,5 +165,6 @@ def get_files(evt: dict) -> list[dict]:
                 "file_id": data.get("file_id",""),
                 "url": data.get("url",""),
                 "size": data.get("file_size",""),
+                "busid": data.get("busid",""),
             })
     return out

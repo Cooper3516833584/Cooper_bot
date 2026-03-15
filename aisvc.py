@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import threading
@@ -32,9 +33,34 @@ except Exception:  # pragma: no cover - optional dependency
     PyPDF2 = None
 
 try:
+    import fitz  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    fitz = None
+
+try:
     from docx import Document  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     Document = None
+
+try:
+    import aiohttp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    aiohttp = None
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    BeautifulSoup = None
+
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    OpenAI = None
+
+try:
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    RapidOCR = None
 
 
 class AIService:
@@ -46,6 +72,7 @@ class AIService:
         "build_vectors.py",
     }
     _ALLOWED_SUFFIXES = {".pdf", ".docx", ".ppt", ".pptx"}
+    _NOTICE_SILENT_TOKEN = "[静默]"
 
     def __init__(self, log):
         self.log = log
@@ -73,6 +100,7 @@ class AIService:
         self._lock = threading.RLock()
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
+        self._rapid_ocr = None
 
     @property
     def chat_ready(self) -> bool:
@@ -89,6 +117,10 @@ class AIService:
             and len(self._semantic_meta) == int(self._semantic_norm_vectors.shape[0])
         )
 
+    @property
+    def notice_ready(self) -> bool:
+        return bool(self.deepseek_api_key and OpenAI is not None)
+
     async def bootstrap_sync(self) -> None:
         await asyncio.to_thread(self._bootstrap_sync_sync)
 
@@ -97,6 +129,50 @@ class AIService:
 
     async def chat(self, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_sync, user_input)
+
+    async def extract_notice_file_head(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
+        return await asyncio.to_thread(
+            self._extract_notice_file_head_sync,
+            Path(path),
+            int(max_chars),
+            int(max_pages),
+        )
+
+    async def extract_notice_url_head(self, url: str, max_chars: int = 4000) -> str:
+        return await self._extract_notice_url_head_async(str(url or "").strip(), int(max_chars))
+
+    async def classify_notice(self, source: str, snippet: str) -> bool:
+        return await asyncio.to_thread(self._classify_notice_sync, str(source or ""), str(snippet or ""))
+
+    async def reason_notice(self, source: str, snippet: str) -> str:
+        return await asyncio.to_thread(self._reason_notice_sync, str(source or ""), str(snippet or ""))
+
+    @classmethod
+    def is_notice_silent(cls, text: str) -> bool:
+        return str(text or "").strip() == cls._NOTICE_SILENT_TOKEN
+
+    @staticmethod
+    def sanitize_reasoner_output(text: str) -> str:
+        s = str(text or "")
+        s = re.sub(r"<think\b[^>]*>[\s\S]*?</think>", "", s, flags=re.IGNORECASE)
+        s = s.strip()
+        if s.startswith("```"):
+            s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+            s = re.sub(r"\s*```$", "", s)
+        # QQ 里不需要 Markdown 星号样式，统一去掉。
+        s = s.replace("*", "")
+        # 兜底：去掉“原文未提及/未知/暂无/待通知”这类占位行。
+        bad_tokens = ("原文未提及", "未知", "暂无", "待通知")
+        kept = []
+        for ln in s.splitlines():
+            line = ln.strip()
+            if not line:
+                continue
+            if any(tok in line for tok in bad_tokens):
+                continue
+            kept.append(line)
+        s = "\n".join(kept).strip()
+        return s.strip()
 
     def _bootstrap_sync_sync(self) -> None:
         self.material_dir.mkdir(parents=True, exist_ok=True)
@@ -299,6 +375,223 @@ class AIService:
         if not text:
             raise RuntimeError("empty chat response")
         return text
+
+    def _extract_notice_file_head_sync(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
+        p = Path(path)
+        if (not p.exists()) or (not p.is_file()):
+            return ""
+        suffix = p.suffix.lower()
+        if suffix == ".pdf":
+            text = self._read_pdf_head_fitz(p, max_pages=max_pages, max_chars=max_chars)
+            if self._has_enough_text(text):
+                return text
+            text2 = self._read_pdf_head(p, max_pages=max_pages, max_chars=max_chars)
+            if self._has_enough_text(text2):
+                return text2
+            # 扫描件兜底：尝试 OCR
+            text3 = self._read_pdf_head_ocr(p, max_pages=max_pages, max_chars=max_chars)
+            if self._has_enough_text(text3):
+                self.log.info(f"群通知解析：已使用 OCR 提取扫描 PDF 文本 {p.name}")
+                return text3
+            return text3
+        if suffix == ".docx":
+            return self._read_docx_head(p, max_chars=max_chars)
+        return ""
+
+    @staticmethod
+    def _has_enough_text(text: str, min_chars: int = 20) -> bool:
+        compact = re.sub(r"\s+", "", str(text or ""))
+        return len(compact) >= int(min_chars)
+
+    async def _extract_notice_url_head_async(self, url: str, max_chars: int = 4000) -> str:
+        if (not url) or (not (url.startswith("http://") or url.startswith("https://"))):
+            return ""
+        if aiohttp is None or BeautifulSoup is None:
+            self.log.warning("群通知解析：缺少 aiohttp 或 beautifulsoup4，回退到 urllib 简易解析")
+            return await asyncio.to_thread(self._extract_notice_url_head_urllib_sync, url, int(max_chars))
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        timeout = aiohttp.ClientTimeout(total=25.0)
+
+        html = ""
+        content_type = ""
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(url, allow_redirects=True) as resp:
+                    if int(resp.status) >= 400:
+                        return ""
+                    content_type = str(resp.headers.get("Content-Type") or "").lower()
+                    html = await resp.text(errors="ignore")
+        except Exception as e:
+            self.log.warning(f"群通知解析：网页抓取失败 {url[:120]}: {e}")
+            return await asyncio.to_thread(self._extract_notice_url_head_urllib_sync, url, int(max_chars))
+
+        if not html:
+            return ""
+
+        if "text/plain" in content_type and "<html" not in html[:500].lower():
+            plain = re.sub(r"\s+", " ", html).strip()
+            return plain[:max_chars]
+
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for bad in soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
+                bad.decompose()
+            body = soup.body if soup.body is not None else soup
+            text = body.get_text(separator="\n", strip=True)
+            text = re.sub(r"[ \t]+", " ", text)
+            text = re.sub(r"\n{2,}", "\n", text).strip()
+            return text[:max_chars]
+        except Exception as e:
+            self.log.warning(f"群通知解析：网页正文提取失败 {url[:120]}: {e}")
+            return self._extract_notice_url_head_urllib_sync(url, int(max_chars))
+
+    def _extract_notice_url_head_urllib_sync(self, url: str, max_chars: int = 4000) -> str:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=25.0) as resp:
+                content_type = str(resp.headers.get("Content-Type") or "").lower()
+                raw = resp.read(1024 * 1024)  # 1MB upper bound
+        except Exception as e:
+            self.log.warning(f"群通知解析：urllib 抓取失败 {url[:120]}: {e}")
+            return ""
+
+        txt = raw.decode("utf-8", errors="ignore")
+        if not txt:
+            return ""
+
+        if "text/plain" in content_type and "<html" not in txt[:500].lower():
+            plain = re.sub(r"\s+", " ", txt).strip()
+            return plain[:max_chars]
+
+        # Simple HTML cleanup fallback when bs4/aiohttp are unavailable.
+        cleaned = re.sub(r"(?is)<(script|style|noscript|svg|canvas|iframe)\b.*?>.*?</\1>", " ", txt)
+        cleaned = re.sub(r"(?is)<br\s*/?>", "\n", cleaned)
+        cleaned = re.sub(r"(?is)</(p|div|li|h[1-6]|tr|section|article)>", "\n", cleaned)
+        cleaned = re.sub(r"(?is)<[^>]+>", " ", cleaned)
+        cleaned = html.unescape(cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
+        return cleaned[:max_chars]
+
+    def _classify_notice_sync(self, source: str, snippet: str) -> bool:
+        if not self.deepseek_api_key:
+            return False
+        if OpenAI is None:
+            return False
+
+        content = str(snippet or "").strip()
+        if not content:
+            return False
+        if len(content) > 6000:
+            content = content[:6000]
+
+        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
+        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+        prompt = (
+            "你是电气2410班群消息过滤器。\n"
+            "请判断下面内容是否属于“需要同学执行动作/流程/截止日期”的通知。\n"
+            "如果是纯学习资料/课件/教材/日历/介绍，请只输出：[静默]\n"
+            "如果是需要执行动作的通知，请只输出：[通知]\n"
+            "禁止输出任何其他字符。\n\n"
+            f"来源：{source or '未知来源'}\n\n"
+            f"内容片段：\n{content}"
+        )
+        try:
+            resp = client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            raw = ""
+            try:
+                raw = str(resp.choices[0].message.content or "").strip()
+            except Exception:
+                raw = ""
+            out = self.sanitize_reasoner_output(raw)
+            if out == "[通知]":
+                return True
+            return (out != self._NOTICE_SILENT_TOKEN) and bool(out)
+        except Exception:
+            # 分类失败时保守处理：不打扰群聊
+            return False
+
+    def _reason_notice_sync(self, source: str, snippet: str) -> str:
+        if not self.deepseek_api_key:
+            raise RuntimeError("deepseek api key not ready")
+        if OpenAI is None:
+            raise RuntimeError("openai sdk is not installed")
+
+        content = str(snippet or "").strip()
+        if not content:
+            return self._NOTICE_SILENT_TOKEN
+        # 通知类尽量使用完整文本；极端长文档才截断，避免超大请求。
+        if len(content) > 120000:
+            content = content[:120000]
+
+        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
+        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+
+        prompt = (
+            "【角色设定】\n"
+            "你是电气2410班的 AI 助手 Cooper_bot。\n\n"
+            "【任务】\n"
+            "根据给定通知全文，生成一份简洁清晰的省流说明。\n"
+            "只提取原文中明确出现的信息，不要补充、猜测或外推。\n"
+            "报名方式、费用、地点等信息仅在原文明确出现时才写入；未出现就直接省略。\n\n"
+            "【输出格式（纯文本，不要*）】\n"
+            "📢 【省流通知】[核心标题]\n"
+            "🎯 核心事由：[一句话概括]\n"
+            "🙋‍♂️ 涉及人员：[全体同学/团员/班委/指定人群]\n"
+            "✅ 需要做什么：\n"
+            "1. ...\n"
+            "2. ...\n"
+            "3. ...\n"
+            "⏰ 截止时间：[若无则写“无明确截止时间”]\n\n"
+            "【风格要求】\n"
+            "- 保持简洁，控制在 6~10 行。\n"
+            "- 可用 emoji。\n"
+            "- 不要 Markdown，不要星号(*)，不要代码块。\n"
+            "- 禁止输出“原文未提及/未知/暂无/待通知”等占位语。\n"
+            "- 除上述模板外，不要额外追加字段。\n\n"
+            "【输入来源】\n"
+            f"{source or '未知来源'}\n\n"
+            "【通知全文/片段】\n"
+            f"{content}"
+        )
+
+        resp = client.chat.completions.create(
+            model="deepseek-reasoner",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+
+        raw = ""
+        try:
+            raw = str(resp.choices[0].message.content or "").strip()
+        except Exception:
+            raw = ""
+        if (not raw) and hasattr(resp, "model_dump"):
+            raw = self._extract_chat_text(resp.model_dump())
+        out = self.sanitize_reasoner_output(raw)
+        return out or self._NOTICE_SILENT_TOKEN
 
     def _build_index_entry(self, rel: str) -> dict:
         rel = self._normalize_rel(rel)
@@ -541,7 +834,7 @@ class AIService:
         try:
             with path.open("rb") as f:
                 reader = PyPDF2.PdfReader(f)
-                pages = min(len(reader.pages), int(max_pages))
+                pages = len(reader.pages) if int(max_pages) <= 0 else min(len(reader.pages), int(max_pages))
                 for i in range(pages):
                     t = reader.pages[i].extract_text() or ""
                     if t:
@@ -550,6 +843,76 @@ class AIService:
             self.log.warning(f"AI 索引：读取 PDF 失败 {path.name}: {e}")
             return ""
         return "\n".join(text_parts)[:max_chars]
+
+    def _read_pdf_head_fitz(self, path: Path, max_pages: int = 6, max_chars: int = 4000) -> str:
+        if fitz is None:
+            return ""
+        chunks: List[str] = []
+        try:
+            doc = fitz.open(str(path))
+            pages = int(doc.page_count) if int(max_pages) <= 0 else min(int(doc.page_count), int(max_pages))
+            for i in range(pages):
+                t = doc.load_page(i).get_text("text") or ""
+                if t:
+                    chunks.append(t)
+            doc.close()
+        except Exception as e:
+            self.log.warning(f"群通知解析：读取 PDF 失败 {path.name}: {e}")
+            return ""
+        return "\n".join(chunks)[:max_chars]
+
+    def _get_rapid_ocr(self):
+        if RapidOCR is None:
+            return None
+        if self._rapid_ocr is False:
+            return None
+        if self._rapid_ocr is None:
+            try:
+                self._rapid_ocr = RapidOCR()
+            except Exception as e:
+                self.log.warning(f"群通知解析：OCR 引擎初始化失败（rapidocr_onnxruntime）: {e}")
+                self._rapid_ocr = False
+                return None
+        return self._rapid_ocr
+
+    def _read_pdf_head_ocr(self, path: Path, max_pages: int = 6, max_chars: int = 4000) -> str:
+        if fitz is None:
+            return ""
+        ocr = self._get_rapid_ocr()
+        if ocr is None:
+            return ""
+
+        chunks: List[str] = []
+        try:
+            doc = fitz.open(str(path))
+            pages = int(doc.page_count) if int(max_pages) <= 0 else min(int(doc.page_count), int(max_pages))
+            for i in range(pages):
+                page = doc.load_page(i)
+                # 2x 放大能明显提升扫描件 OCR 成功率
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                arr = np.frombuffer(pix.samples, dtype=np.uint8)
+                if arr.size <= 0:
+                    continue
+                arr = arr.reshape(pix.h, pix.w, pix.n)
+                if pix.n >= 4:
+                    arr = arr[:, :, :3]
+
+                result, _elapse = ocr(arr)
+                if not result:
+                    continue
+                for item in result:
+                    if not isinstance(item, (list, tuple)) or len(item) < 2:
+                        continue
+                    txt = str(item[1] or "").strip()
+                    if txt:
+                        chunks.append(txt)
+                if len("\n".join(chunks)) >= int(max_chars):
+                    break
+            doc.close()
+        except Exception as e:
+            self.log.warning(f"群通知解析：OCR 提取 PDF 失败 {path.name}: {e}")
+            return ""
+        return "\n".join(chunks)[:max_chars]
 
     def _read_docx_head(self, path: Path, max_chars: int = 2000) -> str:
         if Document is None:

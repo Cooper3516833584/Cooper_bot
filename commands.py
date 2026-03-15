@@ -38,6 +38,10 @@ LARGE_FILE_WARN_BYTES = int(LARGE_FILE_WARN_MB) * 1024 * 1024
 ANSWER_FILE_PATH = Path(__file__).resolve().parent / "answer.txt"
 _ANSWER_CACHE_MTIME: Optional[float] = None
 _ANSWER_CACHE: Dict[str, List[str]] = {}
+_GROUP_NOTICE_FILE_SUFFIXES = {".pdf", ".docx"}
+_URL_RE = re.compile(r"(https?://[^\s<>\"]+)", flags=re.IGNORECASE)
+_GROUP_NOTICE_MAX_CANDIDATES = 3
+_GROUP_NOTICE_DEDUP_SECONDS = 60.0
 def _normalize_answer_q(s: str) -> str:
     # 触发词匹配：忽略首尾空白、大小写，内部连续空白视为一个空格
     return re.sub(r"\s+", " ", (s or "").strip()).casefold()
@@ -174,11 +178,29 @@ class BotState:
     pending_handin_choose: Dict[int, dict] = field(default_factory=dict)
     # Handin: user_id -> {"task_id": str, "path": str, "name": str, "ts": float}
     pending_handin_overwrite: Dict[int, dict] = field(default_factory=dict)
+    # Group notice digest dedup cache: notice_key -> ts
+    recent_group_notice_keys: Dict[str, float] = field(default_factory=dict)
 def conv_key(ctx) -> str:
     # 文件检索结果最好按“人”隔离，避免群里互相覆盖
     if ctx.scene == "group" and ctx.group_id is not None:
         return f"g:{ctx.group_id}:{ctx.user_id}"
     return f"p:{ctx.user_id}:{ctx.scene}"
+
+
+def _claim_group_notice_key(state: BotState, key: str, ttl_seconds: float = _GROUP_NOTICE_DEDUP_SECONDS) -> bool:
+    now = time.time()
+    cache = state.recent_group_notice_keys
+    # Opportunistic cleanup.
+    stale_before = now - max(float(ttl_seconds) * 3.0, 300.0)
+    for k, ts in list(cache.items()):
+        if float(ts) < stale_before:
+            cache.pop(k, None)
+
+    prev = cache.get(key)
+    if prev is not None and (now - float(prev) < float(ttl_seconds)):
+        return False
+    cache[key] = now
+    return True
 
 
 async def reply(api, ctx, text: str, logsvc: LogService):
@@ -326,6 +348,333 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
             return None
         return (m.group(1) or "").strip()
     return None
+
+
+def _is_notice_file_name(name: str) -> bool:
+    return Path(str(name or "").strip()).suffix.lower() in _GROUP_NOTICE_FILE_SUFFIXES
+
+
+def _clean_url_candidate(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    # Remove trailing punctuation that often appears in chat text.
+    s = s.rstrip(".,!?;:)]}>\u3002\uff0c\uff1b\uff1a\uff01\uff1f\u3011\u300d\u300f\uff09")
+    if not (s.startswith("http://") or s.startswith("https://")):
+        return ""
+    return s
+
+
+def _extract_urls_from_evt(evt: dict) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+
+    def _push(text: str) -> None:
+        for m in _URL_RE.findall(str(text or "")):
+            u = _clean_url_candidate(m)
+            if (not u) or (u in seen):
+                continue
+            seen.add(u)
+            urls.append(u)
+
+    msg = evt.get("message")
+    if isinstance(msg, list):
+        for seg in msg:
+            if not isinstance(seg, dict):
+                continue
+            tp = str(seg.get("type") or "").lower()
+            data = seg.get("data") or {}
+            if tp == "text":
+                _push(data.get("text") or "")
+            elif tp in ("share", "link"):
+                u = _clean_url_candidate(str(data.get("url") or ""))
+                if u and u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+    else:
+        _push(str(evt.get("raw_message") or ""))
+        _push(str(msg or ""))
+
+    return urls
+
+
+async def _resolve_src_by_get_file_for_notice(
+    api,
+    fid: str,
+    big: bool = False,
+    group_id: Optional[int] = None,
+    busid: Optional[str] = None,
+) -> str:
+    timeout = 180.0 if big else 60.0
+
+    async def _extract_from_resp(resp: Optional[dict]) -> str:
+        if not resp or resp.get("status") != "ok":
+            return ""
+        data = resp.get("data")
+        if isinstance(data, str):
+            return data.strip()
+        data = data or {}
+        return str(
+            data.get("url")
+            or data.get("download_url")
+            or data.get("file")
+            or data.get("file_path")
+            or data.get("path")
+            or ""
+        ).strip()
+
+    # 群文件优先尝试 get_group_file_url（NapCat/OneBot 常见接口）。
+    if group_id is not None and fid:
+        params = {"group_id": int(group_id), "file_id": str(fid)}
+        if str(busid or "").strip().isdigit():
+            params["busid"] = int(str(busid).strip())
+        resp = await api.call("get_group_file_url", params, timeout=timeout)
+        src = await _extract_from_resp(resp)
+        if src:
+            return src
+
+        # 兼容部分实现：不带 busid 再试一次。
+        if "busid" in params:
+            params2 = {"group_id": int(group_id), "file_id": str(fid)}
+            resp2 = await api.call("get_group_file_url", params2, timeout=timeout)
+            src2 = await _extract_from_resp(resp2)
+            if src2:
+                return src2
+
+    # 兜底旧路径。
+    resp3 = await api.get_file(
+        str(fid),
+        timeout=timeout,
+        retries=2,
+        retry_delay=2.0,
+    )
+    return await _extract_from_resp(resp3)
+
+
+async def _extract_notice_text_from_group_file(
+    api,
+    ctx,
+    handin: HandinService,
+    aisvc: "AIService",
+    f: dict,
+    logsvc: Optional[LogService] = None,
+    max_chars: int = 4000,
+    max_pages: int = 6,
+) -> str:
+    fname = (f.get("name") or "file").strip()
+    file_id = (f.get("file_id") or "").strip()
+    url = (f.get("url") or "").strip()
+    busid = (f.get("busid") or "").strip()
+    size_raw = (f.get("size") or "").strip()
+    expected_size: Optional[int] = None
+    try:
+        expected_size = int(size_raw) if size_raw else None
+    except Exception:
+        expected_size = None
+
+    big = _is_large(expected_size)
+    src = url
+    if (not src) and file_id:
+        src = await _resolve_src_by_get_file_for_notice(
+            api,
+            file_id,
+            big=big,
+            group_id=ctx.group_id,
+            busid=busid,
+        )
+    if not src:
+        if logsvc is not None:
+            logsvc.log.warning(f"group notice: resolve source failed for file={fname} file_id={file_id}")
+        return ""
+
+    dl_timeout = 600.0 if big else 180.0
+    ok, _msg, p = await asyncio.to_thread(
+        handin.download_to_inbox,
+        ctx.user_id,
+        fname,
+        src,
+        expected_size,
+        dl_timeout,
+    )
+
+    if (not ok) and file_id and src == url:
+        src2 = await _resolve_src_by_get_file_for_notice(
+            api,
+            file_id,
+            big=big,
+            group_id=ctx.group_id,
+            busid=busid,
+        )
+        if src2 and src2 != src:
+            ok, _msg, p = await asyncio.to_thread(
+                handin.download_to_inbox,
+                ctx.user_id,
+                fname,
+                src2,
+                expected_size,
+                dl_timeout,
+            )
+
+    if (not ok) or (not p):
+        if logsvc is not None:
+            logsvc.log.warning(f"group notice: download failed for file={fname}: {_msg}")
+        return ""
+
+    try:
+        out = await aisvc.extract_notice_file_head(Path(p), max_chars=int(max_chars), max_pages=int(max_pages))
+        if (not out) and (logsvc is not None):
+            logsvc.log.warning(f"group notice: extracted empty text for file={fname}")
+        return out
+    finally:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+async def _run_group_notice_digest(
+    api,
+    ctx,
+    evt: dict,
+    text: str,
+    logsvc: LogService,
+    state: BotState,
+    handin: HandinService,
+    aisvc: "AIService",
+):
+    if ctx.scene != "group" or ctx.group_id is None:
+        return
+    if int(evt.get("self_id") or 0) == int(ctx.user_id):
+        return
+
+    files = [x for x in get_files(evt) if _is_notice_file_name(x.get("name") or "")]
+    urls = _extract_urls_from_evt(evt)
+    # 同一条文件消息里常带一个下载 URL；若同时处理会造成双发。
+    if files:
+        urls = []
+    if (not files) and (not urls):
+        return
+
+    # A command like /find URL should not trigger auto-digest unless a file is attached.
+    t = (text or "").strip()
+    if (not files) and (t.startswith("/") or t.startswith("／")):
+        return
+
+    candidates: List[Tuple[str, object]] = []
+    for item in files:
+        candidates.append(("file", item))
+    for item in urls:
+        candidates.append(("url", item))
+    if not candidates:
+        return
+
+    for kind, payload in candidates[:_GROUP_NOTICE_MAX_CANDIDATES]:
+        try:
+            source = ""
+            dedup_key = ""
+            preview = ""
+            if kind == "file":
+                f = payload if isinstance(payload, dict) else {}
+                fname = str(f.get("name") or "未命名文件").strip() or "未命名文件"
+                fsize = str(f.get("size") or "").strip()
+                fid = str(f.get("file_id") or "").strip()
+                busid = str(f.get("busid") or "").strip()
+                source = f"群文件：{fname}"
+                # 跨 message/file 与 notice/group_upload 去重：优先稳定字段（文件名+大小+上传者+群）
+                name_norm = re.sub(r"\s+", "", fname).casefold()
+                dedup_key = f"g{ctx.group_id}:file:{name_norm}:{fsize}:{ctx.user_id}"
+            else:
+                u = str(payload or "").strip()
+                source = f"群链接：{u}"
+                dedup_key = f"g{ctx.group_id}:url:{u.casefold()}"
+
+            if dedup_key and (not _claim_group_notice_key(state, dedup_key)):
+                continue
+
+            # Step 1: 小窗口预判是否为“需要动作的通知”
+            if kind == "file":
+                f = payload if isinstance(payload, dict) else {}
+                preview = await _extract_notice_text_from_group_file(
+                    api,
+                    ctx,
+                    handin,
+                    aisvc,
+                    f,
+                    logsvc=logsvc,
+                    max_chars=6000,
+                    max_pages=8,
+                )
+            else:
+                u = str(payload or "").strip()
+                preview = await aisvc.extract_notice_url_head(u, max_chars=6000)
+
+            preview = str(preview or "").strip()
+            if not preview:
+                continue
+
+            is_notice = await aisvc.classify_notice(source, preview)
+            if not is_notice:
+                continue
+
+            # Step 2: 对通知做更完整文本提取，再生成更详细省流
+            material = preview
+            if kind == "file":
+                f = payload if isinstance(payload, dict) else {}
+                full_text = await _extract_notice_text_from_group_file(
+                    api,
+                    ctx,
+                    handin,
+                    aisvc,
+                    f,
+                    logsvc=logsvc,
+                    max_chars=50000,
+                    max_pages=0,  # 0 => all pages
+                )
+                if full_text:
+                    material = full_text
+            else:
+                u = str(payload or "").strip()
+                full_text = await aisvc.extract_notice_url_head(u, max_chars=25000)
+                if full_text:
+                    material = full_text
+
+            out = await aisvc.reason_notice(source, material)
+            out = aisvc.sanitize_reasoner_output(out)
+            if (not out) or aisvc.is_notice_silent(out):
+                continue
+
+            await reply(api, ctx, out, logsvc)
+            return
+        except Exception as e:
+            logsvc.log.warning(f"group notice digest failed: {e}")
+            continue
+
+
+def _schedule_group_notice_digest(
+    api,
+    ctx,
+    evt: dict,
+    text: str,
+    logsvc: LogService,
+    state: BotState,
+    handin: HandinService,
+    aisvc: Optional["AIService"],
+) -> None:
+    if aisvc is None:
+        return
+    if not getattr(aisvc, "notice_ready", False):
+        return
+    task = asyncio.create_task(_run_group_notice_digest(api, ctx, evt, text, logsvc, state, handin, aisvc))
+
+    def _done(t: asyncio.Task) -> None:
+        try:
+            t.result()
+        except Exception as e:
+            logsvc.log.warning(f"group notice digest task exception: {e}")
+
+    task.add_done_callback(_done)
+
+
 def _parse_indices(arg: str) -> List[int]:
     """
     支持：
@@ -1247,6 +1596,8 @@ async def dispatch(
                     ctx.group_name = str(gname)
         except Exception:
             pass
+    if getattr(ctx, "scene", "") == "group":
+        _schedule_group_notice_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
     # ========== Handin: 文件提交 / 数字选择（优先） ==========
     # 私聊文件 / 覆盖确认 / 数字选择（优先）
     if ctx.scene.startswith("private"):
