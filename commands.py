@@ -2245,7 +2245,8 @@ async def _handle_explicit_command(
         lines.append("用 /get 序号（如/get 1 2 3 4）获取文件；文件夹会先打包成 zip。")
         lines.append("直接回复序号可进入目录并继续按数字下钻。")
         if has_large:
-            lines.append("（提示：标记“大文件”的条目发送可能较慢，请耐心等待。）")
+            lines.append("标记“大文件”的条目发送可能较慢，请耐心等待。")
+        lines.append("\n新！增！功！能！\n/find \"需求\"现在可以ai智能查找了！！！")
         await reply(api, ctx, "\n".join(lines), logsvc)
         return
     if cmd == "get":
