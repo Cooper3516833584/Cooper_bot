@@ -7,6 +7,7 @@ import html
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -80,10 +81,13 @@ class AIService:
     _ALLOWED_SUFFIXES = {".pdf", ".doc", ".docx", ".ppt", ".pptx"}
     _EBOOK_SUFFIXES = {".epub", ".mobi"}
     _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
+    _CHAT_CONTEXT_MAX_TURNS = 15
     _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
     _AUTO_ORGANIZE_EBOOK_SUBJECT = "课外书"
     _AUTO_ORGANIZE_MARKS_FILENAME = "ai_material_scan_marks.json"
     _AUTO_ORGANIZE_STATE_CACHE_FILENAME = "ai_material_state_cache.json"
+    _INCREMENTAL_STORE_FILENAME = "ai_semantic_store.sqlite3"
+    _INCREMENTAL_STORE_SCHEMA_VERSION = 1
     _AUTO_ORGANIZE_MAX_WARNINGS = 5
     _TBD_CLASSIFY_MAX_CONCURRENCY = 3
     _NEW_FILE_SUMMARY_MAX_CONCURRENCY = 3
@@ -103,6 +107,7 @@ class AIService:
         self.private_chat_prompt_config_path = Path(__file__).resolve().parent / "private_chat_prompts.json"
         self.material_scan_marks_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_MARKS_FILENAME
         self.material_state_cache_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_STATE_CACHE_FILENAME
+        self.incremental_store_path = Path(BASE_DIR) / self._INCREMENTAL_STORE_FILENAME
 
         self.bot_nick = str(AI_BOT_NICK or "Cooepr_bot")
         self.chat_model = str(AI_CHAT_MODEL or "deepseek-chat")
@@ -124,6 +129,7 @@ class AIService:
         self._chat_sessions: Dict[str, Dict[str, object]] = {}
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
+        self._semantic_entry_by_rel: Dict[str, Tuple[dict, np.ndarray]] = {}
         self._rapid_ocr = None
         self._notice_prompt_cache_mtime: Optional[float] = None
         self._notice_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
@@ -741,11 +747,12 @@ class AIService:
         self._save_material_scan_marks({"confirmed_ok_hashes": confirmed})
         return stats
 
-    def _auto_organize_materials_on_boot(self, index_list: List[dict]) -> Tuple[Dict[str, str], Dict[str, dict]]:
+    def _auto_organize_materials_on_boot(self, index_list: List[dict]) -> Tuple[Dict[str, str], Dict[str, dict], set[str]]:
         move_map: Dict[str, str] = {}
         new_file_hints: Dict[str, dict] = {}
+        changed_classified_rels: set[str] = set()
         if str(self.material_dir.name or "").strip().lower() != "textbook_and_material":
-            return move_map, new_file_hints
+            return move_map, new_file_hints, changed_classified_rels
 
         tbd_dir = self.material_dir / self._AUTO_ORGANIZE_TBD_DIRNAME
         tbd_dir.mkdir(parents=True, exist_ok=True)
@@ -753,7 +760,7 @@ class AIService:
         subjects = self._collect_existing_subject_dirs()
         if not subjects:
             self.log.info("AI 整理：未找到学科文件夹，跳过启动整理")
-            return move_map, new_file_hints
+            return move_map, new_file_hints, changed_classified_rels
         can_use_ai = bool(self.deepseek_base_url and self.deepseek_api_key)
         if not can_use_ai:
             self.log.info("AI 整理：未配置 DeepSeek，仅执行哈希去重")
@@ -784,7 +791,6 @@ class AIService:
         marks_changed = False
         state_cache_map = self._load_material_state_cache()
         state_cache_changed = False
-        changed_classified_rels: set[str] = set()
 
         fix_files: List[Path] = []
         file_hash_by_rel: Dict[str, str] = {}
@@ -1437,7 +1443,7 @@ class AIService:
             f"已归类扫描={len(fix_files)}, 增量候选={len(fix_candidate_rel_set)}, "
             f"非增量跳过={fix_non_incremental_skip}, 已确认跳过={fix_marked_skip}, 移动={fix_moved}, 保留={fix_kept}, 失败={fix_failed})"
         )
-        return move_map, new_file_hints
+        return move_map, new_file_hints, changed_classified_rels
 
     def _collect_existing_subject_dirs(self) -> List[str]:
         out: List[str] = []
@@ -1800,27 +1806,14 @@ class AIService:
         self.material_dir.mkdir(parents=True, exist_ok=True)
         self._load_api_config()
 
-        # Fast path: load existing cache artifacts first so bot can serve requests ASAP.
         self.log.info("AI 启动阶段：加载缓存索引/元数据/向量")
-        index_list = self._load_json_list(self.index_path)
-        metadata_list = self._load_json_list(self.metadata_path)
-        vectors = self._load_vectors(self.vectors_path)
-        metadata_list, vectors = self._align_metadata_vectors(metadata_list, vectors)
-
-        with self._lock:
-            if vectors.size > 0 and vectors.ndim == 2 and len(metadata_list) == int(vectors.shape[0]):
-                norm = np.linalg.norm(vectors, axis=1, keepdims=True)
-                norm[norm == 0.0] = 1.0
-                self._semantic_meta = metadata_list
-                self._semantic_norm_vectors = (vectors / norm).astype(np.float64, copy=False)
-            else:
-                self._semantic_meta = []
-                self._semantic_norm_vectors = np.empty((0, 0), dtype=np.float64)
+        index_by_rel, metadata_by_rel, vector_by_rel = self._load_incremental_store_maps()
+        self._set_semantic_cache_from_maps(metadata_by_rel, vector_by_rel)
 
         self.log.info(
             "AI 快速启动："
-            f"索引={len(index_list)}, 元数据={len(metadata_list)}, "
-            f"向量={int(vectors.shape[0]) if vectors.ndim == 2 else 0}, "
+            f"索引={len(index_by_rel)}, 元数据={len(metadata_by_rel)}, "
+            f"向量={len(vector_by_rel)}, "
             f"语义检索就绪={self.semantic_ready}"
         )
 
@@ -1829,56 +1822,124 @@ class AIService:
         self._load_api_config()
 
         self.log.info("AI 启动阶段：加载启动后同步所需缓存索引")
-        index_list = self._load_json_list(self.index_path)
+        index_by_rel, metadata_by_rel, vector_by_rel = self._load_incremental_store_maps()
+        old_index_rels = set(index_by_rel.keys())
+
         move_map: Dict[str, str] = {}
         new_file_hints: Dict[str, dict] = {}
+        changed_classified_rels: set[str] = set()
         self.log.info("AI 启动阶段：整理资料（TBD + 增量纠偏）")
         try:
-            move_map, new_file_hints = self._auto_organize_materials_on_boot(index_list)
+            move_map, new_file_hints, changed_classified_rels = self._auto_organize_materials_on_boot(
+                [index_by_rel[k] for k in sorted(index_by_rel.keys())]
+            )
         except Exception as e:
             self.log.warning(f"AI 整理：启动整理失败，已回退并继续启动: {e}")
             move_map = {}
             new_file_hints = {}
+            changed_classified_rels = set()
+
+        index_upserts: Dict[str, dict] = {}
+        index_deletes: set[str] = set()
+        metadata_upserts: Dict[str, dict] = {}
+        metadata_deletes: set[str] = set()
+        vector_upserts: Dict[str, np.ndarray] = {}
+        vector_deletes: set[str] = set()
+
         if move_map:
-            index_list = self._remap_index_items_after_move(index_list, move_map)
-        self.log.info("AI 启动阶段：加载缓存元数据/向量")
-        metadata_list = self._load_json_list(self.metadata_path)
-        if move_map:
-            metadata_list = self._remap_metadata_items_after_move(metadata_list, move_map)
-        vector_matrix = self._load_vectors(self.vectors_path)
-        metadata_list, vector_matrix = self._align_metadata_vectors(metadata_list, vector_matrix)
+            for old_rel, new_rel in move_map.items():
+                old_norm = self._normalize_rel(old_rel)
+                new_norm = self._normalize_rel(new_rel)
+                if (not old_norm) or (not new_norm):
+                    continue
+
+                idx_item = index_by_rel.pop(old_norm, None)
+                if old_norm != new_norm:
+                    index_deletes.add(old_norm)
+                if isinstance(idx_item, dict):
+                    updated = dict(idx_item)
+                    updated["file_path"] = self._to_store_rel(new_norm)
+                    updated["subject"] = self._subject_from_rel(new_norm)
+                    updated["filename"] = (self.material_dir / new_norm).name
+                    index_by_rel[new_norm] = updated
+                    index_upserts[new_norm] = updated
+
+                meta_item = metadata_by_rel.pop(old_norm, None)
+                if old_norm != new_norm:
+                    metadata_deletes.add(old_norm)
+                if isinstance(meta_item, dict):
+                    meta_updated = dict(meta_item)
+                    meta_updated["file_path"] = self._to_store_rel(new_norm)
+                    meta_updated["subject"] = self._subject_from_rel(new_norm)
+                    meta_updated["filename"] = (self.material_dir / new_norm).name
+                    metadata_by_rel[new_norm] = meta_updated
+                    metadata_upserts[new_norm] = meta_updated
+
+                vec_item = vector_by_rel.pop(old_norm, None)
+                if old_norm != new_norm:
+                    vector_deletes.add(old_norm)
+                if isinstance(vec_item, np.ndarray):
+                    vec_arr = np.asarray(vec_item, dtype=np.float64).reshape(-1)
+                    if vec_arr.size > 0:
+                        vector_by_rel[new_norm] = vec_arr
+                        vector_upserts[new_norm] = vec_arr
 
         actual_rels = self._scan_material_files()
-        old_index_count = len(index_list)
+        known_rels = set(index_by_rel.keys()) | set(metadata_by_rel.keys()) | set(vector_by_rel.keys())
+        stale_rels = known_rels - actual_rels
+        for rel in stale_rels:
+            if rel in index_by_rel:
+                index_by_rel.pop(rel, None)
+                index_deletes.add(rel)
+            if rel in metadata_by_rel:
+                metadata_by_rel.pop(rel, None)
+                metadata_deletes.add(rel)
+            if rel in vector_by_rel:
+                vector_by_rel.pop(rel, None)
+                vector_deletes.add(rel)
 
-        cleaned_index: List[dict] = []
-        seen_index_rels = set()
-        for item in index_list:
-            rel = self._normalize_rel(item.get("file_path"))
-            if (not rel) or (rel in seen_index_rels) or (rel not in actual_rels):
+        existing_index_rels: set[str] = set()
+        for rel in sorted(actual_rels):
+            item = index_by_rel.get(rel)
+            if not isinstance(item, dict):
                 continue
-            abs_path = self.material_dir / rel
-            cleaned_index.append(self._normalize_index_item(item, rel, abs_path))
-            seen_index_rels.add(rel)
+            normalized = self._normalize_index_item(item, rel, self.material_dir / rel)
+            if normalized != item:
+                index_by_rel[rel] = normalized
+                index_upserts[rel] = normalized
+            existing_index_rels.add(rel)
 
-        new_rels = sorted(actual_rels - seen_index_rels)
-        new_pipeline_by_rel: Dict[str, dict] = {}
-        if new_rels:
-            self.log.info(f"AI 启动阶段：新文件摘要流水线开始，总数={len(new_rels)}")
-        new_pipeline_errors: Dict[str, str] = {}
-        if new_rels:
-            max_summary_workers = max(1, min(int(self._NEW_FILE_SUMMARY_MAX_CONCURRENCY), len(new_rels)))
+        new_rels = sorted(actual_rels - existing_index_rels)
+        changed_norm_rels = {
+            self._normalize_rel(rel)
+            for rel in (changed_classified_rels or set())
+            if self._normalize_rel(rel)
+        }
+        modified_rels = sorted((changed_norm_rels & actual_rels) - set(new_rels))
+        pipeline_targets = []
+        seen_pipeline = set()
+        for rel in new_rels + modified_rels:
+            if rel in seen_pipeline:
+                continue
+            seen_pipeline.add(rel)
+            pipeline_targets.append(rel)
+
+        pipeline_by_rel: Dict[str, dict] = {}
+        pipeline_errors: Dict[str, str] = {}
+        if pipeline_targets:
+            self.log.info(f"AI 启动阶段：新/变更文件摘要流水线开始，总数={len(pipeline_targets)}")
+            max_summary_workers = max(1, min(int(self._NEW_FILE_SUMMARY_MAX_CONCURRENCY), len(pipeline_targets)))
             if max_summary_workers <= 1:
-                for rel in new_rels:
+                for rel in pipeline_targets:
                     try:
                         hint = new_file_hints.get(rel)
-                        new_pipeline_by_rel[rel] = self._run_new_file_pipeline(rel, hint=hint, build_vector=False)
+                        pipeline_by_rel[rel] = self._run_new_file_pipeline(rel, hint=hint, build_vector=False)
                     except Exception as e:
-                        new_pipeline_errors[rel] = str(e)
+                        pipeline_errors[rel] = str(e)
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_summary_workers) as executor:
                     future_to_rel: Dict[concurrent.futures.Future, str] = {}
-                    for rel in new_rels:
+                    for rel in pipeline_targets:
                         hint = new_file_hints.get(rel)
                         fut = executor.submit(self._run_new_file_pipeline, rel, hint, False)
                         future_to_rel[fut] = rel
@@ -1887,55 +1948,88 @@ class AIService:
                         try:
                             ctx = fut.result()
                             if isinstance(ctx, dict):
-                                new_pipeline_by_rel[rel] = ctx
+                                pipeline_by_rel[rel] = ctx
                             else:
-                                new_pipeline_errors[rel] = "pipeline result is not dict"
+                                pipeline_errors[rel] = "pipeline result is not dict"
                         except Exception as e:
-                            new_pipeline_errors[rel] = str(e)
+                            pipeline_errors[rel] = str(e)
 
-        for idx, rel in enumerate(new_rels, 1):
-            pipeline_ctx = new_pipeline_by_rel.get(rel)
-            if not isinstance(pipeline_ctx, dict):
-                err = str(new_pipeline_errors.get(rel) or "pipeline context missing")
-                self.log.warning(f"AI 索引：新增失败 {rel}: {err}")
+        new_rel_set = set(new_rels)
+        modified_rel_set = set(modified_rels)
+        for idx, rel in enumerate(pipeline_targets, 1):
+            ctx = pipeline_by_rel.get(rel)
+            if not isinstance(ctx, dict):
+                err = str(pipeline_errors.get(rel) or "pipeline context missing")
+                self.log.warning(f"AI 索引：处理失败 {rel}: {err}")
                 continue
-            entry = pipeline_ctx.get("index_item")
-            if not isinstance(entry, dict):
-                self.log.warning(f"AI 索引：新增失败 {rel}: pipeline index item missing")
+
+            idx_item = ctx.get("index_item")
+            if not isinstance(idx_item, dict):
+                self.log.warning(f"AI 索引：处理失败 {rel}: pipeline index item missing")
                 continue
-            cleaned_index.append(entry)
-            self.log.info(f"AI 索引：新增[{idx}/{len(new_rels)}] {rel}")
-        if new_rels:
+            index_by_rel[rel] = idx_item
+            index_upserts[rel] = idx_item
+
+            raw_meta = ctx.get("metadata_item")
+            if isinstance(raw_meta, dict):
+                meta_item = dict(raw_meta)
+            else:
+                meta_item = {
+                    "file_path": self._to_store_rel(rel),
+                    "filename": str(idx_item.get("filename") or Path(rel).name),
+                    "subject": str(idx_item.get("subject") or self._subject_from_rel(rel)),
+                }
+            metadata_by_rel[rel] = meta_item
+            metadata_upserts[rel] = meta_item
+
+            if rel in new_rel_set:
+                self.log.info(f"AI 索引：新增[{idx}/{len(pipeline_targets)}] {rel}")
+            elif rel in modified_rel_set:
+                self.log.info(f"AI 索引：更新[{idx}/{len(pipeline_targets)}] {rel}")
+            else:
+                self.log.info(f"AI 索引：处理[{idx}/{len(pipeline_targets)}] {rel}")
+
+        if pipeline_targets:
             self.log.info(
-                "AI 启动阶段：新文件摘要流水线完成 "
-                f"(成功={len(new_pipeline_by_rel)}, 失败={max(0, len(new_rels) - len(new_pipeline_by_rel))})"
+                "AI 启动阶段：新/变更文件摘要流水线完成 "
+                f"(成功={len(pipeline_by_rel)}, 失败={max(0, len(pipeline_targets) - len(pipeline_by_rel))})"
             )
 
-        self.log.info("AI 启动阶段：写入增量索引更新")
-        self._save_json(self.index_path, cleaned_index)
+        vector_candidate_rels: List[str] = []
+        seen_vector_candidate = set()
+        for rel in pipeline_targets:
+            if rel not in pipeline_by_rel:
+                continue
+            should_embed = False
+            if rel in modified_rel_set:
+                should_embed = True
+            elif (rel in new_rel_set) and (rel not in vector_by_rel):
+                should_embed = True
+            if (not should_embed) or (rel in seen_vector_candidate):
+                continue
+            seen_vector_candidate.add(rel)
+            vector_candidate_rels.append(rel)
 
-        existing_vec_by_rel = self._metadata_vector_map(metadata_list, vector_matrix, valid_rels=actual_rels)
-        vector_candidate_rels = [rel for rel in new_rels if rel in new_pipeline_by_rel and (rel not in existing_vec_by_rel)]
         if vector_candidate_rels:
-            self.log.info(f"AI 启动阶段：新文件向量流水线开始，总数={len(vector_candidate_rels)}")
+            self.log.info(f"AI 启动阶段：新/变更文件向量流水线开始，总数={len(vector_candidate_rels)}")
             embed_done = 0
             embed_ok = 0
             embed_fail = 0
 
-            def _log_embed_progress(force: bool = False) -> None:
+            def _log_embed_progress() -> None:
                 if len(vector_candidate_rels) <= 0:
                     return
-                if (not force) and embed_done < len(vector_candidate_rels) and (embed_done % int(self._ORGANIZE_PROGRESS_EVERY) != 0):
+                if embed_done < len(vector_candidate_rels) and (embed_done % int(self._ORGANIZE_PROGRESS_EVERY) != 0):
                     return
                 self.log.info(
-                    f"AI 启动进度：新文件向量 {embed_done}/{len(vector_candidate_rels)} "
+                    f"AI 启动进度：新/变更文件向量 {embed_done}/{len(vector_candidate_rels)} "
                     f"(成功={embed_ok}, 失败={embed_fail})"
                 )
 
             max_embed_workers = max(1, min(int(self._NEW_FILE_EMBED_MAX_CONCURRENCY), len(vector_candidate_rels)))
             if max_embed_workers <= 1:
                 for rel in vector_candidate_rels:
-                    ctx = new_pipeline_by_rel.get(rel)
+                    ctx = pipeline_by_rel.get(rel)
                     if not isinstance(ctx, dict):
                         embed_done += 1
                         embed_fail += 1
@@ -1960,7 +2054,7 @@ class AIService:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_embed_workers) as executor:
                     future_to_rel: Dict[concurrent.futures.Future, str] = {}
                     for rel in vector_candidate_rels:
-                        ctx = new_pipeline_by_rel.get(rel)
+                        ctx = pipeline_by_rel.get(rel)
                         if not isinstance(ctx, dict):
                             embed_done += 1
                             embed_fail += 1
@@ -1971,7 +2065,7 @@ class AIService:
                         future_to_rel[fut] = rel
                     for fut in concurrent.futures.as_completed(future_to_rel):
                         rel = future_to_rel[fut]
-                        ctx = new_pipeline_by_rel.get(rel)
+                        ctx = pipeline_by_rel.get(rel)
                         if not isinstance(ctx, dict):
                             continue
                         try:
@@ -1988,74 +2082,61 @@ class AIService:
                         finally:
                             embed_done += 1
                             _log_embed_progress()
+
+            for rel in vector_candidate_rels:
+                ctx = pipeline_by_rel.get(rel)
+                if not isinstance(ctx, dict):
+                    continue
+                vec_obj = ctx.get("vector")
+                vec = None
+                if isinstance(vec_obj, np.ndarray):
+                    vec = vec_obj
+                if vec is None:
+                    idx_item = index_by_rel.get(rel)
+                    if isinstance(idx_item, dict):
+                        vec = self._build_vector_for_index_item(idx_item)
+                if vec is None:
+                    continue
+                arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+                if arr.size <= 0:
+                    continue
+                vector_by_rel[rel] = arr
+                vector_upserts[rel] = arr
+
             self.log.info(
-                "AI 启动阶段：新文件向量流水线完成 "
+                "AI 启动阶段：新/变更文件向量流水线完成 "
                 f"(成功={embed_ok}, 失败={embed_fail})"
             )
 
-        rebuilt_metadata: List[dict] = []
-        rebuilt_vectors: List[np.ndarray] = []
-        vec_dim: Optional[int] = None
+        self.log.info("AI 启动阶段：写入增量索引更新")
+        try:
+            self._persist_incremental_store_changes(
+                index_upserts=index_upserts,
+                index_deletes=index_deletes,
+                metadata_upserts=metadata_upserts,
+                metadata_deletes=metadata_deletes,
+                vector_upserts=vector_upserts,
+                vector_deletes=vector_deletes,
+            )
+        except Exception as e:
+            self.log.warning(f"AI 索引：增量写入失败，已继续运行: {e}")
 
-        for item in cleaned_index:
-            rel = self._normalize_rel(item.get("file_path"))
-            if not rel:
-                continue
+        semantic_delete_rels = set(metadata_deletes) | set(vector_deletes) | set(index_deletes)
+        if self._semantic_entry_by_rel:
+            self._apply_semantic_cache_changes(
+                metadata_upserts=metadata_upserts,
+                vector_upserts=vector_upserts,
+                delete_rels=semantic_delete_rels,
+            )
+        else:
+            self._set_semantic_cache_from_maps(metadata_by_rel, vector_by_rel)
 
-            pipeline_ctx = new_pipeline_by_rel.get(rel)
-            vec = existing_vec_by_rel.get(rel)
-            if vec is None and isinstance(pipeline_ctx, dict):
-                cached_vec = pipeline_ctx.get("vector")
-                if isinstance(cached_vec, np.ndarray):
-                    vec = cached_vec
-                elif bool(pipeline_ctx.get("vector_attempted")):
-                    err = str(pipeline_ctx.get("vector_error") or "").strip()
-                    if err:
-                        self.log.warning(f"AI 向量：跳过 {rel}（并发向量生成失败: {err}）")
-                    else:
-                        self.log.warning(f"AI 向量：跳过 {rel}（并发向量生成失败）")
-                    continue
-            if vec is None:
-                vec = self._build_vector_for_index_item(item)
-                if vec is None:
-                    self.log.warning(f"AI 向量：跳过 {rel}（向量生成失败）")
-                    continue
-
-            vec = np.asarray(vec, dtype=np.float64).reshape(-1)
-            if vec_dim is None:
-                vec_dim = int(vec.size)
-            if vec.size != vec_dim:
-                self.log.warning(f"AI 向量：跳过 {rel}（维度不一致 {vec.size} != {vec_dim}）")
-                continue
-
-            metadata_item = None
-            if isinstance(pipeline_ctx, dict):
-                raw_meta = pipeline_ctx.get("metadata_item")
-                if isinstance(raw_meta, dict):
-                    metadata_item = dict(raw_meta)
-            if not isinstance(metadata_item, dict):
-                metadata_item = {
-                    "file_path": self._to_store_rel(rel),
-                    "filename": str(item.get("filename") or Path(rel).name),
-                    "subject": str(item.get("subject") or self._subject_from_rel(rel)),
-                }
-            rebuilt_metadata.append(metadata_item)
-            rebuilt_vectors.append(vec)
-
-        matrix = (
-            np.vstack(rebuilt_vectors).astype(np.float64, copy=False)
-            if rebuilt_vectors
-            else np.empty((0, 0), dtype=np.float64)
-        )
-        self._save_json(self.metadata_path, rebuilt_metadata)
-        np.save(self.vectors_path, matrix)
-
-        removed = max(0, old_index_count - len(cleaned_index) + len(new_rels))
+        added = len([rel for rel in index_upserts.keys() if rel not in old_index_rels])
+        updated = len(index_upserts) - added
+        removed = len(index_deletes)
         self.log.info(
-            f"AI 索引：同步完成，现有索引 {len(cleaned_index)} 条，向量 {matrix.shape[0]} 条，新增 {len(new_rels)}，清理 {removed}"
+            f"AI 索引：同步完成，现有索引 {len(index_by_rel)} 条，向量 {len(vector_by_rel)} 条，新增 {added}，更新 {updated}，清理 {removed}"
         )
-
-        self._reload_semantic_cache()
 
     def _load_api_config(self) -> None:
         lines: List[str] = []
@@ -2076,27 +2157,20 @@ class AIService:
         self.log.info("AI 配置：已加载 DeepSeek 与 Embedding API")
 
     def _reload_semantic_cache(self) -> None:
-        metadata = self._load_json_list(self.metadata_path)
-        vectors = self._load_vectors(self.vectors_path)
-        metadata, vectors = self._align_metadata_vectors(metadata, vectors)
-
-        if vectors.size <= 0 or vectors.ndim != 2 or not metadata:
-            with self._lock:
-                self._semantic_meta = []
-                self._semantic_norm_vectors = np.empty((0, 0), dtype=np.float64)
-            self.log.warning("AI 检索：向量库为空，/find 引号语义检索不可用")
+        metadata_by_rel: Dict[str, dict] = {}
+        vector_by_rel: Dict[str, np.ndarray] = {}
+        try:
+            _index_by_rel, metadata_by_rel, vector_by_rel = self._load_incremental_store_maps()
+        except Exception as e:
+            self.log.warning(f"AI 检索：增量缓存重载失败: {e}")
             return
 
-        norm = np.linalg.norm(vectors, axis=1, keepdims=True)
-        norm[norm == 0.0] = 1.0
-        norm_vectors = vectors / norm
-
-        with self._lock:
-            self._semantic_meta = metadata
-            self._semantic_norm_vectors = norm_vectors.astype(np.float64, copy=False)
-
+        self._set_semantic_cache_from_maps(metadata_by_rel, vector_by_rel)
+        if not self.semantic_ready:
+            self.log.warning("AI 检索：向量库为空，/find 引号语义检索不可用")
+            return
         self.log.info(
-            f"AI 检索：载入 {len(metadata)} 条向量，维度 {int(self._semantic_norm_vectors.shape[1])}"
+            f"AI 检索：载入 {len(self._semantic_meta)} 条向量，维度 {int(self._semantic_norm_vectors.shape[1])}"
         )
 
     def _semantic_find_paths_sync(self, demand: str, limit: Optional[int] = None) -> List[Path]:
@@ -2223,6 +2297,30 @@ class AIService:
         content = str(item.get("content") or "")
         return {"role": role, "content": content}
 
+    def _validate_and_trim_chat_history(self, messages: List[Dict[str, str]]) -> Optional[List[Dict[str, str]]]:
+        if not isinstance(messages, list):
+            return None
+        out: List[Dict[str, str]] = []
+        for item in messages:
+            normalized = self._normalize_chat_history_item(item)
+            if normalized is None:
+                return None
+            out.append(normalized)
+
+        if (len(out) % 2) != 0:
+            return None
+        for i in range(0, len(out), 2):
+            if out[i].get("role") != "user":
+                return None
+            if out[i + 1].get("role") != "assistant":
+                return None
+
+        max_turns = max(1, int(self._CHAT_CONTEXT_MAX_TURNS))
+        max_items = max_turns * 2
+        if len(out) > max_items:
+            out = out[-max_items:]
+        return out
+
     def _load_active_chat_history(self, session_key: str, now_ts: Optional[float] = None) -> List[Dict[str, str]]:
         key = str(session_key or "").strip()
         if not key:
@@ -2264,18 +2362,32 @@ class AIService:
                 self.log.warning(f"AI chat context invalid message item, reset: session={session_key[:80]}")
                 return []
             out.append(normalized)
-        return out
+
+        checked = self._validate_and_trim_chat_history(out)
+        if checked is None:
+            self._chat_sessions.pop(session_key, None)
+            self.log.warning(f"AI chat context invalid turn structure, reset: session={session_key[:80]}")
+            return []
+        if len(checked) != len(out):
+            self._chat_sessions[session_key] = {"messages": checked, "last_active_ts": last_active_ts}
+        return checked
 
     def _save_chat_turn(self, session_key: str, user_input: str, assistant_output: str) -> None:
         key = str(session_key or "").strip()
         if not key:
             return
         now_ts = float(time.time())
+        user_msg = {"role": "user", "content": str(user_input or "")}
+        assistant_msg = {"role": "assistant", "content": str(assistant_output or "")}
         with self._chat_sessions_lock:
             history = self._load_active_chat_history_locked(key, now_ts)
-            history.append({"role": "user", "content": str(user_input or "")})
-            history.append({"role": "assistant", "content": str(assistant_output or "")})
-            self._chat_sessions[key] = {"messages": history, "last_active_ts": now_ts}
+            history.append(user_msg)
+            history.append(assistant_msg)
+            checked = self._validate_and_trim_chat_history(history)
+            if checked is None:
+                checked = [user_msg, assistant_msg]
+                self.log.warning(f"AI chat context invalid after append, reset to current turn: session={key[:80]}")
+            self._chat_sessions[key] = {"messages": checked, "last_active_ts": now_ts}
 
     def _extract_notice_file_head_sync(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         p = Path(path)
@@ -2866,6 +2978,360 @@ class AIService:
         if n <= 0:
             return [], np.empty((0, 0), dtype=np.float64)
         return metadata[:n], vectors[:n]
+
+    def _open_incremental_store(self) -> sqlite3.Connection:
+        self.incremental_store_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.incremental_store_path), timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _ensure_incremental_store_ready(self) -> None:
+        conn = self._open_incremental_store()
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS store_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS index_items ("
+                "rel TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_ts INTEGER NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS metadata_items ("
+                "rel TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_ts INTEGER NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS vector_items ("
+                "rel TEXT PRIMARY KEY, dim INTEGER NOT NULL, vec BLOB NOT NULL, updated_ts INTEGER NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO store_meta(k, v) VALUES('schema_version', ?) "
+                "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (str(int(self._INCREMENTAL_STORE_SCHEMA_VERSION)),),
+            )
+
+            idx_cnt = int((conn.execute("SELECT COUNT(1) FROM index_items").fetchone() or [0])[0])
+            meta_cnt = int((conn.execute("SELECT COUNT(1) FROM metadata_items").fetchone() or [0])[0])
+            vec_cnt = int((conn.execute("SELECT COUNT(1) FROM vector_items").fetchone() or [0])[0])
+            if (idx_cnt + meta_cnt + vec_cnt) > 0:
+                conn.commit()
+                return
+
+            legacy_index = self._load_json_list(self.index_path)
+            legacy_meta = self._load_json_list(self.metadata_path)
+            legacy_vec = self._load_vectors(self.vectors_path)
+            legacy_meta, legacy_vec = self._align_metadata_vectors(legacy_meta, legacy_vec)
+
+            index_by_rel: Dict[str, dict] = {}
+            for item in legacy_index:
+                if not isinstance(item, dict):
+                    continue
+                rel = self._normalize_rel(item.get("file_path"))
+                if not rel:
+                    continue
+                abs_path = self.material_dir / rel
+                index_by_rel[rel] = self._normalize_index_item(item, rel, abs_path)
+
+            metadata_by_rel: Dict[str, dict] = {}
+            vector_by_rel: Dict[str, np.ndarray] = {}
+            rows = int(legacy_vec.shape[0]) if isinstance(legacy_vec, np.ndarray) and legacy_vec.ndim == 2 else 0
+            for i, item in enumerate(legacy_meta[:rows]):
+                rel = self._normalize_rel((item or {}).get("file_path"))
+                if not rel:
+                    continue
+                metadata_by_rel[rel] = dict(item)
+                arr = np.asarray(legacy_vec[i], dtype=np.float64).reshape(-1)
+                if arr.size <= 0:
+                    continue
+                vector_by_rel[rel] = arr
+
+            now_ts = int(time.time())
+            if index_by_rel:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO index_items(rel, payload, updated_ts) VALUES(?, ?, ?)",
+                    [
+                        (rel, json.dumps(item, ensure_ascii=False, separators=(",", ":")), now_ts)
+                        for rel, item in index_by_rel.items()
+                    ],
+                )
+            if metadata_by_rel:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO metadata_items(rel, payload, updated_ts) VALUES(?, ?, ?)",
+                    [
+                        (rel, json.dumps(item, ensure_ascii=False, separators=(",", ":")), now_ts)
+                        for rel, item in metadata_by_rel.items()
+                    ],
+                )
+            if vector_by_rel:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO vector_items(rel, dim, vec, updated_ts) VALUES(?, ?, ?, ?)",
+                    [
+                        (
+                            rel,
+                            int(arr.size),
+                            np.asarray(arr, dtype=np.float64).reshape(-1).tobytes(),
+                            now_ts,
+                        )
+                        for rel, arr in vector_by_rel.items()
+                    ],
+                )
+            conn.commit()
+            self.log.info(
+                f"AI 索引：已完成增量存储迁移 (索引={len(index_by_rel)}, 元数据={len(metadata_by_rel)}, 向量={len(vector_by_rel)})"
+            )
+        finally:
+            conn.close()
+
+    def _load_incremental_store_maps(self) -> Tuple[Dict[str, dict], Dict[str, dict], Dict[str, np.ndarray]]:
+        self._ensure_incremental_store_ready()
+        index_by_rel: Dict[str, dict] = {}
+        metadata_by_rel: Dict[str, dict] = {}
+        vector_by_rel: Dict[str, np.ndarray] = {}
+
+        conn = self._open_incremental_store()
+        try:
+            for rel, payload in conn.execute("SELECT rel, payload FROM index_items"):
+                rel_norm = self._normalize_rel(rel)
+                if not rel_norm:
+                    continue
+                try:
+                    obj = json.loads(str(payload or ""))
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    index_by_rel[rel_norm] = obj
+
+            for rel, payload in conn.execute("SELECT rel, payload FROM metadata_items"):
+                rel_norm = self._normalize_rel(rel)
+                if not rel_norm:
+                    continue
+                try:
+                    obj = json.loads(str(payload or ""))
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    metadata_by_rel[rel_norm] = obj
+
+            for rel, dim, vec_blob in conn.execute("SELECT rel, dim, vec FROM vector_items"):
+                rel_norm = self._normalize_rel(rel)
+                if not rel_norm:
+                    continue
+                try:
+                    dim_i = int(dim)
+                except Exception:
+                    continue
+                if dim_i <= 0:
+                    continue
+                if not isinstance(vec_blob, (bytes, bytearray, memoryview)):
+                    continue
+                arr = np.frombuffer(bytes(vec_blob), dtype=np.float64)
+                if arr.size != dim_i:
+                    continue
+                vector_by_rel[rel_norm] = arr.copy()
+        finally:
+            conn.close()
+        return index_by_rel, metadata_by_rel, vector_by_rel
+
+    def _persist_incremental_store_changes(
+        self,
+        *,
+        index_upserts: Dict[str, dict],
+        index_deletes: set[str],
+        metadata_upserts: Dict[str, dict],
+        metadata_deletes: set[str],
+        vector_upserts: Dict[str, np.ndarray],
+        vector_deletes: set[str],
+    ) -> None:
+        if (
+            (not index_upserts)
+            and (not index_deletes)
+            and (not metadata_upserts)
+            and (not metadata_deletes)
+            and (not vector_upserts)
+            and (not vector_deletes)
+        ):
+            return
+
+        self._ensure_incremental_store_ready()
+        now_ts = int(time.time())
+        conn = self._open_incremental_store()
+        try:
+            with conn:
+                if index_deletes:
+                    conn.executemany(
+                        "DELETE FROM index_items WHERE rel=?",
+                        [(self._normalize_rel(rel),) for rel in sorted(index_deletes) if self._normalize_rel(rel)],
+                    )
+                if metadata_deletes:
+                    conn.executemany(
+                        "DELETE FROM metadata_items WHERE rel=?",
+                        [(self._normalize_rel(rel),) for rel in sorted(metadata_deletes) if self._normalize_rel(rel)],
+                    )
+                if vector_deletes:
+                    conn.executemany(
+                        "DELETE FROM vector_items WHERE rel=?",
+                        [(self._normalize_rel(rel),) for rel in sorted(vector_deletes) if self._normalize_rel(rel)],
+                    )
+
+                if index_upserts:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO index_items(rel, payload, updated_ts) VALUES(?, ?, ?)",
+                        [
+                            (
+                                rel_norm,
+                                json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+                                now_ts,
+                            )
+                            for rel_norm, item in (
+                                (self._normalize_rel(rel), item) for rel, item in index_upserts.items()
+                            )
+                            if rel_norm and isinstance(item, dict)
+                        ],
+                    )
+                if metadata_upserts:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO metadata_items(rel, payload, updated_ts) VALUES(?, ?, ?)",
+                        [
+                            (
+                                rel_norm,
+                                json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+                                now_ts,
+                            )
+                            for rel_norm, item in (
+                                (self._normalize_rel(rel), item) for rel, item in metadata_upserts.items()
+                            )
+                            if rel_norm and isinstance(item, dict)
+                        ],
+                    )
+                if vector_upserts:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO vector_items(rel, dim, vec, updated_ts) VALUES(?, ?, ?, ?)",
+                        [
+                            (
+                                rel_norm,
+                                int(arr.size),
+                                arr.tobytes(),
+                                now_ts,
+                            )
+                            for rel_norm, arr in (
+                                (
+                                    self._normalize_rel(rel),
+                                    np.asarray(vec, dtype=np.float64).reshape(-1),
+                                )
+                                for rel, vec in vector_upserts.items()
+                            )
+                            if rel_norm and isinstance(arr, np.ndarray) and arr.size > 0
+                        ],
+                    )
+        finally:
+            conn.close()
+
+    def _set_semantic_cache_from_maps(
+        self,
+        metadata_by_rel: Dict[str, dict],
+        vector_by_rel: Dict[str, np.ndarray],
+    ) -> None:
+        merged: Dict[str, Tuple[dict, np.ndarray]] = {}
+        for rel, meta_item in (metadata_by_rel or {}).items():
+            rel_norm = self._normalize_rel(rel)
+            if not rel_norm or not isinstance(meta_item, dict):
+                continue
+            vec = (vector_by_rel or {}).get(rel_norm)
+            if vec is None:
+                continue
+            arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+            if arr.size <= 0:
+                continue
+            merged[rel_norm] = (dict(meta_item), arr)
+        with self._lock:
+            self._semantic_entry_by_rel = merged
+            self._rebuild_semantic_cache_locked()
+
+    def _apply_semantic_cache_changes(
+        self,
+        *,
+        metadata_upserts: Dict[str, dict],
+        vector_upserts: Dict[str, np.ndarray],
+        delete_rels: set[str],
+    ) -> None:
+        with self._lock:
+            entry_map = dict(self._semantic_entry_by_rel)
+
+            for rel in delete_rels or set():
+                rel_norm = self._normalize_rel(rel)
+                if rel_norm:
+                    entry_map.pop(rel_norm, None)
+
+            for rel, meta_item in (metadata_upserts or {}).items():
+                rel_norm = self._normalize_rel(rel)
+                if (not rel_norm) or (not isinstance(meta_item, dict)):
+                    continue
+                old = entry_map.get(rel_norm)
+                if old is None:
+                    continue
+                entry_map[rel_norm] = (dict(meta_item), old[1])
+
+            for rel, vec in (vector_upserts or {}).items():
+                rel_norm = self._normalize_rel(rel)
+                if not rel_norm:
+                    continue
+                arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+                if arr.size <= 0:
+                    continue
+                old = entry_map.get(rel_norm)
+                if old is not None:
+                    entry_map[rel_norm] = (old[0], arr)
+
+            for rel, meta_item in (metadata_upserts or {}).items():
+                rel_norm = self._normalize_rel(rel)
+                if (not rel_norm) or (not isinstance(meta_item, dict)):
+                    continue
+                if rel_norm in entry_map:
+                    continue
+                vec = (vector_upserts or {}).get(rel_norm)
+                if vec is None:
+                    continue
+                arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+                if arr.size <= 0:
+                    continue
+                entry_map[rel_norm] = (dict(meta_item), arr)
+
+            self._semantic_entry_by_rel = entry_map
+            self._rebuild_semantic_cache_locked()
+
+    def _rebuild_semantic_cache_locked(self) -> None:
+        cleaned_map: Dict[str, Tuple[dict, np.ndarray]] = {}
+        meta_list: List[dict] = []
+        norm_rows: List[np.ndarray] = []
+        vec_dim: Optional[int] = None
+
+        for rel in sorted(self._semantic_entry_by_rel.keys()):
+            entry = self._semantic_entry_by_rel.get(rel)
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                continue
+            meta_item, vec = entry
+            if not isinstance(meta_item, dict):
+                continue
+            arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+            if arr.size <= 0:
+                continue
+            if vec_dim is None:
+                vec_dim = int(arr.size)
+            if int(arr.size) != int(vec_dim):
+                continue
+            norm = float(np.linalg.norm(arr))
+            if norm <= 0.0:
+                continue
+            cleaned_map[rel] = (dict(meta_item), arr)
+            meta_list.append(dict(meta_item))
+            norm_rows.append((arr / norm).astype(np.float64, copy=False))
+
+        self._semantic_entry_by_rel = cleaned_map
+        self._semantic_meta = meta_list
+        if norm_rows:
+            self._semantic_norm_vectors = np.vstack(norm_rows).astype(np.float64, copy=False)
+        else:
+            self._semantic_norm_vectors = np.empty((0, 0), dtype=np.float64)
 
     @staticmethod
     def _load_json_list(path: Path) -> List[dict]:
