@@ -1,0 +1,14 @@
+{
+  "_help": [
+    "Private aichat prompt overrides.",
+    "If a user does not have custom prompt, bot falls back to default and then AI_SYSTEM_PROMPT.",
+    "users key is QQ user_id string.",
+    "Each prompt field can be a string or a string array."
+  ],
+  "default": {},
+  "users": {
+    "123456789": {
+      "system_prompt": ""
+    }
+  }
+}

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import hashlib
 import html
 import json
 import re
+import shutil
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -25,6 +29,7 @@ from config import (
     AI_SEARCH_MIN_SIMILARITY,
     AI_SYSTEM_PROMPT,
     AI_VECTORS_PATH,
+    BASE_DIR,
 )
 
 try:
@@ -72,6 +77,16 @@ class AIService:
         "build_vectors.py",
     }
     _ALLOWED_SUFFIXES = {".pdf", ".docx", ".ppt", ".pptx"}
+    _EBOOK_SUFFIXES = {".epub", ".mobi"}
+    _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
+    _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
+    _AUTO_ORGANIZE_EBOOK_SUBJECT = "课外书"
+    _AUTO_ORGANIZE_MARKS_FILENAME = "ai_material_scan_marks.json"
+    _AUTO_ORGANIZE_STATE_CACHE_FILENAME = "ai_material_state_cache.json"
+    _AUTO_ORGANIZE_MAX_WARNINGS = 5
+    _TBD_CLASSIFY_MAX_CONCURRENCY = 3
+    _NEW_FILE_SUMMARY_MAX_CONCURRENCY = 3
+    _NEW_FILE_EMBED_MAX_CONCURRENCY = 4
     _NOTICE_SILENT_TOKEN = "[静默]"
 
     def __init__(self, log):
@@ -82,6 +97,9 @@ class AIService:
         self.metadata_path = Path(AI_METADATA_PATH)
         self.vectors_path = Path(AI_VECTORS_PATH)
         self.notice_prompt_config_path = Path(__file__).resolve().parent / "group_notice_prompts.json"
+        self.private_chat_prompt_config_path = Path(__file__).resolve().parent / "private_chat_prompts.json"
+        self.material_scan_marks_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_MARKS_FILENAME
+        self.material_state_cache_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_STATE_CACHE_FILENAME
 
         self.bot_nick = str(AI_BOT_NICK or "Cooepr_bot")
         self.chat_model = str(AI_CHAT_MODEL or "deepseek-chat")
@@ -99,11 +117,15 @@ class AIService:
         self.embedding_api_key = ""
 
         self._lock = threading.RLock()
+        self._chat_sessions_lock = threading.RLock()
+        self._chat_sessions: Dict[str, Dict[str, object]] = {}
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
         self._rapid_ocr = None
         self._notice_prompt_cache_mtime: Optional[float] = None
         self._notice_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
+        self._private_chat_prompt_cache_mtime: Optional[float] = None
+        self._private_chat_prompt_cache: Dict[str, object] = {"default": {}, "users": {}}
 
     @property
     def chat_ready(self) -> bool:
@@ -125,13 +147,22 @@ class AIService:
         return bool(self.deepseek_api_key and OpenAI is not None)
 
     async def bootstrap_sync(self) -> None:
+        await asyncio.to_thread(self._bootstrap_quick_sync_sync)
+
+    async def bootstrap_post_startup_sync(self) -> None:
         await asyncio.to_thread(self._bootstrap_sync_sync)
+
+    async def rebuild_material_scan_marks_from_current_layout(self) -> Dict[str, int]:
+        return await asyncio.to_thread(self._rebuild_material_scan_marks_from_current_layout_sync)
 
     async def semantic_find_paths(self, demand: str, limit: Optional[int] = None) -> List[Path]:
         return await asyncio.to_thread(self._semantic_find_paths_sync, demand, limit)
 
     async def chat(self, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_sync, user_input)
+
+    async def chat_with_context(self, session_key: str, user_input: str) -> str:
+        return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
 
     async def extract_notice_file_head(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         return await asyncio.to_thread(
@@ -214,6 +245,113 @@ class AIService:
                     out.append(s)
             return out
         return []
+
+    @staticmethod
+    def _normalize_chat_prompt_text(value: object) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            lines: List[str] = []
+            for item in value:
+                s = str(item or "").strip()
+                if s:
+                    lines.append(s)
+            return "\n".join(lines).strip()
+        return ""
+
+    @staticmethod
+    def _builtin_private_chat_prompt_config() -> Dict[str, object]:
+        return {"default": {}, "users": {}}
+
+    def _load_private_chat_prompt_config(self) -> Dict[str, object]:
+        path = self.private_chat_prompt_config_path
+        fallback = self._builtin_private_chat_prompt_config()
+        try:
+            mtime = path.stat().st_mtime
+        except Exception:
+            return fallback
+
+        with self._lock:
+            if self._private_chat_prompt_cache_mtime == float(mtime):
+                return self._private_chat_prompt_cache
+
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("private chat prompt config root must be an object")
+                default_cfg = data.get("default") or {}
+                users_cfg = data.get("users") or {}
+                if not isinstance(default_cfg, dict):
+                    default_cfg = {}
+                if not isinstance(users_cfg, dict):
+                    users_cfg = {}
+                normalized = {"default": default_cfg, "users": users_cfg}
+                self._private_chat_prompt_cache = normalized
+                self._private_chat_prompt_cache_mtime = float(mtime)
+                self.log.info(f"AI chat: loaded private prompt config {path.name}")
+                return normalized
+            except Exception as e:
+                self.log.warning(f"AI chat: failed to load private prompt config {path.name}: {e}")
+                self._private_chat_prompt_cache = fallback
+                self._private_chat_prompt_cache_mtime = float(mtime)
+                return fallback
+
+    def _select_chat_system_prompt(self, session_key: str) -> str:
+        default_prompt = str(self.system_prompt or "").strip()
+        key = str(session_key or "").strip()
+        if not key.startswith("private:"):
+            return default_prompt
+
+        user_id = key.split(":", 1)[1].strip()
+        if not user_id:
+            return default_prompt
+
+        try:
+            cfg = self._load_private_chat_prompt_config()
+        except Exception as e:
+            self.log.warning(f"AI chat: private prompt read error, fallback to default prompt: user={user_id[:40]} err={e}")
+            return default_prompt
+
+        default_raw = cfg.get("default") if isinstance(cfg, dict) else {}
+        default_cfg = default_raw if isinstance(default_raw, dict) else {}
+        users_cfg = cfg.get("users") if isinstance(cfg, dict) else {}
+        if not isinstance(users_cfg, dict):
+            users_cfg = {}
+
+        user_raw = users_cfg.get(user_id)
+        user_prompt_direct = self._normalize_chat_prompt_text(user_raw)
+        if user_prompt_direct:
+            return user_prompt_direct
+
+        user_cfg = user_raw or {}
+        if not isinstance(user_cfg, dict):
+            user_cfg = {}
+
+        for value in (
+            user_cfg.get("system_prompt"),
+            user_cfg.get("prompt"),
+            user_cfg.get("system_prompt_lines"),
+            user_cfg.get("prompt_lines"),
+        ):
+            prompt = self._normalize_chat_prompt_text(value)
+            if prompt:
+                return prompt
+
+        default_prompt_direct = self._normalize_chat_prompt_text(default_raw)
+        if default_prompt_direct:
+            return default_prompt_direct
+
+        for value in (
+            default_cfg.get("system_prompt"),
+            default_cfg.get("prompt"),
+            default_cfg.get("system_prompt_lines"),
+            default_cfg.get("prompt_lines"),
+        ):
+            prompt = self._normalize_chat_prompt_text(value)
+            if prompt:
+                return prompt
+
+        return default_prompt
 
     def _builtin_notice_prompt_config(self) -> Dict[str, object]:
         return {
@@ -362,12 +500,1139 @@ class AIService:
             .replace("{{silent_token}}", self._NOTICE_SILENT_TOKEN)
         )
 
+    @staticmethod
+    def _file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+        h = hashlib.sha256()
+        with Path(path).open("rb") as f:
+            while True:
+                buf = f.read(int(chunk_size))
+                if not buf:
+                    break
+                h.update(buf)
+        return h.hexdigest().lower()
+
+    @staticmethod
+    def _normalize_sha256(value: object) -> str:
+        h = str(value or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", h):
+            return ""
+        return h
+
+    @staticmethod
+    def _file_stat_signature(path: Path) -> Tuple[int, int]:
+        st = Path(path).stat()
+        size = int(st.st_size)
+        mtime_ns_raw = getattr(st, "st_mtime_ns", 0)
+        try:
+            mtime_ns = int(mtime_ns_raw)
+        except Exception:
+            mtime_ns = int(float(st.st_mtime) * 1_000_000_000)
+        if mtime_ns < 0:
+            mtime_ns = 0
+        if size < 0:
+            size = 0
+        return size, mtime_ns
+
+    def _load_material_state_cache(self) -> Dict[str, dict]:
+        fallback: Dict[str, dict] = {}
+        path = self.material_state_cache_path
+        if not path.exists():
+            return fallback
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                return fallback
+            raw = obj.get("files")
+            if raw is None:
+                raw = obj
+            if not isinstance(raw, dict):
+                return fallback
+
+            out: Dict[str, dict] = {}
+            for rel_key, entry in raw.items():
+                rel = self._normalize_rel(rel_key)
+                if not rel:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    size = int(entry.get("size"))
+                    mtime_ns = int(entry.get("mtime_ns"))
+                except Exception:
+                    continue
+                if size < 0 or mtime_ns < 0:
+                    continue
+                sha = self._normalize_sha256(entry.get("sha256"))
+                if not sha:
+                    continue
+                out[rel] = {"size": size, "mtime_ns": mtime_ns, "sha256": sha}
+            return out
+        except Exception as e:
+            self.log.warning(f"AI organize: failed to load state cache {path.name}: {e}")
+            return fallback
+
+    def _save_material_state_cache(self, cache_map: Dict[str, dict]) -> None:
+        payload: Dict[str, dict] = {"files": {}}
+        out = payload["files"]
+        for rel_key, entry in (cache_map or {}).items():
+            rel = self._normalize_rel(rel_key)
+            if not rel or not isinstance(entry, dict):
+                continue
+            try:
+                size = int(entry.get("size"))
+                mtime_ns = int(entry.get("mtime_ns"))
+            except Exception:
+                continue
+            if size < 0 or mtime_ns < 0:
+                continue
+            sha = self._normalize_sha256(entry.get("sha256"))
+            if not sha:
+                continue
+            out[rel] = {"size": size, "mtime_ns": mtime_ns, "sha256": sha}
+        self.material_state_cache_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _get_file_hash_by_state_cache(
+        self,
+        path: Path,
+        rel_hint: str,
+        cache_map: Dict[str, dict],
+    ) -> Tuple[str, bool]:
+        rel = self._normalize_rel(rel_hint)
+        if not rel:
+            try:
+                rel = Path(path).relative_to(self.material_dir).as_posix()
+            except Exception:
+                rel = str(Path(path).name)
+
+        size, mtime_ns = self._file_stat_signature(path)
+        old = cache_map.get(rel)
+        if isinstance(old, dict):
+            old_sha = self._normalize_sha256(old.get("sha256"))
+            if old_sha:
+                try:
+                    old_size = int(old.get("size"))
+                    old_mtime_ns = int(old.get("mtime_ns"))
+                except Exception:
+                    old_size = -1
+                    old_mtime_ns = -1
+                if old_size == size and old_mtime_ns == mtime_ns:
+                    return old_sha, False
+
+        new_sha = self._normalize_sha256(self._file_sha256(path))
+        if not new_sha:
+            return "", False
+        cache_map[rel] = {"size": size, "mtime_ns": mtime_ns, "sha256": new_sha}
+        return new_sha, True
+
+    def _set_file_hash_state_cache_entry(
+        self,
+        path: Path,
+        rel_hint: str,
+        file_hash: str,
+        cache_map: Dict[str, dict],
+    ) -> bool:
+        rel = self._normalize_rel(rel_hint)
+        sha = self._normalize_sha256(file_hash)
+        if (not rel) or (not sha):
+            return False
+        size, mtime_ns = self._file_stat_signature(path)
+        new_entry = {"size": size, "mtime_ns": mtime_ns, "sha256": sha}
+        old_entry = cache_map.get(rel)
+        if old_entry == new_entry:
+            return False
+        cache_map[rel] = new_entry
+        return True
+
+    def _load_material_scan_marks(self) -> Dict[str, object]:
+        fallback: Dict[str, object] = {"confirmed_ok_hashes": {}}
+        path = self.material_scan_marks_path
+        if not path.exists():
+            return fallback
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(obj, dict):
+                return fallback
+            raw = obj.get("confirmed_ok_hashes") or {}
+            if not isinstance(raw, dict):
+                return fallback
+            normalized: Dict[str, dict] = {}
+            for k, v in raw.items():
+                h = str(k or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", h):
+                    continue
+                if isinstance(v, dict):
+                    rel = str(v.get("rel") or "").strip()
+                    ts_raw = v.get("ts") or 0
+                else:
+                    rel = ""
+                    ts_raw = 0
+                try:
+                    ts = int(ts_raw)
+                except Exception:
+                    ts = 0
+                normalized[h] = {"rel": rel, "ts": ts}
+            return {"confirmed_ok_hashes": normalized}
+        except Exception as e:
+            self.log.warning(f"AI organize: failed to load marks file {path.name}: {e}")
+            return fallback
+
+    def _save_material_scan_marks(self, marks: Dict[str, object]) -> None:
+        payload = {"confirmed_ok_hashes": {}}
+        raw = (marks or {}).get("confirmed_ok_hashes") if isinstance(marks, dict) else {}
+        if isinstance(raw, dict):
+            out: Dict[str, dict] = {}
+            for k, v in raw.items():
+                h = str(k or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", h):
+                    continue
+                if isinstance(v, dict):
+                    rel = str(v.get("rel") or "").strip()
+                    ts_raw = v.get("ts") or 0
+                else:
+                    rel = ""
+                    ts_raw = 0
+                try:
+                    ts = int(ts_raw)
+                except Exception:
+                    ts = 0
+                out[h] = {"rel": rel, "ts": ts}
+            payload["confirmed_ok_hashes"] = out
+        self.material_scan_marks_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _rebuild_material_scan_marks_from_current_layout_sync(self) -> Dict[str, int]:
+        stats = {"scanned": 0, "marked": 0, "hash_failed": 0, "duplicates": 0}
+        if str(self.material_dir.name or "").strip().lower() != "textbook_and_material":
+            return stats
+        subjects = self._collect_existing_subject_dirs()
+        if not subjects:
+            return stats
+        subject_set = set(subjects)
+        files = self._collect_classified_files(subject_set)
+        now_ts = int(time.time())
+        confirmed: Dict[str, dict] = {}
+        for path in files:
+            rel = ""
+            try:
+                rel = path.relative_to(self.material_dir).as_posix()
+            except Exception:
+                rel = str(path.name)
+            try:
+                h = self._file_sha256(path)
+                stats["scanned"] += 1
+            except Exception:
+                stats["hash_failed"] += 1
+                continue
+            if not h:
+                continue
+            if h in confirmed:
+                stats["duplicates"] += 1
+                continue
+            confirmed[h] = {"rel": rel, "ts": now_ts}
+        stats["marked"] = len(confirmed)
+        self._save_material_scan_marks({"confirmed_ok_hashes": confirmed})
+        return stats
+
+    def _auto_organize_materials_on_boot(self, index_list: List[dict]) -> Tuple[Dict[str, str], Dict[str, dict]]:
+        move_map: Dict[str, str] = {}
+        new_file_hints: Dict[str, dict] = {}
+        if str(self.material_dir.name or "").strip().lower() != "textbook_and_material":
+            return move_map, new_file_hints
+
+        tbd_dir = self.material_dir / self._AUTO_ORGANIZE_TBD_DIRNAME
+        tbd_dir.mkdir(parents=True, exist_ok=True)
+
+        subjects = self._collect_existing_subject_dirs()
+        if not subjects:
+            self.log.info("AI organize: no subject folders found, skip startup organizer")
+            return move_map, new_file_hints
+        can_use_ai = bool(self.deepseek_base_url and self.deepseek_api_key)
+        if not can_use_ai:
+            self.log.info("AI organize: DeepSeek not configured, only hash dedup will run")
+
+        index_by_rel = self._index_item_map_by_rel(index_list)
+        subject_set = set(subjects)
+
+        marks = self._load_material_scan_marks()
+        raw_confirmed = marks.get("confirmed_ok_hashes") if isinstance(marks, dict) else {}
+        confirmed_map: Dict[str, dict] = {}
+        if isinstance(raw_confirmed, dict):
+            for k, v in raw_confirmed.items():
+                h = str(k or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", h):
+                    continue
+                if isinstance(v, dict):
+                    rel = str(v.get("rel") or "").strip()
+                    ts_raw = v.get("ts") or 0
+                else:
+                    rel = ""
+                    ts_raw = 0
+                try:
+                    ts = int(ts_raw)
+                except Exception:
+                    ts = 0
+                confirmed_map[h] = {"rel": rel, "ts": ts}
+        confirmed_hashes = set(confirmed_map.keys())
+        marks_changed = False
+        state_cache_map = self._load_material_state_cache()
+        state_cache_changed = False
+
+        fix_files: List[Path] = []
+        file_hash_by_rel: Dict[str, str] = {}
+        existing_rel_by_hash: Dict[str, str] = {}
+        classified_hashes_ready = False
+        hash_failed = 0
+
+        def _material_rel_exists(rel: str) -> bool:
+            rel_norm = str(rel or "").strip()
+            if not rel_norm:
+                return False
+            p = self.material_dir / rel_norm
+            return p.exists() and p.is_file()
+
+        def _ensure_classified_hash_cache() -> None:
+            nonlocal fix_files, classified_hashes_ready, hash_failed, marks_changed, state_cache_changed
+            if classified_hashes_ready:
+                return
+
+            fix_files = self._collect_classified_files(subject_set)
+            fix_rel_set = set()
+            local_hash_failed = 0
+            for path in fix_files:
+                rel_hint = ""
+                try:
+                    rel_hint = path.relative_to(self.material_dir).as_posix()
+                except Exception:
+                    rel_hint = str(path.name)
+                rel_norm = self._normalize_rel(rel_hint)
+                if rel_norm:
+                    fix_rel_set.add(rel_norm)
+                try:
+                    h, cache_updated = self._get_file_hash_by_state_cache(path, rel_hint, state_cache_map)
+                    if cache_updated:
+                        state_cache_changed = True
+                    if not h:
+                        continue
+                    file_hash_by_rel[rel_hint] = h
+                    if h not in existing_rel_by_hash:
+                        existing_rel_by_hash[h] = rel_hint
+                except Exception as e:
+                    local_hash_failed += 1
+                    if local_hash_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                        self.log.warning(f"AI organize: failed to hash classified file {rel_hint}: {e}")
+            hash_failed = local_hash_failed
+            if hash_failed > self._AUTO_ORGANIZE_MAX_WARNINGS:
+                extra = hash_failed - self._AUTO_ORGANIZE_MAX_WARNINGS
+                self.log.warning(f"AI organize: classified-file hash failures omitted={extra}")
+
+            stale_hashes = [h for h in list(confirmed_map.keys()) if h not in existing_rel_by_hash]
+            if stale_hashes:
+                for h in stale_hashes:
+                    confirmed_map.pop(h, None)
+                    confirmed_hashes.discard(h)
+                marks_changed = True
+                self.log.info(f"AI organize: pruned stale marks for deleted files count={len(stale_hashes)}")
+
+            stale_state_rels = []
+            for rel_key in list(state_cache_map.keys()):
+                rel_norm = self._normalize_rel(rel_key)
+                if not rel_norm:
+                    stale_state_rels.append(rel_key)
+                    continue
+                if rel_norm not in fix_rel_set:
+                    stale_state_rels.append(rel_key)
+            if stale_state_rels:
+                for rel_key in stale_state_rels:
+                    state_cache_map.pop(rel_key, None)
+                state_cache_changed = True
+            classified_hashes_ready = True
+
+        tbd_files = self._collect_tbd_files(tbd_dir)
+        tbd_moved = 0
+        tbd_deleted = 0
+        tbd_kept = 0
+        tbd_failed = 0
+        tbd_ai_candidates: List[dict] = []
+        tbd_seen_hashes: Dict[str, str] = {}
+        for path in tbd_files:
+            rel_hint = ""
+            try:
+                rel_hint = path.relative_to(self.material_dir).as_posix()
+            except Exception:
+                rel_hint = str(path.name)
+
+            tbd_hash = ""
+            try:
+                tbd_hash = self._file_sha256(path)
+            except Exception as e:
+                tbd_failed += 1
+                if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                    self.log.warning(f"AI organize: failed to hash TBD file {rel_hint}: {e}")
+
+            if tbd_hash:
+                duplicate_rel = existing_rel_by_hash.get(tbd_hash, "")
+                if not duplicate_rel:
+                    mark_entry = confirmed_map.get(tbd_hash)
+                    mark_rel = (
+                        str((mark_entry or {}).get("rel") or "").strip()
+                        if isinstance(mark_entry, dict)
+                        else ""
+                    )
+                    if _material_rel_exists(mark_rel):
+                        duplicate_rel = mark_rel
+                        existing_rel_by_hash[tbd_hash] = mark_rel
+                if not duplicate_rel:
+                    duplicate_rel = tbd_seen_hashes.get(tbd_hash, "")
+                if (not duplicate_rel) and (not classified_hashes_ready):
+                    _ensure_classified_hash_cache()
+                    duplicate_rel = existing_rel_by_hash.get(tbd_hash, "")
+                if duplicate_rel:
+                    try:
+                        path.unlink()
+                        tbd_deleted += 1
+                        self.log.info(f"AI organize: removed duplicate TBD file {rel_hint} (hash matches {duplicate_rel})")
+                        continue
+                    except Exception as e:
+                        tbd_failed += 1
+                        if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                            self.log.warning(f"AI organize: failed to delete duplicate TBD file {rel_hint}: {e}")
+                    continue
+                tbd_seen_hashes[tbd_hash] = rel_hint
+
+            if path.suffix.lower() in self._EBOOK_SUFFIXES:
+                try:
+                    moved = self._move_material_to_subject(path, self._AUTO_ORGANIZE_EBOOK_SUBJECT)
+                    if not moved:
+                        tbd_kept += 1
+                        continue
+                    old_rel, new_rel = moved
+                    move_map[old_rel] = new_rel
+                    tbd_moved += 1
+                    old_rel_norm = self._normalize_rel(old_rel)
+                    if old_rel_norm and (old_rel_norm in state_cache_map):
+                        state_cache_map.pop(old_rel_norm, None)
+                        state_cache_changed = True
+                    item = index_by_rel.pop(old_rel, None)
+                    if isinstance(item, dict):
+                        updated = dict(item)
+                        updated["file_path"] = self._to_store_rel(new_rel)
+                        updated["subject"] = self._subject_from_rel(new_rel)
+                        updated["filename"] = (self.material_dir / new_rel).name
+                        index_by_rel[new_rel] = updated
+                    if tbd_hash:
+                        file_hash_by_rel[new_rel] = tbd_hash
+                        if tbd_hash not in existing_rel_by_hash:
+                            existing_rel_by_hash[tbd_hash] = new_rel
+                        try:
+                            if self._set_file_hash_state_cache_entry(
+                                self.material_dir / new_rel,
+                                new_rel,
+                                tbd_hash,
+                                state_cache_map,
+                            ):
+                                state_cache_changed = True
+                        except Exception:
+                            pass
+                    ebook_filename = (self.material_dir / new_rel).name
+                    new_file_hints[new_rel] = {
+                        "from_tbd": True,
+                        "old_rel": old_rel,
+                        "classified_target": self._AUTO_ORGANIZE_EBOOK_SUBJECT,
+                        "snippet": "",
+                        "summary_data": self._fallback_summary(
+                            self._AUTO_ORGANIZE_EBOOK_SUBJECT,
+                            ebook_filename,
+                            path.suffix.lower().lstrip("."),
+                        ),
+                    }
+                    self.log.info(
+                        f"AI organize: moved ebook TBD file {old_rel} -> {new_rel}"
+                    )
+                    continue
+                except Exception as e:
+                    tbd_failed += 1
+                    if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                        self.log.warning(f"AI organize: failed to move ebook TBD file {rel_hint}: {e}")
+
+            if not can_use_ai:
+                tbd_kept += 1
+                continue
+
+            tbd_ai_candidates.append({"path": path, "rel_hint": rel_hint, "tbd_hash": tbd_hash})
+
+        tbd_classify_results: Dict[str, dict] = {}
+        if can_use_ai and tbd_ai_candidates:
+            max_workers = max(1, min(int(self._TBD_CLASSIFY_MAX_CONCURRENCY), len(tbd_ai_candidates)))
+            if max_workers <= 1:
+                for candidate in tbd_ai_candidates:
+                    rel_hint = str(candidate.get("rel_hint") or "").strip()
+                    path = candidate.get("path")
+                    if (not rel_hint) or (not isinstance(path, Path)):
+                        continue
+                    try:
+                        tbd_classify_results[rel_hint] = self._classify_tbd_target_subject(
+                            rel_hint,
+                            path,
+                            subjects,
+                            index_by_rel.get(rel_hint),
+                        )
+                    except Exception as e:
+                        tbd_failed += 1
+                        if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                            self.log.warning(f"AI organize: failed to classify TBD file {rel_hint}: {e}")
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_rel: Dict[concurrent.futures.Future, str] = {}
+                    for candidate in tbd_ai_candidates:
+                        rel_hint = str(candidate.get("rel_hint") or "").strip()
+                        path = candidate.get("path")
+                        if (not rel_hint) or (not isinstance(path, Path)):
+                            continue
+                        fut = executor.submit(
+                            self._classify_tbd_target_subject,
+                            rel_hint,
+                            path,
+                            subjects,
+                            index_by_rel.get(rel_hint),
+                        )
+                        future_to_rel[fut] = rel_hint
+                    for fut in concurrent.futures.as_completed(future_to_rel):
+                        rel_hint = future_to_rel[fut]
+                        try:
+                            tbd_classify_results[rel_hint] = fut.result()
+                        except Exception as e:
+                            tbd_failed += 1
+                            if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                                self.log.warning(f"AI organize: failed to classify TBD file {rel_hint}: {e}")
+
+        for candidate in tbd_ai_candidates:
+            rel_hint = str(candidate.get("rel_hint") or "").strip()
+            path = candidate.get("path")
+            if (not rel_hint) or (not isinstance(path, Path)):
+                tbd_kept += 1
+                continue
+            classify_result = tbd_classify_results.get(rel_hint)
+            if not isinstance(classify_result, dict):
+                tbd_kept += 1
+                continue
+            target = str(classify_result.get("target") or "").strip()
+            if (not target) or (target not in subject_set):
+                tbd_kept += 1
+                continue
+            try:
+                moved = self._move_material_to_subject(path, target)
+                if not moved:
+                    tbd_kept += 1
+                    continue
+                old_rel, new_rel = moved
+                move_map[old_rel] = new_rel
+                tbd_moved += 1
+                old_rel_norm = self._normalize_rel(old_rel)
+                if old_rel_norm and (old_rel_norm in state_cache_map):
+                    state_cache_map.pop(old_rel_norm, None)
+                    state_cache_changed = True
+                item = index_by_rel.pop(old_rel, None)
+                if isinstance(item, dict):
+                    updated = dict(item)
+                    updated["file_path"] = self._to_store_rel(new_rel)
+                    updated["subject"] = self._subject_from_rel(new_rel)
+                    updated["filename"] = (self.material_dir / new_rel).name
+                    index_by_rel[new_rel] = updated
+                tbd_hash = str(candidate.get("tbd_hash") or "").strip().lower()
+                if tbd_hash:
+                    file_hash_by_rel[new_rel] = tbd_hash
+                    if tbd_hash not in existing_rel_by_hash:
+                        existing_rel_by_hash[tbd_hash] = new_rel
+                    try:
+                        if self._set_file_hash_state_cache_entry(
+                            self.material_dir / new_rel,
+                            new_rel,
+                            tbd_hash,
+                            state_cache_map,
+                        ):
+                            state_cache_changed = True
+                    except Exception:
+                        pass
+                hint_payload: Dict[str, object] = {
+                    "from_tbd": True,
+                    "old_rel": old_rel,
+                    "classified_target": target,
+                    "snippet": str(classify_result.get("snippet") or "").strip(),
+                }
+                summary_hint = self._normalize_summary_data(
+                    classify_result.get("summary_data"),
+                    target,
+                    path.name,
+                )
+                if isinstance(summary_hint, dict):
+                    hint_payload["summary_data"] = summary_hint
+                new_file_hints[new_rel] = hint_payload
+                self.log.info(f"AI organize: moved TBD file {old_rel} -> {new_rel}")
+            except Exception as e:
+                tbd_failed += 1
+                if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                    self.log.warning(f"AI organize: failed to move classified TBD file {rel_hint}: {e}")
+        if tbd_failed > self._AUTO_ORGANIZE_MAX_WARNINGS:
+            extra = tbd_failed - self._AUTO_ORGANIZE_MAX_WARNINGS
+            self.log.warning(f"AI organize: TBD classification failures omitted={extra}")
+
+        _ensure_classified_hash_cache()
+
+        skip_rels = set(move_map.values())
+        fix_marked_skip = 0
+        fix_moved = 0
+        fix_kept = 0
+        fix_failed = 0
+        for path in fix_files:
+            rel_hint = ""
+            try:
+                rel_hint = path.relative_to(self.material_dir).as_posix()
+            except Exception:
+                rel_hint = str(path.name)
+            if rel_hint in skip_rels:
+                continue
+            current_subject = self._subject_from_rel(rel_hint)
+            if current_subject not in subject_set:
+                continue
+
+            file_hash = file_hash_by_rel.get(rel_hint, "")
+            if (not file_hash) and path.exists():
+                try:
+                    file_hash, cache_updated = self._get_file_hash_by_state_cache(path, rel_hint, state_cache_map)
+                    if cache_updated:
+                        state_cache_changed = True
+                    if file_hash:
+                        file_hash_by_rel[rel_hint] = file_hash
+                except Exception:
+                    file_hash = ""
+
+            if (path.suffix.lower() in self._EBOOK_SUFFIXES) and (current_subject != self._AUTO_ORGANIZE_EBOOK_SUBJECT):
+                try:
+                    moved = self._move_material_to_subject(path, self._AUTO_ORGANIZE_EBOOK_SUBJECT)
+                    if not moved:
+                        fix_kept += 1
+                        continue
+                    old_rel, new_rel = moved
+                    move_map[old_rel] = new_rel
+                    fix_moved += 1
+                    old_rel_norm = self._normalize_rel(old_rel)
+                    if old_rel_norm and (old_rel_norm in state_cache_map):
+                        state_cache_map.pop(old_rel_norm, None)
+                        state_cache_changed = True
+                    item = index_by_rel.pop(old_rel, None)
+                    if isinstance(item, dict):
+                        updated = dict(item)
+                        updated["file_path"] = self._to_store_rel(new_rel)
+                        updated["subject"] = self._subject_from_rel(new_rel)
+                        updated["filename"] = (self.material_dir / new_rel).name
+                        index_by_rel[new_rel] = updated
+                    if file_hash:
+                        file_hash_by_rel[new_rel] = file_hash
+                        existing_rel_by_hash[file_hash] = new_rel
+                        try:
+                            if self._set_file_hash_state_cache_entry(
+                                self.material_dir / new_rel,
+                                new_rel,
+                                file_hash,
+                                state_cache_map,
+                            ):
+                                state_cache_changed = True
+                        except Exception:
+                            pass
+                    self.log.info(f"AI organize: moved ebook file {old_rel} -> {new_rel}")
+                    continue
+                except Exception as e:
+                    fix_failed += 1
+                    if fix_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                        self.log.warning(f"AI organize: failed to move ebook file {rel_hint}: {e}")
+                    continue
+
+            if file_hash and (file_hash in confirmed_hashes):
+                fix_marked_skip += 1
+                continue
+
+            if not can_use_ai:
+                fix_kept += 1
+                continue
+
+            try:
+                target = self._classify_obvious_wrong_subject(
+                    rel_hint,
+                    path,
+                    current_subject,
+                    subjects,
+                    index_by_rel.get(rel_hint),
+                )
+                if (not target) or (target == current_subject) or (target not in subject_set):
+                    fix_kept += 1
+                    if file_hash:
+                        old_entry = confirmed_map.get(file_hash)
+                        old_rel = str((old_entry or {}).get("rel") or "").strip() if isinstance(old_entry, dict) else ""
+                        if old_rel != rel_hint:
+                            confirmed_map[file_hash] = {"rel": rel_hint, "ts": int(time.time())}
+                            confirmed_hashes.add(file_hash)
+                            marks_changed = True
+                    continue
+                moved = self._move_material_to_subject(path, target)
+                if not moved:
+                    fix_kept += 1
+                    continue
+                old_rel, new_rel = moved
+                move_map[old_rel] = new_rel
+                fix_moved += 1
+                old_rel_norm = self._normalize_rel(old_rel)
+                if old_rel_norm and (old_rel_norm in state_cache_map):
+                    state_cache_map.pop(old_rel_norm, None)
+                    state_cache_changed = True
+                item = index_by_rel.pop(old_rel, None)
+                if isinstance(item, dict):
+                    updated = dict(item)
+                    updated["file_path"] = self._to_store_rel(new_rel)
+                    updated["subject"] = self._subject_from_rel(new_rel)
+                    updated["filename"] = (self.material_dir / new_rel).name
+                    index_by_rel[new_rel] = updated
+                if file_hash:
+                    file_hash_by_rel[new_rel] = file_hash
+                    existing_rel_by_hash[file_hash] = new_rel
+                    try:
+                        if self._set_file_hash_state_cache_entry(
+                            self.material_dir / new_rel,
+                            new_rel,
+                            file_hash,
+                            state_cache_map,
+                        ):
+                            state_cache_changed = True
+                    except Exception:
+                        pass
+                self.log.info(f"AI organize: corrected obvious misplaced file {old_rel} -> {new_rel}")
+            except Exception as e:
+                fix_failed += 1
+                if fix_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
+                    self.log.warning(f"AI organize: failed to review file {rel_hint}: {e}")
+        if fix_failed > self._AUTO_ORGANIZE_MAX_WARNINGS:
+            extra = fix_failed - self._AUTO_ORGANIZE_MAX_WARNINGS
+            self.log.warning(f"AI organize: misplaced-file review failures omitted={extra}")
+
+        if marks_changed:
+            try:
+                self._save_material_scan_marks({"confirmed_ok_hashes": confirmed_map})
+            except Exception as e:
+                self.log.warning(f"AI organize: failed to save marks file {self.material_scan_marks_path.name}: {e}")
+
+        if state_cache_changed or (not self.material_state_cache_path.exists()):
+            try:
+                self._save_material_state_cache(state_cache_map)
+            except Exception as e:
+                self.log.warning(f"AI organize: failed to save state cache {self.material_state_cache_path.name}: {e}")
+
+        self.log.info(
+            "AI organize: startup finished "
+            f"(TBD scanned={len(tbd_files)}, dedup_deleted={tbd_deleted}, moved={tbd_moved}, kept={tbd_kept}, failed={tbd_failed}; "
+            f"classified scanned={len(fix_files)}, marked_skip={fix_marked_skip}, moved={fix_moved}, kept={fix_kept}, failed={fix_failed})"
+        )
+        return move_map, new_file_hints
+
+    def _collect_existing_subject_dirs(self) -> List[str]:
+        out: List[str] = []
+        if not self.material_dir.exists():
+            return out
+        for p in sorted(self.material_dir.iterdir(), key=lambda x: x.name.lower()):
+            if not p.is_dir():
+                continue
+            nm = str(p.name or "").strip()
+            if not nm:
+                continue
+            if nm.startswith(".") or nm.startswith("_"):
+                continue
+            if nm.casefold() == self._AUTO_ORGANIZE_TBD_DIRNAME.casefold():
+                continue
+            out.append(nm)
+        return out
+
+    def _collect_tbd_files(self, tbd_dir: Path) -> List[Path]:
+        out: List[Path] = []
+        if not tbd_dir.exists():
+            return out
+        for p in tbd_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            if not self._is_auto_organize_suffix(p.suffix.lower()):
+                continue
+            if self._skip_file(p):
+                continue
+            out.append(p.resolve())
+        out.sort(key=lambda x: str(x).lower())
+        return out
+
+    def _collect_classified_files(self, subject_set: set[str]) -> List[Path]:
+        out: List[Path] = []
+        if not self.material_dir.exists():
+            return out
+        for p in self.material_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            if not self._is_auto_organize_suffix(p.suffix.lower()):
+                continue
+            if self._skip_file(p):
+                continue
+            try:
+                rel = p.relative_to(self.material_dir).as_posix()
+            except Exception:
+                continue
+            top = self._subject_from_rel(rel)
+            if top.casefold() == self._AUTO_ORGANIZE_TBD_DIRNAME.casefold():
+                continue
+            if top not in subject_set:
+                continue
+            out.append(p.resolve())
+        out.sort(key=lambda x: str(x).lower())
+        return out
+
+    @classmethod
+    def _is_auto_organize_suffix(cls, suffix: str) -> bool:
+        s = str(suffix or "").strip().lower()
+        return (s in cls._ALLOWED_SUFFIXES) or (s in cls._EBOOK_SUFFIXES)
+
+    def _extract_material_snippet(self, path: Path, max_chars: int = 1600) -> str:
+        p = Path(path)
+        suffix = p.suffix.lower()
+        if suffix == ".pdf":
+            txt = self._read_pdf_head_fitz(p, max_pages=4, max_chars=max_chars)
+            if self._has_enough_text(txt):
+                return txt[:max_chars]
+            txt2 = self._read_pdf_head(p, max_pages=4, max_chars=max_chars)
+            if self._has_enough_text(txt2):
+                return txt2[:max_chars]
+            return (txt2 or txt)[:max_chars]
+        if suffix == ".docx":
+            return self._read_docx_head(p, max_chars=max_chars)[:max_chars]
+        return ""
+
+    def _index_item_map_by_rel(self, index_list: List[dict]) -> Dict[str, dict]:
+        out: Dict[str, dict] = {}
+        for item in index_list:
+            if not isinstance(item, dict):
+                continue
+            rel = self._normalize_rel(item.get("file_path"))
+            if (not rel) or (rel in out):
+                continue
+            out[rel] = item
+        return out
+
+    def _classify_tbd_target_subject(
+        self,
+        rel: str,
+        path: Path,
+        subjects: List[str],
+        index_item: Optional[dict],
+    ) -> Dict[str, object]:
+        item = index_item if isinstance(index_item, dict) else {}
+        item_summary = str(item.get("summary") or "").strip()
+        item_keywords = item.get("keywords") or []
+        if not isinstance(item_keywords, list):
+            item_keywords = [str(item_keywords)]
+        kw_text = ", ".join(str(x).strip() for x in item_keywords if str(x).strip())
+
+        snippet = ""
+        try:
+            snippet = self._extract_material_snippet(path, max_chars=1800)
+        except Exception:
+            snippet = ""
+        if len(snippet) > 1800:
+            snippet = snippet[:1800]
+
+        prompt = (
+            "You are a conservative material organizer.\n"
+            "Task: choose whether this file should be moved from TBD into an existing subject folder.\n"
+            "Rules:\n"
+            "- Move only when highly certain.\n"
+            "- Never invent a new folder.\n"
+            "- If uncertain, keep the file in TBD.\n"
+            "Return strict JSON only with keys: action, target_subject, confidence, reason, keywords, summary.\n"
+            "action must be 'move' or 'keep'.\n"
+            "If action=move and you are confident, also return concise keywords and summary for indexing.\n"
+            f"candidate_subjects={json.dumps(subjects, ensure_ascii=False)}\n"
+            f"file_relative_path={rel}\n"
+            f"file_name={path.name}\n"
+            f"index_summary={item_summary}\n"
+            f"index_keywords={kw_text}\n"
+            f"content_snippet={snippet}\n"
+        )
+        obj = self._ask_subject_decision(prompt, timeout=120.0)
+        move, target, confidence, obvious_flag, _reason = self._extract_move_decision(obj)
+        summary_data = self._normalize_summary_data(obj, self._subject_from_rel(rel), path.name)
+        if not move:
+            return {"target": "", "snippet": snippet, "summary_data": summary_data}
+        if target not in set(subjects):
+            return {"target": "", "snippet": snippet, "summary_data": summary_data}
+        if not self._is_high_confidence(confidence):
+            return {"target": "", "snippet": snippet, "summary_data": summary_data}
+        if isinstance(obvious_flag, bool) and (not obvious_flag):
+            return {"target": "", "snippet": snippet, "summary_data": summary_data}
+        return {"target": target, "snippet": snippet, "summary_data": summary_data}
+
+    def _classify_obvious_wrong_subject(
+        self,
+        rel: str,
+        path: Path,
+        current_subject: str,
+        subjects: List[str],
+        index_item: Optional[dict],
+    ) -> str:
+        if len(subjects) <= 1:
+            return ""
+
+        item = index_item if isinstance(index_item, dict) else {}
+        item_summary = str(item.get("summary") or "").strip()
+        item_keywords = item.get("keywords") or []
+        if not isinstance(item_keywords, list):
+            item_keywords = [str(item_keywords)]
+        kw_text = ", ".join(str(x).strip() for x in item_keywords if str(x).strip())
+
+        snippet = ""
+        if len(item_summary) < 30:
+            try:
+                snippet = self._extract_material_snippet(path, max_chars=1200)
+            except Exception:
+                snippet = ""
+        if len(snippet) > 1200:
+            snippet = snippet[:1200]
+
+        prompt = (
+            "You are reviewing subject placement for a learning material file.\n"
+            "Goal: only detect obvious misclassification.\n"
+            "Be very conservative: if there is any ambiguity, keep it unchanged.\n"
+            "Only move when mismatch is obvious (for example, analog circuits placed in politics).\n"
+            "Return strict JSON only with keys: action, target_subject, confidence, obvious_error, reason.\n"
+            "action must be 'move' or 'keep'.\n"
+            f"candidate_subjects={json.dumps(subjects, ensure_ascii=False)}\n"
+            f"current_subject={current_subject}\n"
+            f"file_relative_path={rel}\n"
+            f"file_name={path.name}\n"
+            f"index_summary={item_summary}\n"
+            f"index_keywords={kw_text}\n"
+            f"content_snippet={snippet}\n"
+        )
+        obj = self._ask_subject_decision(prompt, timeout=120.0)
+        move, target, confidence, obvious_flag, _reason = self._extract_move_decision(obj)
+        if not move:
+            return ""
+        if target not in set(subjects):
+            return ""
+        if target == current_subject:
+            return ""
+        if obvious_flag is not True:
+            return ""
+        if not self._is_high_confidence(confidence):
+            return ""
+        return target
+
+    def _ask_subject_decision(self, prompt: str, timeout: float = 90.0) -> dict:
+        payload = {
+            "model": self.chat_model,
+            "messages": [{"role": "user", "content": str(prompt or "")}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.0,
+        }
+        url = self._join_url(self.deepseek_base_url, "chat/completions")
+        data = self._post_json(url, payload, self.deepseek_api_key, timeout=float(timeout))
+        text = self._extract_chat_text(data)
+        obj = self._parse_json_object(text)
+        if obj is None:
+            raise RuntimeError("decision json parse failed")
+        return obj
+
+    @staticmethod
+    def _parse_json_object(text: str) -> Optional[dict]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        obj = None
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", raw)
+            if not m:
+                return None
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                return None
+        return obj if isinstance(obj, dict) else None
+
+    @staticmethod
+    def _is_high_confidence(value: object) -> bool:
+        if isinstance(value, (int, float)):
+            try:
+                return float(value) >= 0.85
+            except Exception:
+                return False
+        v = str(value or "").strip().lower()
+        if not v:
+            return False
+        if v in {"high", "very_high", "certain", "sure", "definite"}:
+            return True
+        m = re.match(r"^(\d+(?:\.\d+)?)%?$", v)
+        if not m:
+            return False
+        try:
+            score = float(m.group(1))
+        except Exception:
+            return False
+        if v.endswith("%"):
+            score = score / 100.0
+        return score >= 0.85
+
+    @staticmethod
+    def _extract_move_decision(obj: dict) -> Tuple[bool, str, str, Optional[bool], str]:
+        action = str(
+            obj.get("action")
+            or obj.get("decision")
+            or obj.get("result")
+            or ""
+        ).strip().lower()
+        target = str(
+            obj.get("target_subject")
+            or obj.get("target")
+            or obj.get("subject")
+            or obj.get("new_subject")
+            or ""
+        ).strip()
+        confidence = str(obj.get("confidence") or obj.get("certainty") or "").strip().lower()
+        reason = str(obj.get("reason") or obj.get("why") or "").strip()
+        obvious_raw = obj.get("obvious_error")
+        obvious_flag: Optional[bool] = obvious_raw if isinstance(obvious_raw, bool) else None
+
+        keep_labels = {"keep", "stay", "hold", "no_move", "unchanged", "keep_as_is"}
+        move_labels = {"move", "relocate", "correct", "migrate", "change"}
+
+        if action in keep_labels:
+            return False, target, confidence, obvious_flag, reason
+        if action in move_labels:
+            return True, target, confidence, obvious_flag, reason
+        if isinstance(obvious_flag, bool):
+            return bool(obvious_flag), target, confidence, obvious_flag, reason
+        return False, target, confidence, obvious_flag, reason
+
+    def _move_material_to_subject(self, src: Path, target_subject: str) -> Optional[Tuple[str, str]]:
+        p = Path(src)
+        if (not p.exists()) or (not p.is_file()):
+            return None
+        target = str(target_subject or "").strip()
+        if not target:
+            return None
+        try:
+            old_rel = p.relative_to(self.material_dir).as_posix()
+        except Exception:
+            return None
+
+        dst_dir = self.material_dir / target
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = self._next_available_path(dst_dir / p.name)
+        shutil.move(str(p), str(dst))
+        new_rel = dst.relative_to(self.material_dir).as_posix()
+        return old_rel, new_rel
+
+    @staticmethod
+    def _next_available_path(path: Path) -> Path:
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        for i in range(1, 1000):
+            cand = path.with_name(f"{stem}__auto{i}{suffix}")
+            if not cand.exists():
+                return cand
+        return path.with_name(f"{stem}__auto{int(time.time())}{suffix}")
+
+    def _remap_index_items_after_move(self, index_list: List[dict], move_map: Dict[str, str]) -> List[dict]:
+        if not move_map:
+            return index_list
+        out: List[dict] = []
+        for item in index_list:
+            if not isinstance(item, dict):
+                continue
+            rel = self._normalize_rel(item.get("file_path"))
+            new_rel = move_map.get(rel)
+            if not new_rel:
+                out.append(item)
+                continue
+            updated = dict(item)
+            updated["file_path"] = self._to_store_rel(new_rel)
+            updated["subject"] = self._subject_from_rel(new_rel)
+            updated["filename"] = (self.material_dir / new_rel).name
+            out.append(updated)
+        return out
+
+    def _remap_metadata_items_after_move(self, metadata_list: List[dict], move_map: Dict[str, str]) -> List[dict]:
+        if not move_map:
+            return metadata_list
+        out: List[dict] = []
+        for item in metadata_list:
+            if not isinstance(item, dict):
+                continue
+            rel = self._normalize_rel(item.get("file_path"))
+            new_rel = move_map.get(rel)
+            if not new_rel:
+                out.append(item)
+                continue
+            updated = dict(item)
+            updated["file_path"] = self._to_store_rel(new_rel)
+            updated["subject"] = self._subject_from_rel(new_rel)
+            updated["filename"] = (self.material_dir / new_rel).name
+            out.append(updated)
+        return out
+
+    def _bootstrap_quick_sync_sync(self) -> None:
+        self.material_dir.mkdir(parents=True, exist_ok=True)
+        self._load_api_config()
+
+        # Fast path: load existing cache artifacts first so bot can serve requests ASAP.
+        index_list = self._load_json_list(self.index_path)
+        metadata_list = self._load_json_list(self.metadata_path)
+        vectors = self._load_vectors(self.vectors_path)
+        metadata_list, vectors = self._align_metadata_vectors(metadata_list, vectors)
+
+        with self._lock:
+            if vectors.size > 0 and vectors.ndim == 2 and len(metadata_list) == int(vectors.shape[0]):
+                norm = np.linalg.norm(vectors, axis=1, keepdims=True)
+                norm[norm == 0.0] = 1.0
+                self._semantic_meta = metadata_list
+                self._semantic_norm_vectors = (vectors / norm).astype(np.float64, copy=False)
+            else:
+                self._semantic_meta = []
+                self._semantic_norm_vectors = np.empty((0, 0), dtype=np.float64)
+
+        self.log.info(
+            "AI quick bootstrap: "
+            f"index={len(index_list)}, metadata={len(metadata_list)}, "
+            f"vectors={int(vectors.shape[0]) if vectors.ndim == 2 else 0}, "
+            f"semantic_ready={self.semantic_ready}"
+        )
+
     def _bootstrap_sync_sync(self) -> None:
         self.material_dir.mkdir(parents=True, exist_ok=True)
         self._load_api_config()
 
         index_list = self._load_json_list(self.index_path)
+        move_map: Dict[str, str] = {}
+        new_file_hints: Dict[str, dict] = {}
+        try:
+            move_map, new_file_hints = self._auto_organize_materials_on_boot(index_list)
+        except Exception as e:
+            self.log.warning(f"AI organize: startup organizer failed, continue without organizer: {e}")
+            move_map = {}
+            new_file_hints = {}
+        if move_map:
+            index_list = self._remap_index_items_after_move(index_list, move_map)
         metadata_list = self._load_json_list(self.metadata_path)
+        if move_map:
+            metadata_list = self._remap_metadata_items_after_move(metadata_list, move_map)
         vector_matrix = self._load_vectors(self.vectors_path)
         metadata_list, vector_matrix = self._align_metadata_vectors(metadata_list, vector_matrix)
 
@@ -385,19 +1650,88 @@ class AIService:
             seen_index_rels.add(rel)
 
         new_rels = sorted(actual_rels - seen_index_rels)
+        new_pipeline_by_rel: Dict[str, dict] = {}
         if new_rels:
             self.log.info(f"AI 索引：发现 {len(new_rels)} 个新文件，开始生成摘要与向量")
+        new_pipeline_errors: Dict[str, str] = {}
+        if new_rels:
+            max_summary_workers = max(1, min(int(self._NEW_FILE_SUMMARY_MAX_CONCURRENCY), len(new_rels)))
+            if max_summary_workers <= 1:
+                for rel in new_rels:
+                    try:
+                        hint = new_file_hints.get(rel)
+                        new_pipeline_by_rel[rel] = self._run_new_file_pipeline(rel, hint=hint, build_vector=False)
+                    except Exception as e:
+                        new_pipeline_errors[rel] = str(e)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_summary_workers) as executor:
+                    future_to_rel: Dict[concurrent.futures.Future, str] = {}
+                    for rel in new_rels:
+                        hint = new_file_hints.get(rel)
+                        fut = executor.submit(self._run_new_file_pipeline, rel, hint, False)
+                        future_to_rel[fut] = rel
+                    for fut in concurrent.futures.as_completed(future_to_rel):
+                        rel = future_to_rel[fut]
+                        try:
+                            ctx = fut.result()
+                            if isinstance(ctx, dict):
+                                new_pipeline_by_rel[rel] = ctx
+                            else:
+                                new_pipeline_errors[rel] = "pipeline result is not dict"
+                        except Exception as e:
+                            new_pipeline_errors[rel] = str(e)
+
         for idx, rel in enumerate(new_rels, 1):
-            try:
-                entry = self._build_index_entry(rel)
-                cleaned_index.append(entry)
-                self.log.info(f"AI 索引：新增[{idx}/{len(new_rels)}] {rel}")
-            except Exception as e:
-                self.log.warning(f"AI 索引：新增失败 {rel}: {e}")
+            pipeline_ctx = new_pipeline_by_rel.get(rel)
+            if not isinstance(pipeline_ctx, dict):
+                err = str(new_pipeline_errors.get(rel) or "pipeline context missing")
+                self.log.warning(f"AI 索引：新增失败 {rel}: {err}")
+                continue
+            entry = pipeline_ctx.get("index_item")
+            if not isinstance(entry, dict):
+                self.log.warning(f"AI 索引：新增失败 {rel}: pipeline index item missing")
+                continue
+            cleaned_index.append(entry)
+            self.log.info(f"AI 索引：新增[{idx}/{len(new_rels)}] {rel}")
 
         self._save_json(self.index_path, cleaned_index)
 
         existing_vec_by_rel = self._metadata_vector_map(metadata_list, vector_matrix, valid_rels=actual_rels)
+        vector_candidate_rels = [rel for rel in new_rels if rel in new_pipeline_by_rel and (rel not in existing_vec_by_rel)]
+        if vector_candidate_rels:
+            max_embed_workers = max(1, min(int(self._NEW_FILE_EMBED_MAX_CONCURRENCY), len(vector_candidate_rels)))
+            if max_embed_workers <= 1:
+                for rel in vector_candidate_rels:
+                    ctx = new_pipeline_by_rel.get(rel)
+                    if not isinstance(ctx, dict):
+                        continue
+                    ctx["vector_attempted"] = True
+                    try:
+                        ctx["vector"] = self._build_vector_for_embedding_text(str(ctx.get("embedding_text") or ""))
+                    except Exception as e:
+                        ctx["vector"] = None
+                        ctx["vector_error"] = str(e)
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_embed_workers) as executor:
+                    future_to_rel: Dict[concurrent.futures.Future, str] = {}
+                    for rel in vector_candidate_rels:
+                        ctx = new_pipeline_by_rel.get(rel)
+                        if not isinstance(ctx, dict):
+                            continue
+                        ctx["vector_attempted"] = True
+                        fut = executor.submit(self._build_vector_for_embedding_text, str(ctx.get("embedding_text") or ""))
+                        future_to_rel[fut] = rel
+                    for fut in concurrent.futures.as_completed(future_to_rel):
+                        rel = future_to_rel[fut]
+                        ctx = new_pipeline_by_rel.get(rel)
+                        if not isinstance(ctx, dict):
+                            continue
+                        try:
+                            ctx["vector"] = fut.result()
+                        except Exception as e:
+                            ctx["vector"] = None
+                            ctx["vector_error"] = str(e)
+
         rebuilt_metadata: List[dict] = []
         rebuilt_vectors: List[np.ndarray] = []
         vec_dim: Optional[int] = None
@@ -407,7 +1741,19 @@ class AIService:
             if not rel:
                 continue
 
+            pipeline_ctx = new_pipeline_by_rel.get(rel)
             vec = existing_vec_by_rel.get(rel)
+            if vec is None and isinstance(pipeline_ctx, dict):
+                cached_vec = pipeline_ctx.get("vector")
+                if isinstance(cached_vec, np.ndarray):
+                    vec = cached_vec
+                elif bool(pipeline_ctx.get("vector_attempted")):
+                    err = str(pipeline_ctx.get("vector_error") or "").strip()
+                    if err:
+                        self.log.warning(f"AI 向量：跳过 {rel}（并发向量生成失败: {err}）")
+                    else:
+                        self.log.warning(f"AI 向量：跳过 {rel}（并发向量生成失败）")
+                    continue
             if vec is None:
                 vec = self._build_vector_for_index_item(item)
                 if vec is None:
@@ -421,13 +1767,18 @@ class AIService:
                 self.log.warning(f"AI 向量：跳过 {rel}（维度不一致 {vec.size} != {vec_dim}）")
                 continue
 
-            rebuilt_metadata.append(
-                {
+            metadata_item = None
+            if isinstance(pipeline_ctx, dict):
+                raw_meta = pipeline_ctx.get("metadata_item")
+                if isinstance(raw_meta, dict):
+                    metadata_item = dict(raw_meta)
+            if not isinstance(metadata_item, dict):
+                metadata_item = {
                     "file_path": self._to_store_rel(rel),
                     "filename": str(item.get("filename") or Path(rel).name),
                     "subject": str(item.get("subject") or self._subject_from_rel(rel)),
                 }
-            )
+            rebuilt_metadata.append(metadata_item)
             rebuilt_vectors.append(vec)
 
         matrix = (
@@ -563,6 +1914,107 @@ class AIService:
         if not text:
             raise RuntimeError("empty chat response")
         return text
+
+    def _chat_with_context_sync(self, session_key: str, user_input: str) -> str:
+        if not self.chat_ready:
+            raise RuntimeError("chat not ready")
+
+        content = str(user_input or "").strip()
+        if not content:
+            return self._chat_sync(content)
+
+        key = str(session_key or "").strip()
+        if not key:
+            return self._chat_sync(content)
+
+        history: List[Dict[str, str]] = []
+        try:
+            history = self._load_active_chat_history(key)
+        except Exception as e:
+            self.log.warning(f"AI chat context read failed, fallback to stateless: session={key[:80]} err={e}")
+            history = []
+
+        system_prompt = self._select_chat_system_prompt(key) or self.system_prompt
+        payload = {
+            "model": self.chat_model,
+            "messages": [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
+            "temperature": 0.4,
+        }
+        url = self._join_url(self.deepseek_base_url, "chat/completions")
+        data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
+        text = self._extract_chat_text(data)
+        if not text:
+            raise RuntimeError("empty chat response")
+
+        try:
+            self._save_chat_turn(key, content, text)
+        except Exception as e:
+            self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
+        return text
+
+    @staticmethod
+    def _normalize_chat_history_item(item: object) -> Optional[Dict[str, str]]:
+        if not isinstance(item, dict):
+            return None
+        role = str(item.get("role") or "").strip().lower()
+        if role not in ("user", "assistant"):
+            return None
+        content = str(item.get("content") or "")
+        return {"role": role, "content": content}
+
+    def _load_active_chat_history(self, session_key: str, now_ts: Optional[float] = None) -> List[Dict[str, str]]:
+        key = str(session_key or "").strip()
+        if not key:
+            return []
+        use_ts = float(now_ts if now_ts is not None else time.time())
+        with self._chat_sessions_lock:
+            return self._load_active_chat_history_locked(key, use_ts)
+
+    def _load_active_chat_history_locked(self, session_key: str, now_ts: float) -> List[Dict[str, str]]:
+        entry = self._chat_sessions.get(session_key)
+        if entry is None:
+            return []
+        if not isinstance(entry, dict):
+            self._chat_sessions.pop(session_key, None)
+            self.log.warning(f"AI chat context invalid session entry, reset: session={session_key[:80]}")
+            return []
+
+        try:
+            last_active_ts = float(entry.get("last_active_ts") or 0.0)
+        except Exception:
+            self._chat_sessions.pop(session_key, None)
+            self.log.warning(f"AI chat context invalid last_active_ts, reset: session={session_key[:80]}")
+            return []
+        if (last_active_ts <= 0.0) or ((float(now_ts) - last_active_ts) > float(self._CHAT_CONTEXT_TTL_SECONDS)):
+            self._chat_sessions.pop(session_key, None)
+            return []
+
+        raw_messages = entry.get("messages")
+        if not isinstance(raw_messages, list):
+            self._chat_sessions.pop(session_key, None)
+            self.log.warning(f"AI chat context invalid messages type, reset: session={session_key[:80]}")
+            return []
+
+        out: List[Dict[str, str]] = []
+        for item in raw_messages:
+            normalized = self._normalize_chat_history_item(item)
+            if normalized is None:
+                self._chat_sessions.pop(session_key, None)
+                self.log.warning(f"AI chat context invalid message item, reset: session={session_key[:80]}")
+                return []
+            out.append(normalized)
+        return out
+
+    def _save_chat_turn(self, session_key: str, user_input: str, assistant_output: str) -> None:
+        key = str(session_key or "").strip()
+        if not key:
+            return
+        now_ts = float(time.time())
+        with self._chat_sessions_lock:
+            history = self._load_active_chat_history_locked(key, now_ts)
+            history.append({"role": "user", "content": str(user_input or "")})
+            history.append({"role": "assistant", "content": str(assistant_output or "")})
+            self._chat_sessions[key] = {"messages": history, "last_active_ts": now_ts}
 
     def _extract_notice_file_head_sync(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         p = Path(path)
@@ -880,43 +2332,107 @@ class AIService:
         out = self.sanitize_reasoner_output(raw)
         return out or self._NOTICE_SILENT_TOKEN
 
-    def _build_index_entry(self, rel: str) -> dict:
-        rel = self._normalize_rel(rel)
-        abs_path = self.material_dir / rel
-        subject = self._subject_from_rel(rel)
+    def _run_new_file_pipeline(
+        self,
+        rel: str,
+        hint: Optional[dict] = None,
+        build_vector: bool = True,
+    ) -> Dict[str, object]:
+        rel_norm = self._normalize_rel(rel)
+        if not rel_norm:
+            raise ValueError("invalid file relative path")
+
+        abs_path = self.material_dir / rel_norm
+        if (not abs_path.exists()) or (not abs_path.is_file()):
+            raise FileNotFoundError(f"file not found: {rel_norm}")
+
+        subject = self._subject_from_rel(rel_norm)
         filename = abs_path.name
         ext = abs_path.suffix.lower().lstrip(".")
         if f".{ext}" not in self._ALLOWED_SUFFIXES:
             raise ValueError(f"unsupported file type: {abs_path.suffix}")
 
-        content = ""
-        if ext == "pdf":
-            content = self._read_pdf_head(abs_path)
-        elif ext == "docx":
-            content = self._read_docx_head(abs_path)
-        elif ext in ("ppt", "pptx"):
-            # 按需求：PPT/PPTX 不解析正文，仅使用学科目录和文件名
-            content = ""
+        hint_obj = hint if isinstance(hint, dict) else {}
+        snippet = str(hint_obj.get("snippet") or "").strip()
+        if len(snippet) > 2000:
+            snippet = snippet[:2000]
 
-        summary_data = self._generate_summary(
-            subject=subject,
-            filename=filename,
-            file_type=ext,
-            text_content=content,
-            title_only=(ext in ("ppt", "pptx")),
-        )
-        return {
-            "file_path": self._to_store_rel(rel),
+        title_only = ext in ("ppt", "pptx")
+        if (not title_only) and (not snippet):
+            try:
+                snippet = self._extract_material_snippet(abs_path, max_chars=2000)
+            except Exception:
+                snippet = ""
+            if len(snippet) > 2000:
+                snippet = snippet[:2000]
+
+        summary_data = self._normalize_summary_data(hint_obj.get("summary_data"), subject, filename)
+        if summary_data is None:
+            generated = self._generate_summary(
+                subject=subject,
+                filename=filename,
+                file_type=ext,
+                text_content=snippet,
+                title_only=title_only,
+            )
+            summary_data = self._normalize_summary_data(generated, subject, filename)
+        if summary_data is None:
+            summary_data = self._fallback_summary(subject, filename, ext)
+
+        index_item = {
+            "file_path": self._to_store_rel(rel_norm),
             "subject": subject,
             "filename": filename,
             "file_type": ext,
             "keywords": summary_data.get("keywords") or [subject],
             "summary": summary_data.get("summary") or f"{subject}资料：{filename}",
         }
+        metadata_item = {
+            "file_path": self._to_store_rel(rel_norm),
+            "filename": filename,
+            "subject": subject,
+        }
+        embedding_text = self._make_embedding_text(index_item)
+        vector_arr: Optional[np.ndarray] = None
+        if build_vector:
+            vec = self._embed_text(embedding_text)
+            if vec is not None:
+                arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+                if arr.size > 0:
+                    vector_arr = arr
+
+        return {
+            "rel": rel_norm,
+            "filename": filename,
+            "subject": subject,
+            "file_type": ext,
+            "snippet": snippet,
+            "classification_target": str(hint_obj.get("classified_target") or "").strip(),
+            "summary_data": summary_data,
+            "index_item": index_item,
+            "metadata_item": metadata_item,
+            "embedding_text": embedding_text,
+            "vector_attempted": bool(build_vector),
+            "vector": vector_arr,
+        }
+
+    def _build_index_entry(self, rel: str) -> dict:
+        ctx = self._run_new_file_pipeline(rel, hint=None, build_vector=False)
+        item = ctx.get("index_item")
+        if isinstance(item, dict):
+            return item
+        raise RuntimeError(f"failed to build index item: {rel}")
 
     def _build_vector_for_index_item(self, item: dict) -> Optional[np.ndarray]:
         combined_text = self._make_embedding_text(item)
         vec = self._embed_text(combined_text)
+        if vec is None:
+            return None
+        arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+        return arr if arr.size > 0 else None
+
+    def _build_vector_for_embedding_text(self, embedding_text: str) -> Optional[np.ndarray]:
+        vec = self._embed_text(str(embedding_text or ""))
         if vec is None:
             return None
         arr = np.asarray(vec, dtype=np.float64).reshape(-1)
@@ -1020,6 +2536,9 @@ class AIService:
             try:
                 rel = p.relative_to(self.material_dir).as_posix()
             except Exception:
+                continue
+            top = self._subject_from_rel(rel)
+            if top.casefold() == self._AUTO_ORGANIZE_TBD_DIRNAME.casefold():
                 continue
             rels.add(rel)
         return rels
@@ -1279,6 +2798,29 @@ class AIService:
         if not summary:
             return None
         return {"keywords": keywords[:12], "summary": summary}
+
+    @staticmethod
+    def _normalize_summary_data(value: object, subject: str, filename: str) -> Optional[dict]:
+        if not isinstance(value, dict):
+            return None
+        keywords = value.get("keywords") or []
+        if not isinstance(keywords, list):
+            keywords = [str(keywords)]
+        norm_keywords = [str(x).strip() for x in keywords if str(x).strip()]
+        summary = str(value.get("summary") or "").strip()
+        if not summary:
+            return None
+        if not norm_keywords:
+            norm_keywords = [str(subject or "").strip(), str(Path(filename).stem or "").strip()]
+        out_keywords = []
+        seen = set()
+        for x in norm_keywords:
+            k = str(x).strip()
+            if (not k) or (k in seen):
+                continue
+            seen.add(k)
+            out_keywords.append(k)
+        return {"keywords": out_keywords[:12], "summary": summary}
 
     @staticmethod
     def _fallback_summary(subject: str, filename: str, file_type: str) -> dict:

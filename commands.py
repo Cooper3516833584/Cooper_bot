@@ -487,6 +487,27 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
     return None
 
 
+def _ai_chat_session_key(ctx) -> Optional[str]:
+    scene = str(getattr(ctx, "scene", "") or "")
+    if scene == "group":
+        gid = getattr(ctx, "group_id", None)
+        if gid is None:
+            return None
+        try:
+            return f"group:{int(gid)}"
+        except Exception:
+            return None
+    if scene.startswith("private"):
+        uid = getattr(ctx, "user_id", None)
+        if uid is None:
+            return None
+        try:
+            return f"private:{int(uid)}"
+        except Exception:
+            return None
+    return None
+
+
 def _is_notice_file_name(name: str) -> bool:
     return Path(str(name or "").strip()).suffix.lower() in _GROUP_NOTICE_FILE_SUFFIXES
 
@@ -1836,7 +1857,11 @@ async def _handle_ai_chat_trigger(
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
         try:
-            out = (await aisvc.chat(ai_input)).strip()
+            session_key = _ai_chat_session_key(ctx)
+            if session_key:
+                out = (await aisvc.chat_with_context(session_key, ai_input)).strip()
+            else:
+                out = (await aisvc.chat(ai_input)).strip()
             if not out:
                 out = "我这边没收到有效回复，稍后再试一次。"
             await reply(api, ctx, out, logsvc)
