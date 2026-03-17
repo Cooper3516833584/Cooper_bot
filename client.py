@@ -91,37 +91,37 @@ async def run_forever():
         try:
             mark_stats = await aisvc.rebuild_material_scan_marks_from_current_layout()
             log.info(
-                "AI organize: rebuilt marks from current layout "
+                "AI 整理：已根据当前目录重建标记 "
                 f"(scanned={int(mark_stats.get('scanned', 0))}, "
                 f"marked={int(mark_stats.get('marked', 0))}, "
                 f"hash_failed={int(mark_stats.get('hash_failed', 0))}, "
                 f"duplicates={int(mark_stats.get('duplicates', 0))})"
             )
         except Exception as e:
-            log.warning(f"AI organize: failed to rebuild marks from current layout: {e}")
+            log.warning(f"AI 整理：根据当前目录重建标记失败: {e}")
 
     quick_bootstrap_ok = True
     try:
         await aisvc.bootstrap_sync()
     except Exception as e:
         quick_bootstrap_ok = False
-        log.warning(f"AI quick bootstrap failed（will continue with basic bot features）: {e}")
+        log.warning(f"AI 快速启动失败（将继续运行基础功能）: {e}")
     else:
-        log.info("AI quick bootstrap ready; bot can start serving while post-startup sync runs")
+        log.info("AI 快速启动就绪；Bot 已可响应，启动后同步将在后台继续运行")
 
     def _on_ai_post_sync_done(task: asyncio.Task) -> None:
         try:
             task.result()
-            log.info("AI post-startup sync finished")
+            log.info("AI 启动后同步已完成")
         except Exception as e:
-            log.warning(f"AI post-startup sync failed: {e}")
+            log.warning(f"AI 启动后同步失败: {e}")
 
     if quick_bootstrap_ok:
         try:
             ai_post_sync_task = asyncio.create_task(aisvc.bootstrap_post_startup_sync())
             ai_post_sync_task.add_done_callback(_on_ai_post_sync_done)
         except Exception as e:
-            log.warning(f"AI post-startup sync schedule failed: {e}")
+            log.warning(f"AI 启动后同步任务调度失败: {e}")
 
     while True:
         try:

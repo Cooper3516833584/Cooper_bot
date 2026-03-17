@@ -38,7 +38,7 @@ LARGE_FILE_WARN_BYTES = int(LARGE_FILE_WARN_MB) * 1024 * 1024
 ANSWER_FILE_PATH = Path(__file__).resolve().parent / "answer.txt"
 _ANSWER_CACHE_MTIME: Optional[float] = None
 _ANSWER_CACHE: Dict[str, List[str]] = {}
-_GROUP_NOTICE_FILE_SUFFIXES = {".pdf", ".docx"}
+_GROUP_NOTICE_FILE_SUFFIXES = {".pdf", ".doc", ".docx"}
 _URL_RE = re.compile(r"(https?://[^\s<>\"]+)", flags=re.IGNORECASE)
 _GROUP_NOTICE_MAX_CANDIDATES = 3
 _GROUP_NOTICE_DEDUP_SECONDS = 60.0

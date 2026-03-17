@@ -7,6 +7,7 @@ import html
 import json
 import re
 import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -76,7 +77,7 @@ class AIService:
         "build_index.py",
         "build_vectors.py",
     }
-    _ALLOWED_SUFFIXES = {".pdf", ".docx", ".ppt", ".pptx"}
+    _ALLOWED_SUFFIXES = {".pdf", ".doc", ".docx", ".ppt", ".pptx"}
     _EBOOK_SUFFIXES = {".epub", ".mobi"}
     _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
     _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
@@ -87,6 +88,8 @@ class AIService:
     _TBD_CLASSIFY_MAX_CONCURRENCY = 3
     _NEW_FILE_SUMMARY_MAX_CONCURRENCY = 3
     _NEW_FILE_EMBED_MAX_CONCURRENCY = 4
+    _MISPLACED_REVIEW_MAX_CANDIDATES = 24
+    _ORGANIZE_PROGRESS_EVERY = 5
     _NOTICE_SILENT_TOKEN = "[静默]"
 
     def __init__(self, log):
@@ -568,7 +571,7 @@ class AIService:
                 out[rel] = {"size": size, "mtime_ns": mtime_ns, "sha256": sha}
             return out
         except Exception as e:
-            self.log.warning(f"AI organize: failed to load state cache {path.name}: {e}")
+            self.log.warning(f"AI 整理：加载状态缓存 {path.name} 失败: {e}")
             return fallback
 
     def _save_material_state_cache(self, cache_map: Dict[str, dict]) -> None:
@@ -676,7 +679,7 @@ class AIService:
                 normalized[h] = {"rel": rel, "ts": ts}
             return {"confirmed_ok_hashes": normalized}
         except Exception as e:
-            self.log.warning(f"AI organize: failed to load marks file {path.name}: {e}")
+            self.log.warning(f"AI 整理：加载标记文件 {path.name} 失败: {e}")
             return fallback
 
     def _save_material_scan_marks(self, marks: Dict[str, object]) -> None:
@@ -749,11 +752,11 @@ class AIService:
 
         subjects = self._collect_existing_subject_dirs()
         if not subjects:
-            self.log.info("AI organize: no subject folders found, skip startup organizer")
+            self.log.info("AI 整理：未找到学科文件夹，跳过启动整理")
             return move_map, new_file_hints
         can_use_ai = bool(self.deepseek_base_url and self.deepseek_api_key)
         if not can_use_ai:
-            self.log.info("AI organize: DeepSeek not configured, only hash dedup will run")
+            self.log.info("AI 整理：未配置 DeepSeek，仅执行哈希去重")
 
         index_by_rel = self._index_item_map_by_rel(index_list)
         subject_set = set(subjects)
@@ -781,12 +784,25 @@ class AIService:
         marks_changed = False
         state_cache_map = self._load_material_state_cache()
         state_cache_changed = False
+        changed_classified_rels: set[str] = set()
 
         fix_files: List[Path] = []
         file_hash_by_rel: Dict[str, str] = {}
         existing_rel_by_hash: Dict[str, str] = {}
         classified_hashes_ready = False
         hash_failed = 0
+        self.log.info(
+            f"AI 整理阶段：准备索引/标记/状态缓存 (索引项={len(index_by_rel)}, 标记={len(confirmed_map)}, 状态缓存={len(state_cache_map)})"
+        )
+
+        def _log_progress(stage: str, done: int, total: int, ok: int, skip: int, fail: int, force: bool = False) -> None:
+            if total <= 0:
+                return
+            if (not force) and done < total and (done % int(self._ORGANIZE_PROGRESS_EVERY) != 0):
+                return
+            self.log.info(
+                f"AI 整理进度：{stage} {done}/{total} (成功={ok}, 跳过={skip}, 失败={fail})"
+            )
 
         def _material_rel_exists(rel: str) -> bool:
             rel_norm = str(rel or "").strip()
@@ -796,12 +812,13 @@ class AIService:
             return p.exists() and p.is_file()
 
         def _ensure_classified_hash_cache() -> None:
-            nonlocal fix_files, classified_hashes_ready, hash_failed, marks_changed, state_cache_changed
+            nonlocal fix_files, classified_hashes_ready, hash_failed, marks_changed, state_cache_changed, changed_classified_rels
             if classified_hashes_ready:
                 return
 
             fix_files = self._collect_classified_files(subject_set)
             fix_rel_set = set()
+            changed_classified_rels = set()
             local_hash_failed = 0
             for path in fix_files:
                 rel_hint = ""
@@ -816,6 +833,8 @@ class AIService:
                     h, cache_updated = self._get_file_hash_by_state_cache(path, rel_hint, state_cache_map)
                     if cache_updated:
                         state_cache_changed = True
+                        if rel_norm:
+                            changed_classified_rels.add(rel_norm)
                     if not h:
                         continue
                     file_hash_by_rel[rel_hint] = h
@@ -824,11 +843,11 @@ class AIService:
                 except Exception as e:
                     local_hash_failed += 1
                     if local_hash_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                        self.log.warning(f"AI organize: failed to hash classified file {rel_hint}: {e}")
+                        self.log.warning(f"AI 整理：计算已归类文件哈希失败 {rel_hint}: {e}")
             hash_failed = local_hash_failed
             if hash_failed > self._AUTO_ORGANIZE_MAX_WARNINGS:
                 extra = hash_failed - self._AUTO_ORGANIZE_MAX_WARNINGS
-                self.log.warning(f"AI organize: classified-file hash failures omitted={extra}")
+                self.log.warning(f"AI 整理：已归类文件哈希失败过多，省略 {extra} 条")
 
             stale_hashes = [h for h in list(confirmed_map.keys()) if h not in existing_rel_by_hash]
             if stale_hashes:
@@ -836,7 +855,7 @@ class AIService:
                     confirmed_map.pop(h, None)
                     confirmed_hashes.discard(h)
                 marks_changed = True
-                self.log.info(f"AI organize: pruned stale marks for deleted files count={len(stale_hashes)}")
+                self.log.info(f"AI 整理：已清理已删除文件的过期标记，数量={len(stale_hashes)}")
 
             stale_state_rels = []
             for rel_key in list(state_cache_map.keys()):
@@ -851,20 +870,29 @@ class AIService:
                     state_cache_map.pop(rel_key, None)
                 state_cache_changed = True
             classified_hashes_ready = True
+            self.log.info(
+                "AI 整理阶段：已归类文件哈希缓存就绪 "
+                f"(文件={len(fix_files)}, 变化={len(changed_classified_rels)}, 哈希失败={hash_failed})"
+            )
 
+        self.log.info("AI 整理阶段：收集 TBD 文件")
         tbd_files = self._collect_tbd_files(tbd_dir)
+        self.log.info(f"AI 整理阶段：TBD 文件收集完成，总数={len(tbd_files)}")
         tbd_moved = 0
         tbd_deleted = 0
         tbd_kept = 0
         tbd_failed = 0
         tbd_ai_candidates: List[dict] = []
         tbd_seen_hashes: Dict[str, str] = {}
+        self.log.info("AI 整理阶段：TBD 去重与预检查")
+        tbd_precheck_done = 0
         for path in tbd_files:
             rel_hint = ""
             try:
                 rel_hint = path.relative_to(self.material_dir).as_posix()
             except Exception:
                 rel_hint = str(path.name)
+            tbd_precheck_done += 1
 
             tbd_hash = ""
             try:
@@ -872,7 +900,7 @@ class AIService:
             except Exception as e:
                 tbd_failed += 1
                 if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                    self.log.warning(f"AI organize: failed to hash TBD file {rel_hint}: {e}")
+                    self.log.warning(f"AI 整理：计算 TBD 文件哈希失败 {rel_hint}: {e}")
 
             if tbd_hash:
                 duplicate_rel = existing_rel_by_hash.get(tbd_hash, "")
@@ -895,12 +923,14 @@ class AIService:
                     try:
                         path.unlink()
                         tbd_deleted += 1
-                        self.log.info(f"AI organize: removed duplicate TBD file {rel_hint} (hash matches {duplicate_rel})")
+                        self.log.info(f"AI 整理：删除 TBD 重复文件 {rel_hint}（哈希命中 {duplicate_rel}）")
+                        _log_progress("TBD 预检查", tbd_precheck_done, len(tbd_files), tbd_moved + tbd_deleted, tbd_kept, tbd_failed)
                         continue
                     except Exception as e:
                         tbd_failed += 1
                         if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                            self.log.warning(f"AI organize: failed to delete duplicate TBD file {rel_hint}: {e}")
+                            self.log.warning(f"AI 整理：删除 TBD 重复文件失败 {rel_hint}: {e}")
+                    _log_progress("TBD 预检查", tbd_precheck_done, len(tbd_files), tbd_moved + tbd_deleted, tbd_kept, tbd_failed)
                     continue
                 tbd_seen_hashes[tbd_hash] = rel_hint
 
@@ -951,28 +981,41 @@ class AIService:
                         ),
                     }
                     self.log.info(
-                        f"AI organize: moved ebook TBD file {old_rel} -> {new_rel}"
+                        f"AI 整理：已移动 TBD 电子书文件 {old_rel} -> {new_rel}"
                     )
+                    _log_progress("TBD 预检查", tbd_precheck_done, len(tbd_files), tbd_moved + tbd_deleted, tbd_kept, tbd_failed)
                     continue
                 except Exception as e:
                     tbd_failed += 1
                     if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                        self.log.warning(f"AI organize: failed to move ebook TBD file {rel_hint}: {e}")
+                        self.log.warning(f"AI 整理：移动 TBD 电子书文件失败 {rel_hint}: {e}")
 
             if not can_use_ai:
                 tbd_kept += 1
+                _log_progress("TBD 预检查", tbd_precheck_done, len(tbd_files), tbd_moved + tbd_deleted, tbd_kept, tbd_failed)
                 continue
 
             tbd_ai_candidates.append({"path": path, "rel_hint": rel_hint, "tbd_hash": tbd_hash})
+            _log_progress("TBD 预检查", tbd_precheck_done, len(tbd_files), tbd_moved + tbd_deleted, tbd_kept, tbd_failed)
 
         tbd_classify_results: Dict[str, dict] = {}
         if can_use_ai and tbd_ai_candidates:
+            self.log.info(
+                "AI 整理阶段：TBD 分类 "
+                f"(候选={len(tbd_ai_candidates)}, 并发={max(1, min(int(self._TBD_CLASSIFY_MAX_CONCURRENCY), len(tbd_ai_candidates)))})"
+            )
+            tbd_classify_done = 0
+            tbd_classify_ok = 0
+            tbd_classify_fail = 0
             max_workers = max(1, min(int(self._TBD_CLASSIFY_MAX_CONCURRENCY), len(tbd_ai_candidates)))
             if max_workers <= 1:
                 for candidate in tbd_ai_candidates:
                     rel_hint = str(candidate.get("rel_hint") or "").strip()
                     path = candidate.get("path")
                     if (not rel_hint) or (not isinstance(path, Path)):
+                        tbd_classify_done += 1
+                        tbd_classify_fail += 1
+                        _log_progress("TBD 分类", tbd_classify_done, len(tbd_ai_candidates), tbd_classify_ok, 0, tbd_classify_fail)
                         continue
                     try:
                         tbd_classify_results[rel_hint] = self._classify_tbd_target_subject(
@@ -981,10 +1024,15 @@ class AIService:
                             subjects,
                             index_by_rel.get(rel_hint),
                         )
+                        tbd_classify_ok += 1
                     except Exception as e:
                         tbd_failed += 1
+                        tbd_classify_fail += 1
                         if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                            self.log.warning(f"AI organize: failed to classify TBD file {rel_hint}: {e}")
+                            self.log.warning(f"AI 整理：TBD 分类失败 {rel_hint}: {e}")
+                    finally:
+                        tbd_classify_done += 1
+                        _log_progress("TBD 分类", tbd_classify_done, len(tbd_ai_candidates), tbd_classify_ok, 0, tbd_classify_fail)
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     future_to_rel: Dict[concurrent.futures.Future, str] = {}
@@ -992,6 +1040,9 @@ class AIService:
                         rel_hint = str(candidate.get("rel_hint") or "").strip()
                         path = candidate.get("path")
                         if (not rel_hint) or (not isinstance(path, Path)):
+                            tbd_classify_done += 1
+                            tbd_classify_fail += 1
+                            _log_progress("TBD 分类", tbd_classify_done, len(tbd_ai_candidates), tbd_classify_ok, 0, tbd_classify_fail)
                             continue
                         fut = executor.submit(
                             self._classify_tbd_target_subject,
@@ -1005,24 +1056,37 @@ class AIService:
                         rel_hint = future_to_rel[fut]
                         try:
                             tbd_classify_results[rel_hint] = fut.result()
+                            tbd_classify_ok += 1
                         except Exception as e:
                             tbd_failed += 1
+                            tbd_classify_fail += 1
                             if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                                self.log.warning(f"AI organize: failed to classify TBD file {rel_hint}: {e}")
+                                self.log.warning(f"AI 整理：TBD 分类失败 {rel_hint}: {e}")
+                        finally:
+                            tbd_classify_done += 1
+                            _log_progress("TBD 分类", tbd_classify_done, len(tbd_ai_candidates), tbd_classify_ok, 0, tbd_classify_fail)
 
+        self.log.info("AI 整理阶段：应用 TBD 分类结果")
+        tbd_apply_done = 0
         for candidate in tbd_ai_candidates:
             rel_hint = str(candidate.get("rel_hint") or "").strip()
             path = candidate.get("path")
             if (not rel_hint) or (not isinstance(path, Path)):
                 tbd_kept += 1
+                tbd_apply_done += 1
+                _log_progress("TBD 应用", tbd_apply_done, len(tbd_ai_candidates), tbd_moved, tbd_kept, tbd_failed)
                 continue
             classify_result = tbd_classify_results.get(rel_hint)
             if not isinstance(classify_result, dict):
                 tbd_kept += 1
+                tbd_apply_done += 1
+                _log_progress("TBD 应用", tbd_apply_done, len(tbd_ai_candidates), tbd_moved, tbd_kept, tbd_failed)
                 continue
             target = str(classify_result.get("target") or "").strip()
             if (not target) or (target not in subject_set):
                 tbd_kept += 1
+                tbd_apply_done += 1
+                _log_progress("TBD 应用", tbd_apply_done, len(tbd_ai_candidates), tbd_moved, tbd_kept, tbd_failed)
                 continue
             try:
                 moved = self._move_material_to_subject(path, target)
@@ -1072,28 +1136,74 @@ class AIService:
                 if isinstance(summary_hint, dict):
                     hint_payload["summary_data"] = summary_hint
                 new_file_hints[new_rel] = hint_payload
-                self.log.info(f"AI organize: moved TBD file {old_rel} -> {new_rel}")
+                self.log.info(f"AI 整理：已移动 TBD 文件 {old_rel} -> {new_rel}")
             except Exception as e:
                 tbd_failed += 1
                 if tbd_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                    self.log.warning(f"AI organize: failed to move classified TBD file {rel_hint}: {e}")
+                    self.log.warning(f"AI 整理：移动已分类 TBD 文件失败 {rel_hint}: {e}")
+            finally:
+                tbd_apply_done += 1
+                _log_progress("TBD 应用", tbd_apply_done, len(tbd_ai_candidates), tbd_moved, tbd_kept, tbd_failed)
         if tbd_failed > self._AUTO_ORGANIZE_MAX_WARNINGS:
             extra = tbd_failed - self._AUTO_ORGANIZE_MAX_WARNINGS
-            self.log.warning(f"AI organize: TBD classification failures omitted={extra}")
+            self.log.warning(f"AI 整理：TBD 分类失败过多，省略 {extra} 条")
 
         _ensure_classified_hash_cache()
+        self.log.info("AI 整理阶段：增量错放纠偏候选筛选")
+
+        fix_rel_set: set[str] = set()
+        for p in fix_files:
+            try:
+                rel_norm = self._normalize_rel(p.relative_to(self.material_dir).as_posix())
+            except Exception:
+                rel_norm = ""
+            if rel_norm:
+                fix_rel_set.add(rel_norm)
+
+        moved_from_tbd_rels: List[str] = []
+        for rel in new_file_hints.keys():
+            rel_norm = self._normalize_rel(rel)
+            if rel_norm and (rel_norm in fix_rel_set):
+                moved_from_tbd_rels.append(rel_norm)
+
+        candidate_order: List[str] = []
+        seen_candidate = set()
+        for rel_norm in moved_from_tbd_rels:
+            if rel_norm in seen_candidate:
+                continue
+            seen_candidate.add(rel_norm)
+            candidate_order.append(rel_norm)
+        for rel_norm in sorted(changed_classified_rels):
+            if (not rel_norm) or (rel_norm in seen_candidate) or (rel_norm not in fix_rel_set):
+                continue
+            seen_candidate.add(rel_norm)
+            candidate_order.append(rel_norm)
+
+        max_candidates = max(1, int(self._MISPLACED_REVIEW_MAX_CANDIDATES))
+        truncated = max(0, len(candidate_order) - max_candidates)
+        if truncated > 0:
+            candidate_order = candidate_order[:max_candidates]
+        fix_candidate_rel_set = set(candidate_order)
+        self.log.info(
+            "AI 整理阶段：增量错放纠偏 "
+            f"(来自TBD移动={len(moved_from_tbd_rels)}, 本次变化={len(changed_classified_rels)}, "
+            f"选中={len(fix_candidate_rel_set)}, 截断={truncated})"
+        )
 
         skip_rels = set(move_map.values())
         fix_marked_skip = 0
         fix_moved = 0
         fix_kept = 0
         fix_failed = 0
+        fix_non_incremental_skip = 0
+        fix_review_done = 0
         for path in fix_files:
             rel_hint = ""
             try:
                 rel_hint = path.relative_to(self.material_dir).as_posix()
             except Exception:
                 rel_hint = str(path.name)
+            rel_norm = self._normalize_rel(rel_hint)
             if rel_hint in skip_rels:
                 continue
             current_subject = self._subject_from_rel(rel_hint)
@@ -1111,11 +1221,23 @@ class AIService:
                 except Exception:
                     file_hash = ""
 
+            is_incremental_candidate = bool(rel_norm and (rel_norm in fix_candidate_rel_set))
+
             if (path.suffix.lower() in self._EBOOK_SUFFIXES) and (current_subject != self._AUTO_ORGANIZE_EBOOK_SUBJECT):
                 try:
                     moved = self._move_material_to_subject(path, self._AUTO_ORGANIZE_EBOOK_SUBJECT)
                     if not moved:
                         fix_kept += 1
+                        if is_incremental_candidate:
+                            fix_review_done += 1
+                            _log_progress(
+                                "已归类增量纠偏",
+                                fix_review_done,
+                                len(fix_candidate_rel_set),
+                                fix_moved,
+                                fix_marked_skip + fix_kept,
+                                fix_failed,
+                            )
                         continue
                     old_rel, new_rel = moved
                     move_map[old_rel] = new_rel
@@ -1144,20 +1266,63 @@ class AIService:
                                 state_cache_changed = True
                         except Exception:
                             pass
-                    self.log.info(f"AI organize: moved ebook file {old_rel} -> {new_rel}")
+                    self.log.info(f"AI 整理：已移动电子书文件 {old_rel} -> {new_rel}")
+                    if is_incremental_candidate:
+                        fix_review_done += 1
+                        _log_progress(
+                            "已归类增量纠偏",
+                            fix_review_done,
+                            len(fix_candidate_rel_set),
+                            fix_moved,
+                            fix_marked_skip + fix_kept,
+                            fix_failed,
+                        )
                     continue
                 except Exception as e:
                     fix_failed += 1
                     if fix_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                        self.log.warning(f"AI organize: failed to move ebook file {rel_hint}: {e}")
+                        self.log.warning(f"AI 整理：移动电子书文件失败 {rel_hint}: {e}")
+                    if is_incremental_candidate:
+                        fix_review_done += 1
+                        _log_progress(
+                            "已归类增量纠偏",
+                            fix_review_done,
+                            len(fix_candidate_rel_set),
+                            fix_moved,
+                            fix_marked_skip + fix_kept,
+                            fix_failed,
+                        )
                     continue
+
+            if not is_incremental_candidate:
+                fix_non_incremental_skip += 1
+                fix_kept += 1
+                continue
 
             if file_hash and (file_hash in confirmed_hashes):
                 fix_marked_skip += 1
+                fix_review_done += 1
+                _log_progress(
+                    "已归类增量纠偏",
+                    fix_review_done,
+                    len(fix_candidate_rel_set),
+                    fix_moved,
+                    fix_marked_skip + fix_kept,
+                    fix_failed,
+                )
                 continue
 
             if not can_use_ai:
                 fix_kept += 1
+                fix_review_done += 1
+                _log_progress(
+                    "已归类增量纠偏",
+                    fix_review_done,
+                    len(fix_candidate_rel_set),
+                    fix_moved,
+                    fix_marked_skip + fix_kept,
+                    fix_failed,
+                )
                 continue
 
             try:
@@ -1177,10 +1342,28 @@ class AIService:
                             confirmed_map[file_hash] = {"rel": rel_hint, "ts": int(time.time())}
                             confirmed_hashes.add(file_hash)
                             marks_changed = True
+                    fix_review_done += 1
+                    _log_progress(
+                        "已归类增量纠偏",
+                        fix_review_done,
+                        len(fix_candidate_rel_set),
+                        fix_moved,
+                        fix_marked_skip + fix_kept,
+                        fix_failed,
+                    )
                     continue
                 moved = self._move_material_to_subject(path, target)
                 if not moved:
                     fix_kept += 1
+                    fix_review_done += 1
+                    _log_progress(
+                        "已归类增量纠偏",
+                        fix_review_done,
+                        len(fix_candidate_rel_set),
+                        fix_moved,
+                        fix_marked_skip + fix_kept,
+                        fix_failed,
+                    )
                     continue
                 old_rel, new_rel = moved
                 move_map[old_rel] = new_rel
@@ -1209,31 +1392,50 @@ class AIService:
                             state_cache_changed = True
                     except Exception:
                         pass
-                self.log.info(f"AI organize: corrected obvious misplaced file {old_rel} -> {new_rel}")
+                self.log.info(f"AI 整理：已纠正明显错放文件 {old_rel} -> {new_rel}")
+                fix_review_done += 1
+                _log_progress(
+                    "已归类增量纠偏",
+                    fix_review_done,
+                    len(fix_candidate_rel_set),
+                    fix_moved,
+                    fix_marked_skip + fix_kept,
+                    fix_failed,
+                )
             except Exception as e:
                 fix_failed += 1
                 if fix_failed <= self._AUTO_ORGANIZE_MAX_WARNINGS:
-                    self.log.warning(f"AI organize: failed to review file {rel_hint}: {e}")
+                    self.log.warning(f"AI 整理：复查文件失败 {rel_hint}: {e}")
+                fix_review_done += 1
+                _log_progress(
+                    "已归类增量纠偏",
+                    fix_review_done,
+                    len(fix_candidate_rel_set),
+                    fix_moved,
+                    fix_marked_skip + fix_kept,
+                    fix_failed,
+                )
         if fix_failed > self._AUTO_ORGANIZE_MAX_WARNINGS:
             extra = fix_failed - self._AUTO_ORGANIZE_MAX_WARNINGS
-            self.log.warning(f"AI organize: misplaced-file review failures omitted={extra}")
+            self.log.warning(f"AI 整理：错放复查失败过多，省略 {extra} 条")
 
         if marks_changed:
             try:
                 self._save_material_scan_marks({"confirmed_ok_hashes": confirmed_map})
             except Exception as e:
-                self.log.warning(f"AI organize: failed to save marks file {self.material_scan_marks_path.name}: {e}")
+                self.log.warning(f"AI 整理：保存标记文件 {self.material_scan_marks_path.name} 失败: {e}")
 
         if state_cache_changed or (not self.material_state_cache_path.exists()):
             try:
                 self._save_material_state_cache(state_cache_map)
             except Exception as e:
-                self.log.warning(f"AI organize: failed to save state cache {self.material_state_cache_path.name}: {e}")
+                self.log.warning(f"AI 整理：保存状态缓存 {self.material_state_cache_path.name} 失败: {e}")
 
         self.log.info(
-            "AI organize: startup finished "
-            f"(TBD scanned={len(tbd_files)}, dedup_deleted={tbd_deleted}, moved={tbd_moved}, kept={tbd_kept}, failed={tbd_failed}; "
-            f"classified scanned={len(fix_files)}, marked_skip={fix_marked_skip}, moved={fix_moved}, kept={fix_kept}, failed={fix_failed})"
+            "AI 整理：启动整理完成 "
+            f"(TBD 扫描={len(tbd_files)}, 去重删除={tbd_deleted}, 移动={tbd_moved}, 保留={tbd_kept}, 失败={tbd_failed}; "
+            f"已归类扫描={len(fix_files)}, 增量候选={len(fix_candidate_rel_set)}, "
+            f"非增量跳过={fix_non_incremental_skip}, 已确认跳过={fix_marked_skip}, 移动={fix_moved}, 保留={fix_kept}, 失败={fix_failed})"
         )
         return move_map, new_file_hints
 
@@ -1308,7 +1510,13 @@ class AIService:
             txt2 = self._read_pdf_head(p, max_pages=4, max_chars=max_chars)
             if self._has_enough_text(txt2):
                 return txt2[:max_chars]
-            return (txt2 or txt)[:max_chars]
+            txt3 = self._read_pdf_head_ocr(p, max_pages=4, max_chars=max_chars)
+            if self._has_enough_text(txt3):
+                self.log.info(f"AI 索引：已使用 OCR 提取扫描 PDF 文本 {p.name}")
+                return txt3[:max_chars]
+            return (txt3 or txt2 or txt)[:max_chars]
+        if suffix == ".doc":
+            return self._read_doc_head(p, max_chars=max_chars)[:max_chars]
         if suffix == ".docx":
             return self._read_docx_head(p, max_chars=max_chars)[:max_chars]
         return ""
@@ -1593,6 +1801,7 @@ class AIService:
         self._load_api_config()
 
         # Fast path: load existing cache artifacts first so bot can serve requests ASAP.
+        self.log.info("AI 启动阶段：加载缓存索引/元数据/向量")
         index_list = self._load_json_list(self.index_path)
         metadata_list = self._load_json_list(self.metadata_path)
         vectors = self._load_vectors(self.vectors_path)
@@ -1609,27 +1818,30 @@ class AIService:
                 self._semantic_norm_vectors = np.empty((0, 0), dtype=np.float64)
 
         self.log.info(
-            "AI quick bootstrap: "
-            f"index={len(index_list)}, metadata={len(metadata_list)}, "
-            f"vectors={int(vectors.shape[0]) if vectors.ndim == 2 else 0}, "
-            f"semantic_ready={self.semantic_ready}"
+            "AI 快速启动："
+            f"索引={len(index_list)}, 元数据={len(metadata_list)}, "
+            f"向量={int(vectors.shape[0]) if vectors.ndim == 2 else 0}, "
+            f"语义检索就绪={self.semantic_ready}"
         )
 
     def _bootstrap_sync_sync(self) -> None:
         self.material_dir.mkdir(parents=True, exist_ok=True)
         self._load_api_config()
 
+        self.log.info("AI 启动阶段：加载启动后同步所需缓存索引")
         index_list = self._load_json_list(self.index_path)
         move_map: Dict[str, str] = {}
         new_file_hints: Dict[str, dict] = {}
+        self.log.info("AI 启动阶段：整理资料（TBD + 增量纠偏）")
         try:
             move_map, new_file_hints = self._auto_organize_materials_on_boot(index_list)
         except Exception as e:
-            self.log.warning(f"AI organize: startup organizer failed, continue without organizer: {e}")
+            self.log.warning(f"AI 整理：启动整理失败，已回退并继续启动: {e}")
             move_map = {}
             new_file_hints = {}
         if move_map:
             index_list = self._remap_index_items_after_move(index_list, move_map)
+        self.log.info("AI 启动阶段：加载缓存元数据/向量")
         metadata_list = self._load_json_list(self.metadata_path)
         if move_map:
             metadata_list = self._remap_metadata_items_after_move(metadata_list, move_map)
@@ -1652,7 +1864,7 @@ class AIService:
         new_rels = sorted(actual_rels - seen_index_rels)
         new_pipeline_by_rel: Dict[str, dict] = {}
         if new_rels:
-            self.log.info(f"AI 索引：发现 {len(new_rels)} 个新文件，开始生成摘要与向量")
+            self.log.info(f"AI 启动阶段：新文件摘要流水线开始，总数={len(new_rels)}")
         new_pipeline_errors: Dict[str, str] = {}
         if new_rels:
             max_summary_workers = max(1, min(int(self._NEW_FILE_SUMMARY_MAX_CONCURRENCY), len(new_rels)))
@@ -1693,30 +1905,66 @@ class AIService:
                 continue
             cleaned_index.append(entry)
             self.log.info(f"AI 索引：新增[{idx}/{len(new_rels)}] {rel}")
+        if new_rels:
+            self.log.info(
+                "AI 启动阶段：新文件摘要流水线完成 "
+                f"(成功={len(new_pipeline_by_rel)}, 失败={max(0, len(new_rels) - len(new_pipeline_by_rel))})"
+            )
 
+        self.log.info("AI 启动阶段：写入增量索引更新")
         self._save_json(self.index_path, cleaned_index)
 
         existing_vec_by_rel = self._metadata_vector_map(metadata_list, vector_matrix, valid_rels=actual_rels)
         vector_candidate_rels = [rel for rel in new_rels if rel in new_pipeline_by_rel and (rel not in existing_vec_by_rel)]
         if vector_candidate_rels:
+            self.log.info(f"AI 启动阶段：新文件向量流水线开始，总数={len(vector_candidate_rels)}")
+            embed_done = 0
+            embed_ok = 0
+            embed_fail = 0
+
+            def _log_embed_progress(force: bool = False) -> None:
+                if len(vector_candidate_rels) <= 0:
+                    return
+                if (not force) and embed_done < len(vector_candidate_rels) and (embed_done % int(self._ORGANIZE_PROGRESS_EVERY) != 0):
+                    return
+                self.log.info(
+                    f"AI 启动进度：新文件向量 {embed_done}/{len(vector_candidate_rels)} "
+                    f"(成功={embed_ok}, 失败={embed_fail})"
+                )
+
             max_embed_workers = max(1, min(int(self._NEW_FILE_EMBED_MAX_CONCURRENCY), len(vector_candidate_rels)))
             if max_embed_workers <= 1:
                 for rel in vector_candidate_rels:
                     ctx = new_pipeline_by_rel.get(rel)
                     if not isinstance(ctx, dict):
+                        embed_done += 1
+                        embed_fail += 1
+                        _log_embed_progress()
                         continue
                     ctx["vector_attempted"] = True
                     try:
-                        ctx["vector"] = self._build_vector_for_embedding_text(str(ctx.get("embedding_text") or ""))
+                        vec = self._build_vector_for_embedding_text(str(ctx.get("embedding_text") or ""))
+                        ctx["vector"] = vec
+                        if isinstance(vec, np.ndarray):
+                            embed_ok += 1
+                        else:
+                            embed_fail += 1
                     except Exception as e:
                         ctx["vector"] = None
                         ctx["vector_error"] = str(e)
+                        embed_fail += 1
+                    finally:
+                        embed_done += 1
+                        _log_embed_progress()
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_embed_workers) as executor:
                     future_to_rel: Dict[concurrent.futures.Future, str] = {}
                     for rel in vector_candidate_rels:
                         ctx = new_pipeline_by_rel.get(rel)
                         if not isinstance(ctx, dict):
+                            embed_done += 1
+                            embed_fail += 1
+                            _log_embed_progress()
                             continue
                         ctx["vector_attempted"] = True
                         fut = executor.submit(self._build_vector_for_embedding_text, str(ctx.get("embedding_text") or ""))
@@ -1727,10 +1975,23 @@ class AIService:
                         if not isinstance(ctx, dict):
                             continue
                         try:
-                            ctx["vector"] = fut.result()
+                            vec = fut.result()
+                            ctx["vector"] = vec
+                            if isinstance(vec, np.ndarray):
+                                embed_ok += 1
+                            else:
+                                embed_fail += 1
                         except Exception as e:
                             ctx["vector"] = None
                             ctx["vector_error"] = str(e)
+                            embed_fail += 1
+                        finally:
+                            embed_done += 1
+                            _log_embed_progress()
+            self.log.info(
+                "AI 启动阶段：新文件向量流水线完成 "
+                f"(成功={embed_ok}, 失败={embed_fail})"
+            )
 
         rebuilt_metadata: List[dict] = []
         rebuilt_vectors: List[np.ndarray] = []
@@ -2034,6 +2295,8 @@ class AIService:
                 self.log.info(f"群通知解析：已使用 OCR 提取扫描 PDF 文本 {p.name}")
                 return text3
             return text3
+        if suffix == ".doc":
+            return self._read_doc_head(p, max_chars=max_chars)
         if suffix == ".docx":
             return self._read_docx_head(p, max_chars=max_chars)
         return ""
@@ -2719,6 +2982,56 @@ class AIService:
             self.log.warning(f"群通知解析：OCR 提取 PDF 失败 {path.name}: {e}")
             return ""
         return "\n".join(chunks)[:max_chars]
+
+    @staticmethod
+    def _cleanup_extracted_text(text: str) -> str:
+        s = str(text or "")
+        s = s.replace("\x00", " ")
+        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _read_doc_head(self, path: Path, max_chars: int = 2000) -> str:
+        antiword_path = shutil.which("antiword")
+        if antiword_path:
+            try:
+                proc = subprocess.run(
+                    [antiword_path, str(path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=25,
+                )
+                raw = bytes(proc.stdout or b"")
+                if raw:
+                    for enc in ("utf-8", "gb18030", "utf-16-le", "latin1"):
+                        txt = self._cleanup_extracted_text(raw.decode(enc, errors="ignore"))
+                        if self._has_enough_text(txt):
+                            return txt[:max_chars]
+            except Exception as e:
+                self.log.warning(f"AI 索引：读取 DOC 失败 {path.name}: {e}")
+
+        try:
+            raw = path.read_bytes()
+        except Exception as e:
+            self.log.warning(f"AI 索引：读取 DOC 失败 {path.name}: {e}")
+            return ""
+        if not raw:
+            return ""
+        raw = raw[: 4 * 1024 * 1024]
+
+        best = ""
+        best_score = -1
+        for enc in ("utf-16-le", "utf-8", "gb18030", "latin1"):
+            txt = self._cleanup_extracted_text(raw.decode(enc, errors="ignore"))
+            if not txt:
+                continue
+            probe = txt[: max_chars * 2]
+            score = len(re.findall(r"[0-9A-Za-z\u4e00-\u9fff]", probe))
+            if score > best_score:
+                best = txt
+                best_score = score
+        return best[:max_chars]
 
     def _read_docx_head(self, path: Path, max_chars: int = 2000) -> str:
         if Document is None:
