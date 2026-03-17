@@ -80,7 +80,7 @@ async def run_forever():
         return
 
     log.info(f"Bot 启动：pid={os.getpid()} lock={_lock_path_text()}")
-    filesvc = FileService()
+    filesvc = FileService(log)
     filesvc.ensure_dirs()
     state = BotState()
     perm = PermService(PERM_DB_PATH)
@@ -100,28 +100,45 @@ async def run_forever():
         except Exception as e:
             log.warning(f"AI 整理：根据当前目录重建标记失败: {e}")
 
-    quick_bootstrap_ok = True
     try:
         await aisvc.bootstrap_sync()
     except Exception as e:
-        quick_bootstrap_ok = False
         log.warning(f"AI 快速启动失败（将继续运行基础功能）: {e}")
     else:
         log.info("AI 快速启动就绪；Bot 已可响应，启动后同步将在后台继续运行")
 
-    def _on_ai_post_sync_done(task: asyncio.Task) -> None:
+    async def _run_post_startup_sync_tasks() -> None:
+        ai_ok = False
         try:
-            task.result()
-            log.info("AI 启动后同步已完成")
+            await aisvc.bootstrap_post_startup_sync()
+            ai_ok = True
         except Exception as e:
             log.warning(f"AI 启动后同步失败: {e}")
 
-    if quick_bootstrap_ok:
         try:
-            ai_post_sync_task = asyncio.create_task(aisvc.bootstrap_post_startup_sync())
-            ai_post_sync_task.add_done_callback(_on_ai_post_sync_done)
+            log.info("普通 /find 索引：启动后后台构建开始")
+            find_stats = await asyncio.to_thread(filesvc.build_find_index)
+            log.info(
+                "普通 /find 索引：启动后后台构建完成 "
+                f"(目录={int(find_stats.get('dirs', 0))}, 文件={int(find_stats.get('files', 0))}, 条目={int(find_stats.get('entries', 0))})"
+            )
         except Exception as e:
-            log.warning(f"AI 启动后同步任务调度失败: {e}")
+            log.warning(f"普通 /find 索引：启动后后台构建失败: {e}")
+
+        if ai_ok:
+            log.info("AI 启动后同步已完成")
+
+    def _on_post_sync_done(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except Exception as e:
+            log.warning(f"启动后后台同步任务异常: {e}")
+
+    try:
+        post_sync_task = asyncio.create_task(_run_post_startup_sync_tasks())
+        post_sync_task.add_done_callback(_on_post_sync_done)
+    except Exception as e:
+        log.warning(f"启动后后台同步任务调度失败: {e}")
 
     while True:
         try:

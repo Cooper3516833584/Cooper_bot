@@ -4,6 +4,9 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Set, Tuple
 import os
 import re
+import json
+import time
+import threading
 import unicodedata
 
 from config import (
@@ -77,8 +80,16 @@ class Root:
     min_level: int
 
 class FileService:
-    def __init__(self):
+    _FIND_INDEX_FILENAME = "find_index.json"
+
+    def __init__(self, log=None):
+        self.log = log
         self.roots: List[Root] = [Root(n, Path(p), int(lv)) for (n, p, lv) in DOC_ROOTS]
+        self._find_index_path = Path(DATA_DIR) / self._FIND_INDEX_FILENAME
+        self._find_index_lock = threading.RLock()
+        self._find_index_entries: List[dict] = []
+        self._find_index_mtime_ns: int = 0
+        self._find_index_loaded: bool = False
 
     def ensure_dirs(self):
         # 只保证“配置里定义的根”存在
@@ -91,6 +102,245 @@ class FileService:
         # NapCat 专用上传目录（用于 /get 发送文件时 staging）
         UPLOAD_GROUP_HOST_DIR.mkdir(parents=True, exist_ok=True)
         UPLOAD_PRIVATE_HOST_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _log_info(self, msg: str) -> None:
+        lg = self.log
+        if lg is not None:
+            try:
+                lg.info(str(msg))
+            except Exception:
+                pass
+
+    def _log_warning(self, msg: str) -> None:
+        lg = self.log
+        if lg is not None:
+            try:
+                lg.warning(str(msg))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _path_under(base: Path, target: Path) -> bool:
+        try:
+            target.resolve().relative_to(base.resolve())
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    @staticmethod
+    def _norm_abs_path_str(p: object) -> str:
+        try:
+            s = os.path.abspath(str(p))
+        except Exception:
+            s = str(p or "")
+        return os.path.normcase(s)
+
+    @staticmethod
+    def _path_under_norm(base_norm: str, target_norm: str) -> bool:
+        b = str(base_norm or "")
+        t = str(target_norm or "")
+        if (not b) or (not t):
+            return False
+        if t == b:
+            return True
+        if b.endswith(os.sep):
+            return t.startswith(b)
+        return t.startswith(b + os.sep)
+
+    def _iter_find_index_bases(self) -> List[Tuple[str, Path]]:
+        out: List[Tuple[str, Path]] = []
+        seen = set()
+        for r in self.roots:
+            try:
+                p = r.path.resolve()
+            except Exception:
+                p = r.path
+            key = (str(r.name), os.path.normcase(str(p)))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((str(r.name), p))
+        try:
+            g = GROUP_DOCS_DIR.resolve()
+        except Exception:
+            g = GROUP_DOCS_DIR
+        g_key = ("groups", os.path.normcase(str(g)))
+        if g_key not in seen:
+            out.append(("groups", g))
+        return out
+
+    def _safe_write_json_atomic(self, path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        txt = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        tmp.write_text(txt, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+
+    def _normalize_find_index_entry(self, raw: object) -> Optional[dict]:
+        if not isinstance(raw, dict):
+            return None
+        p = str(raw.get("path") or "").strip()
+        root_name = str(raw.get("root_name") or "").strip()
+        root_path = str(raw.get("root_path") or "").strip()
+        rel = str(raw.get("rel") or "").strip().replace("\\", "/")
+        name = str(raw.get("name") or "").strip()
+        if (not p) or (not root_name) or (not root_path) or (not rel) or (not name):
+            return None
+        is_dir = bool(raw.get("is_dir"))
+        name_norm = str(raw.get("name_norm") or "").strip() or _find_norm(name)
+        stem_norm = str(raw.get("stem_norm") or "").strip()
+        if not stem_norm:
+            stem_norm = _find_norm(Path(name).stem if not is_dir else name)
+        rel_norm = str(raw.get("rel_norm") or "").strip() or _find_norm(rel)
+        parent_norm = str(raw.get("parent_norm") or "").strip() or _find_norm(Path(rel).parent.as_posix())
+        return {
+            "path": p,
+            "path_norm": str(raw.get("path_norm") or "").strip() or self._norm_abs_path_str(p),
+            "root_name": root_name,
+            "root_path": root_path,
+            "rel": rel,
+            "name": name,
+            "is_dir": is_dir,
+            "name_norm": name_norm,
+            "stem_norm": stem_norm,
+            "rel_norm": rel_norm,
+            "parent_norm": parent_norm,
+        }
+
+    def _load_find_index_from_disk(self, force: bool = False) -> bool:
+        path = self._find_index_path
+        if not path.exists():
+            return False
+        try:
+            st = path.stat()
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+        except Exception:
+            mtime_ns = 0
+
+        with self._find_index_lock:
+            if (not force) and self._find_index_loaded and (mtime_ns > 0) and (mtime_ns == self._find_index_mtime_ns):
+                return True
+
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+            raw_entries = obj.get("entries") if isinstance(obj, dict) else None
+            if not isinstance(raw_entries, list):
+                self._log_warning("普通 /find 索引读取失败：entries 非列表，回退实时扫描")
+                return False
+            normalized: List[dict] = []
+            for item in raw_entries:
+                one = self._normalize_find_index_entry(item)
+                if one is None:
+                    continue
+                normalized.append(one)
+            with self._find_index_lock:
+                self._find_index_entries = normalized
+                self._find_index_mtime_ns = mtime_ns
+                self._find_index_loaded = True
+            self._log_info(f"普通 /find 索引已加载：条目={len(normalized)}")
+            return True
+        except Exception as e:
+            self._log_warning(f"普通 /find 索引读取失败，回退实时扫描: {e}")
+            return False
+
+    def ensure_find_index_loaded(self) -> bool:
+        return self._load_find_index_from_disk(force=False)
+
+    def build_find_index(self) -> Dict[str, int]:
+        bases = self._iter_find_index_bases()
+        self._log_info("普通 /find 索引：开始构建")
+
+        entries: List[dict] = []
+        seen = set()
+        scanned_dirs = 0
+        scanned_files = 0
+
+        for root_name, base in bases:
+            if not base.exists() or (not base.is_dir()):
+                continue
+            for root, dirs, files in os.walk(base):
+                dirs.sort(key=lambda s: s.lower())
+                files.sort(key=lambda s: s.lower())
+                root_p = Path(root)
+
+                for dn in dirs:
+                    p = root_p / dn
+                    try:
+                        key = os.path.normcase(str(p.resolve()))
+                    except (OSError, RuntimeError):
+                        key = os.path.normcase(str(p))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        rel = p.relative_to(base).as_posix()
+                    except ValueError:
+                        rel = p.name
+                    entries.append(
+                        {
+                            "path": str(p.resolve() if p.exists() else p),
+                            "path_norm": self._norm_abs_path_str(p),
+                            "root_name": root_name,
+                            "root_path": str(base.resolve() if base.exists() else base),
+                            "rel": rel,
+                            "name": p.name,
+                            "is_dir": True,
+                            "name_norm": _find_norm(p.name),
+                            "stem_norm": _find_norm(p.name),
+                            "rel_norm": _find_norm(rel),
+                            "parent_norm": _find_norm(Path(rel).parent.as_posix()),
+                        }
+                    )
+                    scanned_dirs += 1
+
+                for fn in files:
+                    p = root_p / fn
+                    try:
+                        key = os.path.normcase(str(p.resolve()))
+                    except (OSError, RuntimeError):
+                        key = os.path.normcase(str(p))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        rel = p.relative_to(base).as_posix()
+                    except ValueError:
+                        rel = p.name
+                    entries.append(
+                        {
+                            "path": str(p.resolve() if p.exists() else p),
+                            "path_norm": self._norm_abs_path_str(p),
+                            "root_name": root_name,
+                            "root_path": str(base.resolve() if base.exists() else base),
+                            "rel": rel,
+                            "name": p.name,
+                            "is_dir": False,
+                            "name_norm": _find_norm(p.name),
+                            "stem_norm": _find_norm(Path(p.name).stem),
+                            "rel_norm": _find_norm(rel),
+                            "parent_norm": _find_norm(Path(rel).parent.as_posix()),
+                        }
+                    )
+                    scanned_files += 1
+
+        payload = {"version": 1, "generated_ts": int(time.time()), "entries": entries}
+        self._safe_write_json_atomic(self._find_index_path, payload)
+        mtime_ns = 0
+        try:
+            st = self._find_index_path.stat()
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+        except Exception:
+            mtime_ns = 0
+
+        with self._find_index_lock:
+            self._find_index_entries = entries
+            self._find_index_mtime_ns = mtime_ns
+            self._find_index_loaded = True
+
+        self._log_info(
+            f"普通 /find 索引：构建完成 (目录={scanned_dirs}, 文件={scanned_files}, 条目={len(entries)})"
+        )
+        return {"dirs": scanned_dirs, "files": scanned_files, "entries": len(entries)}
 
     def _ctx_roots(self, ctx) -> List[Root]:
         out = [r for r in self.roots if ctx.level >= r.min_level]
@@ -350,32 +600,14 @@ class FileService:
             return 88.0
         return 82.0
 
-    def find(self, ctx, keyword: str, in_dir: Optional[str] = None) -> List[Path]:
-        keyword = (keyword or "").strip()
-        if not keyword:
-            return []
-
-        query_compact, query_groups = self._prepare_find_query(keyword)
-        if not query_compact or not query_groups:
-            return []
-        min_score = self._min_find_score(query_compact, query_groups)
-
-        roots = self._ctx_roots(ctx)
-
-        # Optional: limit search under a specific directory, e.g. /find analog public/textbook_and_material
-        base_filters: List[Path] = []
-        if in_dir:
-            in_dir = in_dir.strip().strip("/")
-            parts = in_dir.split("/", 1)
-            r = self._pick_root(ctx, parts[0])
-            if r:
-                sub = parts[1] if len(parts) == 2 else ""
-                target = self._safe_join(r.path, sub) if sub else r.path
-                if target and target.exists() and target.is_dir():
-                    base_filters = [target]
-
-        search_bases = base_filters if base_filters else [r.path for r in roots]
-
+    def _find_by_scan(
+        self,
+        *,
+        query_compact: str,
+        query_groups: List[List[str]],
+        min_score: float,
+        search_bases: List[Path],
+    ) -> List[Path]:
         dir_hits_scored: List[Tuple[float, int, str, Path]] = []
         file_hits_scored: List[Tuple[float, int, str, Path]] = []
         seen = set()  # Deduplicate overlapping roots (e.g. groups/ and group/).
@@ -438,6 +670,122 @@ class FileService:
         dir_hits = [x[3] for x in dir_hits_scored[:FIND_DIR_LIMIT]]
         file_hits = [x[3] for x in file_hits_scored[:FIND_FILE_LIMIT]]
         return dir_hits + file_hits
+
+    def _find_with_index(
+        self,
+        *,
+        query_compact: str,
+        query_groups: List[List[str]],
+        min_score: float,
+        search_bases: List[Path],
+    ) -> List[Path]:
+        if not self.ensure_find_index_loaded():
+            raise FileNotFoundError("find index not ready")
+
+        base_norm_pairs: List[Tuple[Path, str]] = []
+        for base in search_bases:
+            try:
+                resolved = base.resolve()
+            except Exception:
+                resolved = base
+            base_norm_pairs.append((resolved, self._norm_abs_path_str(resolved)))
+
+        with self._find_index_lock:
+            entries = list(self._find_index_entries)
+
+        dir_hits_scored: List[Tuple[float, int, str, Path]] = []
+        file_hits_scored: List[Tuple[float, int, str, Path]] = []
+        seen = set()
+
+        for item in entries:
+            p_raw = str((item or {}).get("path") or "").strip()
+            if not p_raw:
+                continue
+            p = Path(p_raw)
+            p_norm = str((item or {}).get("path_norm") or "").strip() or self._norm_abs_path_str(p_raw)
+
+            matched_base: Optional[Path] = None
+            for base, base_norm in base_norm_pairs:
+                if self._path_under_norm(base_norm, p_norm):
+                    matched_base = base
+                    break
+            if matched_base is None:
+                continue
+
+            is_dir = bool((item or {}).get("is_dir"))
+            is_file = not is_dir
+            score = self._score_candidate(p, matched_base, is_file, query_compact, query_groups)
+            if score < min_score:
+                continue
+            try:
+                key = os.path.normcase(str(p.resolve()))
+            except (OSError, RuntimeError):
+                key = os.path.normcase(str(p))
+            if key in seen:
+                continue
+            seen.add(key)
+            depth = self._depth_under(matched_base, p)
+            if is_dir:
+                dir_hits_scored.append((score, depth, p.name.casefold(), p))
+            else:
+                file_hits_scored.append((score, depth, p.name.casefold(), p))
+
+        dir_hits_scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+        file_hits_scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+        dir_hits = [x[3] for x in dir_hits_scored[:FIND_DIR_LIMIT]]
+        file_hits = [x[3] for x in file_hits_scored[:FIND_FILE_LIMIT]]
+        return dir_hits + file_hits
+
+    def find(self, ctx, keyword: str, in_dir: Optional[str] = None) -> List[Path]:
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return []
+
+        query_compact, query_groups = self._prepare_find_query(keyword)
+        if not query_compact or not query_groups:
+            return []
+        min_score = self._min_find_score(query_compact, query_groups)
+
+        roots = self._ctx_roots(ctx)
+
+        # Optional: limit search under a specific directory, e.g. /find analog public/textbook_and_material
+        base_filters: List[Path] = []
+        if in_dir:
+            in_dir = in_dir.strip().strip("/")
+            parts = in_dir.split("/", 1)
+            r = self._pick_root(ctx, parts[0])
+            if r:
+                sub = parts[1] if len(parts) == 2 else ""
+                target = self._safe_join(r.path, sub) if sub else r.path
+                if target and target.exists() and target.is_dir():
+                    base_filters = [target]
+
+        search_bases = base_filters if base_filters else [r.path for r in roots]
+        if not search_bases:
+            return []
+
+        try:
+            return self._find_with_index(
+                query_compact=query_compact,
+                query_groups=query_groups,
+                min_score=min_score,
+                search_bases=search_bases,
+            )
+        except FileNotFoundError:
+            return self._find_by_scan(
+                query_compact=query_compact,
+                query_groups=query_groups,
+                min_score=min_score,
+                search_bases=search_bases,
+            )
+        except Exception as e:
+            self._log_warning(f"普通 /find 索引不可用，回退实时扫描: {e}")
+            return self._find_by_scan(
+                query_compact=query_compact,
+                query_groups=query_groups,
+                min_score=min_score,
+                search_bases=search_bases,
+            )
 
     def display_rel(self, p: Path) -> str:
         """展示用：尽量显示相对 data/ 的路径（POSIX 风格）。"""
