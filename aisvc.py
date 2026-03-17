@@ -130,6 +130,10 @@ class AIService:
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
         self._semantic_entry_by_rel: Dict[str, Tuple[dict, np.ndarray]] = {}
+        self._semantic_row_by_rel: Dict[str, int] = {}
+        self._semantic_rel_by_row: List[str] = []
+        self._semantic_active_count: int = 0
+        self._semantic_vector_dim: int = 0
         self._rapid_ocr = None
         self._notice_prompt_cache_mtime: Optional[float] = None
         self._notice_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
@@ -142,13 +146,24 @@ class AIService:
 
     @property
     def semantic_ready(self) -> bool:
+        with self._lock:
+            active_count = int(self._semantic_active_count)
+            vector_dim = int(self._semantic_vector_dim)
+            norm_vectors = self._semantic_norm_vectors
+            meta_len = len(self._semantic_meta)
+            rel_by_row_len = len(self._semantic_rel_by_row)
+            row_by_rel_len = len(self._semantic_row_by_rel)
         return bool(
             self.embedding_base_url
             and self.embedding_api_key
-            and self._semantic_norm_vectors.ndim == 2
-            and self._semantic_norm_vectors.shape[0] > 0
-            and self._semantic_norm_vectors.shape[1] > 0
-            and len(self._semantic_meta) == int(self._semantic_norm_vectors.shape[0])
+            and active_count > 0
+            and vector_dim > 0
+            and norm_vectors.ndim == 2
+            and norm_vectors.shape[0] >= active_count
+            and norm_vectors.shape[1] == vector_dim
+            and meta_len == active_count
+            and rel_by_row_len == active_count
+            and row_by_rel_len == active_count
         )
 
     @property
@@ -2191,8 +2206,11 @@ class AIService:
         q_arr = q_arr / q_norm
 
         with self._lock:
-            meta = list(self._semantic_meta)
-            norm_vectors = self._semantic_norm_vectors.copy()
+            active_count = int(self._semantic_active_count)
+            if active_count <= 0:
+                return []
+            meta = list(self._semantic_meta[:active_count])
+            norm_vectors = self._semantic_norm_vectors[:active_count].copy()
 
         if norm_vectors.ndim != 2 or norm_vectors.shape[0] != len(meta):
             return []
@@ -3226,26 +3244,187 @@ class AIService:
         finally:
             conn.close()
 
+    def _reset_semantic_cache_locked(self) -> None:
+        self._semantic_entry_by_rel = {}
+        self._semantic_row_by_rel = {}
+        self._semantic_rel_by_row = []
+        self._semantic_meta = []
+        self._semantic_norm_vectors = np.empty((0, 0), dtype=np.float64)
+        self._semantic_active_count = 0
+        self._semantic_vector_dim = 0
+
+    def _ensure_semantic_capacity_locked(self, required_count: int, vec_dim: int) -> None:
+        required = max(0, int(required_count))
+        dim = max(0, int(vec_dim))
+        if required <= 0 or dim <= 0:
+            return
+
+        if self._semantic_vector_dim == 0:
+            self._semantic_vector_dim = dim
+        elif dim != self._semantic_vector_dim:
+            return
+
+        if self._semantic_norm_vectors.ndim != 2 or int(self._semantic_norm_vectors.shape[1]) != self._semantic_vector_dim:
+            old_rows = 0
+            if (
+                self._semantic_norm_vectors.ndim == 2
+                and int(self._semantic_norm_vectors.shape[1]) == self._semantic_vector_dim
+            ):
+                old_rows = min(int(self._semantic_active_count), int(self._semantic_norm_vectors.shape[0]))
+            new_capacity = max(required, max(8, old_rows))
+            new_mat = np.zeros((new_capacity, self._semantic_vector_dim), dtype=np.float64)
+            if old_rows > 0:
+                new_mat[:old_rows, :] = self._semantic_norm_vectors[:old_rows, :]
+            self._semantic_norm_vectors = new_mat
+            return
+
+        old_capacity = int(self._semantic_norm_vectors.shape[0])
+        if old_capacity >= required:
+            return
+        new_capacity = max(required, max(8, old_capacity * 2))
+        new_mat = np.zeros((new_capacity, self._semantic_vector_dim), dtype=np.float64)
+        active_rows = min(int(self._semantic_active_count), old_capacity)
+        if active_rows > 0:
+            new_mat[:active_rows, :] = self._semantic_norm_vectors[:active_rows, :]
+        self._semantic_norm_vectors = new_mat
+
+    @staticmethod
+    def _normalize_semantic_vector(vec: object) -> Optional[np.ndarray]:
+        try:
+            arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+        except Exception:
+            return None
+        if arr.size <= 0:
+            return None
+        norm = float(np.linalg.norm(arr))
+        if norm <= 0.0:
+            return None
+        return (arr / norm).astype(np.float64, copy=False)
+
+    def _semantic_insert_or_replace_locked(self, rel: str, meta_item: dict, vec: np.ndarray) -> bool:
+        rel_norm = self._normalize_rel(rel)
+        if (not rel_norm) or (not isinstance(meta_item, dict)):
+            return False
+
+        norm_vec = self._normalize_semantic_vector(vec)
+        if norm_vec is None:
+            return False
+        vec_dim = int(norm_vec.size)
+
+        row = self._semantic_row_by_rel.get(rel_norm)
+        if row is not None:
+            row_idx = int(row)
+            if (
+                row_idx < 0
+                or row_idx >= int(self._semantic_active_count)
+                or row_idx >= len(self._semantic_meta)
+                or row_idx >= len(self._semantic_rel_by_row)
+            ):
+                return False
+            if int(self._semantic_vector_dim) <= 0 or vec_dim != int(self._semantic_vector_dim):
+                return False
+            if (
+                self._semantic_norm_vectors.ndim != 2
+                or int(self._semantic_norm_vectors.shape[1]) != int(self._semantic_vector_dim)
+                or int(self._semantic_norm_vectors.shape[0]) <= row_idx
+            ):
+                return False
+            self._semantic_meta[row_idx] = dict(meta_item)
+            self._semantic_norm_vectors[row_idx, :] = norm_vec
+            return True
+
+        if int(self._semantic_vector_dim) == 0:
+            self._semantic_vector_dim = vec_dim
+        elif vec_dim != int(self._semantic_vector_dim):
+            return False
+
+        required = int(self._semantic_active_count) + 1
+        self._ensure_semantic_capacity_locked(required, int(self._semantic_vector_dim))
+        if (
+            self._semantic_norm_vectors.ndim != 2
+            or int(self._semantic_norm_vectors.shape[1]) != int(self._semantic_vector_dim)
+            or int(self._semantic_norm_vectors.shape[0]) < required
+        ):
+            return False
+
+        row_idx = int(self._semantic_active_count)
+        self._semantic_row_by_rel[rel_norm] = row_idx
+        self._semantic_rel_by_row.append(rel_norm)
+        self._semantic_meta.append(dict(meta_item))
+        self._semantic_norm_vectors[row_idx, :] = norm_vec
+        self._semantic_active_count = row_idx + 1
+        return True
+
+    def _semantic_delete_locked(self, rel: str) -> None:
+        rel_norm = self._normalize_rel(rel)
+        if not rel_norm:
+            return
+        row = self._semantic_row_by_rel.pop(rel_norm, None)
+        if row is None:
+            return
+
+        row_idx = int(row)
+        active = int(self._semantic_active_count)
+        if active <= 0:
+            self._reset_semantic_cache_locked()
+            return
+
+        last_row = active - 1
+        if (
+            row_idx < 0
+            or row_idx >= active
+            or last_row >= len(self._semantic_rel_by_row)
+            or last_row >= len(self._semantic_meta)
+        ):
+            self._reset_semantic_cache_locked()
+            return
+
+        if row_idx != last_row:
+            last_rel = self._semantic_rel_by_row[last_row]
+            if (
+                self._semantic_norm_vectors.ndim != 2
+                or int(self._semantic_norm_vectors.shape[0]) <= last_row
+                or int(self._semantic_norm_vectors.shape[0]) <= row_idx
+                or int(self._semantic_norm_vectors.shape[1]) != int(self._semantic_vector_dim)
+            ):
+                self._reset_semantic_cache_locked()
+                return
+            self._semantic_norm_vectors[row_idx, :] = self._semantic_norm_vectors[last_row, :]
+            self._semantic_meta[row_idx] = self._semantic_meta[last_row]
+            self._semantic_rel_by_row[row_idx] = last_rel
+            self._semantic_row_by_rel[last_rel] = row_idx
+
+        self._semantic_rel_by_row.pop()
+        self._semantic_meta.pop()
+        self._semantic_active_count = last_row
+        if int(self._semantic_active_count) <= 0:
+            self._reset_semantic_cache_locked()
+
     def _set_semantic_cache_from_maps(
         self,
         metadata_by_rel: Dict[str, dict],
         vector_by_rel: Dict[str, np.ndarray],
     ) -> None:
-        merged: Dict[str, Tuple[dict, np.ndarray]] = {}
-        for rel, meta_item in (metadata_by_rel or {}).items():
-            rel_norm = self._normalize_rel(rel)
-            if not rel_norm or not isinstance(meta_item, dict):
-                continue
-            vec = (vector_by_rel or {}).get(rel_norm)
-            if vec is None:
-                continue
-            arr = np.asarray(vec, dtype=np.float64).reshape(-1)
-            if arr.size <= 0:
-                continue
-            merged[rel_norm] = (dict(meta_item), arr)
         with self._lock:
-            self._semantic_entry_by_rel = merged
-            self._rebuild_semantic_cache_locked()
+            self._reset_semantic_cache_locked()
+            for rel in sorted((metadata_by_rel or {}).keys()):
+                meta_item = (metadata_by_rel or {}).get(rel)
+                rel_norm = self._normalize_rel(rel)
+                if (not rel_norm) or (not isinstance(meta_item, dict)):
+                    continue
+                vec = (vector_by_rel or {}).get(rel_norm)
+                if vec is None:
+                    vec = (vector_by_rel or {}).get(rel)
+                if vec is None:
+                    continue
+                try:
+                    raw_arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+                except Exception:
+                    continue
+                if raw_arr.size <= 0:
+                    continue
+                if self._semantic_insert_or_replace_locked(rel_norm, meta_item, raw_arr):
+                    self._semantic_entry_by_rel[rel_norm] = (dict(meta_item), raw_arr)
 
     def _apply_semantic_cache_changes(
         self,
@@ -3255,83 +3434,75 @@ class AIService:
         delete_rels: set[str],
     ) -> None:
         with self._lock:
-            entry_map = dict(self._semantic_entry_by_rel)
-
             for rel in delete_rels or set():
                 rel_norm = self._normalize_rel(rel)
-                if rel_norm:
-                    entry_map.pop(rel_norm, None)
+                if not rel_norm:
+                    continue
+                self._semantic_entry_by_rel.pop(rel_norm, None)
+                self._semantic_delete_locked(rel_norm)
 
+            normalized_metadata_upserts: Dict[str, dict] = {}
             for rel, meta_item in (metadata_upserts or {}).items():
                 rel_norm = self._normalize_rel(rel)
                 if (not rel_norm) or (not isinstance(meta_item, dict)):
                     continue
-                old = entry_map.get(rel_norm)
-                if old is None:
-                    continue
-                entry_map[rel_norm] = (dict(meta_item), old[1])
+                normalized_metadata_upserts[rel_norm] = dict(meta_item)
 
+            normalized_vector_upserts: Dict[str, Optional[np.ndarray]] = {}
             for rel, vec in (vector_upserts or {}).items():
                 rel_norm = self._normalize_rel(rel)
                 if not rel_norm:
                     continue
-                arr = np.asarray(vec, dtype=np.float64).reshape(-1)
-                if arr.size <= 0:
-                    continue
-                old = entry_map.get(rel_norm)
-                if old is not None:
-                    entry_map[rel_norm] = (old[0], arr)
+                try:
+                    arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+                except Exception:
+                    arr = np.empty((0,), dtype=np.float64)
+                normalized_vector_upserts[rel_norm] = arr if arr.size > 0 else None
 
-            for rel, meta_item in (metadata_upserts or {}).items():
-                rel_norm = self._normalize_rel(rel)
-                if (not rel_norm) or (not isinstance(meta_item, dict)):
-                    continue
-                if rel_norm in entry_map:
-                    continue
-                vec = (vector_upserts or {}).get(rel_norm)
-                if vec is None:
-                    continue
-                arr = np.asarray(vec, dtype=np.float64).reshape(-1)
-                if arr.size <= 0:
-                    continue
-                entry_map[rel_norm] = (dict(meta_item), arr)
+            affected_rels = set(normalized_metadata_upserts.keys()) | set(normalized_vector_upserts.keys())
 
-            self._semantic_entry_by_rel = entry_map
-            self._rebuild_semantic_cache_locked()
+            for rel_norm in sorted(affected_rels):
+                old_entry = self._semantic_entry_by_rel.get(rel_norm)
+                old_meta = old_entry[0] if (isinstance(old_entry, tuple) and len(old_entry) == 2) else None
+                old_vec = old_entry[1] if (isinstance(old_entry, tuple) and len(old_entry) == 2) else None
+                if not isinstance(old_meta, dict):
+                    old_meta = None
+                if not isinstance(old_vec, np.ndarray):
+                    old_vec = None
+
+                new_meta = normalized_metadata_upserts.get(rel_norm, old_meta)
+                new_vec = normalized_vector_upserts.get(rel_norm, old_vec)
+
+                if isinstance(new_meta, dict) and isinstance(new_vec, np.ndarray):
+                    raw_arr = np.asarray(new_vec, dtype=np.float64).reshape(-1)
+                    if raw_arr.size > 0 and self._semantic_insert_or_replace_locked(rel_norm, new_meta, raw_arr):
+                        self._semantic_entry_by_rel[rel_norm] = (dict(new_meta), raw_arr)
+                        continue
+
+                self._semantic_entry_by_rel.pop(rel_norm, None)
+                self._semantic_delete_locked(rel_norm)
 
     def _rebuild_semantic_cache_locked(self) -> None:
-        cleaned_map: Dict[str, Tuple[dict, np.ndarray]] = {}
-        meta_list: List[dict] = []
-        norm_rows: List[np.ndarray] = []
-        vec_dim: Optional[int] = None
-
-        for rel in sorted(self._semantic_entry_by_rel.keys()):
-            entry = self._semantic_entry_by_rel.get(rel)
+        source_map = dict(self._semantic_entry_by_rel)
+        self._reset_semantic_cache_locked()
+        for rel in sorted(source_map.keys()):
+            rel_norm = self._normalize_rel(rel)
+            if not rel_norm:
+                continue
+            entry = source_map.get(rel)
             if not isinstance(entry, tuple) or len(entry) != 2:
                 continue
             meta_item, vec = entry
             if not isinstance(meta_item, dict):
                 continue
-            arr = np.asarray(vec, dtype=np.float64).reshape(-1)
-            if arr.size <= 0:
+            try:
+                raw_arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+            except Exception:
                 continue
-            if vec_dim is None:
-                vec_dim = int(arr.size)
-            if int(arr.size) != int(vec_dim):
+            if raw_arr.size <= 0:
                 continue
-            norm = float(np.linalg.norm(arr))
-            if norm <= 0.0:
-                continue
-            cleaned_map[rel] = (dict(meta_item), arr)
-            meta_list.append(dict(meta_item))
-            norm_rows.append((arr / norm).astype(np.float64, copy=False))
-
-        self._semantic_entry_by_rel = cleaned_map
-        self._semantic_meta = meta_list
-        if norm_rows:
-            self._semantic_norm_vectors = np.vstack(norm_rows).astype(np.float64, copy=False)
-        else:
-            self._semantic_norm_vectors = np.empty((0, 0), dtype=np.float64)
+            if self._semantic_insert_or_replace_locked(rel_norm, meta_item, raw_arr):
+                self._semantic_entry_by_rel[rel_norm] = (dict(meta_item), raw_arr)
 
     @staticmethod
     def _load_json_list(path: Path) -> List[dict]:
