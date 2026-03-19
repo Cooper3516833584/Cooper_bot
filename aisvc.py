@@ -105,6 +105,7 @@ class AIService:
         self.vectors_path = Path(AI_VECTORS_PATH)
         self.notice_prompt_config_path = Path(__file__).resolve().parent / "group_notice_prompts.json"
         self.private_chat_prompt_config_path = Path(__file__).resolve().parent / "private_chat_prompts.json"
+        self.group_chat_prompt_config_path = Path(__file__).resolve().parent / "group_chat_prompts.json"
         self.material_scan_marks_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_MARKS_FILENAME
         self.material_state_cache_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_STATE_CACHE_FILENAME
         self.incremental_store_path = Path(BASE_DIR) / self._INCREMENTAL_STORE_FILENAME
@@ -139,6 +140,8 @@ class AIService:
         self._notice_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
         self._private_chat_prompt_cache_mtime: Optional[float] = None
         self._private_chat_prompt_cache: Dict[str, object] = {"default": {}, "users": {}}
+        self._group_chat_prompt_cache_mtime: Optional[float] = None
+        self._group_chat_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
 
     @property
     def chat_ready(self) -> bool:
@@ -287,6 +290,10 @@ class AIService:
     def _builtin_private_chat_prompt_config() -> Dict[str, object]:
         return {"default": {}, "users": {}}
 
+    @staticmethod
+    def _builtin_group_chat_prompt_config() -> Dict[str, object]:
+        return {"default": {}, "groups": {}}
+
     def _load_private_chat_prompt_config(self) -> Dict[str, object]:
         path = self.private_chat_prompt_config_path
         fallback = self._builtin_private_chat_prompt_config()
@@ -320,60 +327,145 @@ class AIService:
                 self._private_chat_prompt_cache_mtime = float(mtime)
                 return fallback
 
+    def _load_group_chat_prompt_config(self) -> Dict[str, object]:
+        path = self.group_chat_prompt_config_path
+        fallback = self._builtin_group_chat_prompt_config()
+        try:
+            mtime = path.stat().st_mtime
+        except Exception:
+            return fallback
+
+        with self._lock:
+            if self._group_chat_prompt_cache_mtime == float(mtime):
+                return self._group_chat_prompt_cache
+
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("group chat prompt config root must be an object")
+                default_cfg = data.get("default")
+                if default_cfg is None:
+                    default_cfg = {}
+                groups_cfg = data.get("groups") or {}
+                if not isinstance(groups_cfg, dict):
+                    groups_cfg = {}
+                normalized = {"default": default_cfg, "groups": groups_cfg}
+                self._group_chat_prompt_cache = normalized
+                self._group_chat_prompt_cache_mtime = float(mtime)
+                self.log.info(f"AI chat: loaded group prompt config {path.name}")
+                return normalized
+            except Exception as e:
+                self.log.warning(f"AI chat: failed to load group prompt config {path.name}: {e}")
+                self._group_chat_prompt_cache = fallback
+                self._group_chat_prompt_cache_mtime = float(mtime)
+                return fallback
+
     def _select_chat_system_prompt(self, session_key: str) -> str:
         default_prompt = str(self.system_prompt or "").strip()
         key = str(session_key or "").strip()
-        if not key.startswith("private:"):
+        if key.startswith("private:"):
+            user_id = key.split(":", 1)[1].strip()
+            if not user_id:
+                return default_prompt
+
+            try:
+                cfg = self._load_private_chat_prompt_config()
+            except Exception as e:
+                self.log.warning(f"AI chat: private prompt read error, fallback to default prompt: user={user_id[:40]} err={e}")
+                return default_prompt
+
+            default_raw = cfg.get("default") if isinstance(cfg, dict) else {}
+            default_cfg = default_raw if isinstance(default_raw, dict) else {}
+            users_cfg = cfg.get("users") if isinstance(cfg, dict) else {}
+            if not isinstance(users_cfg, dict):
+                users_cfg = {}
+
+            user_raw = users_cfg.get(user_id)
+            user_prompt_direct = self._normalize_chat_prompt_text(user_raw)
+            if user_prompt_direct:
+                return user_prompt_direct
+
+            user_cfg = user_raw or {}
+            if not isinstance(user_cfg, dict):
+                user_cfg = {}
+
+            for value in (
+                user_cfg.get("system_prompt"),
+                user_cfg.get("prompt"),
+                user_cfg.get("system_prompt_lines"),
+                user_cfg.get("prompt_lines"),
+            ):
+                prompt = self._normalize_chat_prompt_text(value)
+                if prompt:
+                    return prompt
+
+            default_prompt_direct = self._normalize_chat_prompt_text(default_raw)
+            if default_prompt_direct:
+                return default_prompt_direct
+
+            for value in (
+                default_cfg.get("system_prompt"),
+                default_cfg.get("prompt"),
+                default_cfg.get("system_prompt_lines"),
+                default_cfg.get("prompt_lines"),
+            ):
+                prompt = self._normalize_chat_prompt_text(value)
+                if prompt:
+                    return prompt
+
             return default_prompt
 
-        user_id = key.split(":", 1)[1].strip()
-        if not user_id:
+        if key.startswith("group:"):
+            group_id = key.split(":", 1)[1].strip()
+            if not group_id:
+                return default_prompt
+
+            try:
+                cfg = self._load_group_chat_prompt_config()
+            except Exception as e:
+                self.log.warning(f"AI chat: group prompt read error, fallback to default prompt: group={group_id[:40]} err={e}")
+                return default_prompt
+
+            default_raw = cfg.get("default") if isinstance(cfg, dict) else {}
+            default_cfg = default_raw if isinstance(default_raw, dict) else {}
+            groups_cfg = cfg.get("groups") if isinstance(cfg, dict) else {}
+            if not isinstance(groups_cfg, dict):
+                groups_cfg = {}
+
+            group_raw = groups_cfg.get(group_id)
+            group_prompt_direct = self._normalize_chat_prompt_text(group_raw)
+            if group_prompt_direct:
+                return group_prompt_direct
+
+            group_cfg = group_raw or {}
+            if not isinstance(group_cfg, dict):
+                group_cfg = {}
+
+            for value in (
+                group_cfg.get("system_prompt"),
+                group_cfg.get("prompt"),
+                group_cfg.get("system_prompt_lines"),
+                group_cfg.get("prompt_lines"),
+            ):
+                prompt = self._normalize_chat_prompt_text(value)
+                if prompt:
+                    return prompt
+
+            default_prompt_direct = self._normalize_chat_prompt_text(default_raw)
+            if default_prompt_direct:
+                return default_prompt_direct
+
+            for value in (
+                default_cfg.get("system_prompt"),
+                default_cfg.get("prompt"),
+                default_cfg.get("system_prompt_lines"),
+                default_cfg.get("prompt_lines"),
+            ):
+                prompt = self._normalize_chat_prompt_text(value)
+                if prompt:
+                    return prompt
+
             return default_prompt
-
-        try:
-            cfg = self._load_private_chat_prompt_config()
-        except Exception as e:
-            self.log.warning(f"AI chat: private prompt read error, fallback to default prompt: user={user_id[:40]} err={e}")
-            return default_prompt
-
-        default_raw = cfg.get("default") if isinstance(cfg, dict) else {}
-        default_cfg = default_raw if isinstance(default_raw, dict) else {}
-        users_cfg = cfg.get("users") if isinstance(cfg, dict) else {}
-        if not isinstance(users_cfg, dict):
-            users_cfg = {}
-
-        user_raw = users_cfg.get(user_id)
-        user_prompt_direct = self._normalize_chat_prompt_text(user_raw)
-        if user_prompt_direct:
-            return user_prompt_direct
-
-        user_cfg = user_raw or {}
-        if not isinstance(user_cfg, dict):
-            user_cfg = {}
-
-        for value in (
-            user_cfg.get("system_prompt"),
-            user_cfg.get("prompt"),
-            user_cfg.get("system_prompt_lines"),
-            user_cfg.get("prompt_lines"),
-        ):
-            prompt = self._normalize_chat_prompt_text(value)
-            if prompt:
-                return prompt
-
-        default_prompt_direct = self._normalize_chat_prompt_text(default_raw)
-        if default_prompt_direct:
-            return default_prompt_direct
-
-        for value in (
-            default_cfg.get("system_prompt"),
-            default_cfg.get("prompt"),
-            default_cfg.get("system_prompt_lines"),
-            default_cfg.get("prompt_lines"),
-        ):
-            prompt = self._normalize_chat_prompt_text(value)
-            if prompt:
-                return prompt
 
         return default_prompt
 
