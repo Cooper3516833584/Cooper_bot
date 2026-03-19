@@ -35,9 +35,9 @@ from config import (
 )
 
 try:
-    import PyPDF2  # type: ignore
+    from pypdf import PdfReader  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
-    PyPDF2 = None
+    PdfReader = None
 
 try:
     import fitz  # type: ignore
@@ -3626,12 +3626,12 @@ class AIService:
         return np.empty((0, 0), dtype=np.float64)
 
     def _read_pdf_head(self, path: Path, max_pages: int = 5, max_chars: int = 2000) -> str:
-        if PyPDF2 is None:
+        if PdfReader is None:
             return ""
         text_parts: List[str] = []
         try:
             with path.open("rb") as f:
-                reader = PyPDF2.PdfReader(f)
+                reader = PdfReader(f)
                 pages = len(reader.pages) if int(max_pages) <= 0 else min(len(reader.pages), int(max_pages))
                 for i in range(pages):
                     t = reader.pages[i].extract_text() or ""

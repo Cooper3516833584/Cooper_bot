@@ -22,8 +22,3 @@ Thumbs.db
 *.pyc
 *.pyo
 *.pyd
-
-# keep test source tracked
-!test/
-!test/**/*.py
-!test/**/.gitkeep
