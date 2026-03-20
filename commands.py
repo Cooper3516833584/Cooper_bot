@@ -48,6 +48,8 @@ _STATE_SWEEP_MIN_INTERVAL_SECONDS = 30.0
 _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_GROUP_NOTICE_SECONDS = 10.0 * 60.0
+_FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
+_FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
 
 
 def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECONDS) -> bool:
@@ -420,6 +422,93 @@ def _parse_find_args(rest: str, filesvc: FileService) -> Tuple[str, Optional[str
     return s, None
 
 
+def _path_identity_key(p: Path) -> str:
+    try:
+        return str(p.resolve()).casefold()
+    except (OSError, RuntimeError):
+        return str(p).casefold()
+
+
+def _split_find_scope_parts(in_dir: Optional[str]) -> Optional[List[str]]:
+    raw = str(in_dir or "").strip().replace("\\", "/").strip("/")
+    if not raw:
+        return []
+    parts: List[str] = []
+    for seg in raw.split("/"):
+        piece = seg.strip()
+        if not piece or piece == ".":
+            continue
+        if piece == "..":
+            return None
+        parts.append(piece)
+    return parts
+
+
+def _semantic_merge_allowed_for_in_dir(in_dir: Optional[str]) -> bool:
+    parts = _split_find_scope_parts(in_dir)
+    if parts is None:
+        return False
+    if not parts:
+        return True
+    lower = [x.lower() for x in parts]
+    return len(lower) >= 2 and lower[0] == "public" and lower[1] == "textbook_and_material"
+
+
+def _semantic_filter_base_for_in_dir(in_dir: Optional[str]) -> Optional[Path]:
+    parts = _split_find_scope_parts(in_dir)
+    if not parts:
+        return None
+    lower = [x.lower() for x in parts]
+    if len(lower) < 2 or lower[0] != "public" or lower[1] != "textbook_and_material":
+        return None
+    base = DATA_DIR / "public" / "textbook_and_material"
+    for seg in parts[2:]:
+        base = base / seg
+    return base
+
+
+def _filter_paths_under_base(paths: List[Path], base: Optional[Path]) -> List[Path]:
+    if not base:
+        return list(paths)
+    try:
+        base_res = base.resolve()
+    except (OSError, RuntimeError):
+        base_res = base
+    out: List[Path] = []
+    for p in paths:
+        try:
+            p_res = p.resolve()
+        except (OSError, RuntimeError):
+            p_res = p
+        try:
+            p_res.relative_to(base_res)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        out.append(p_res)
+    return out
+
+
+def _merge_find_hits(primary_hits: List[Path], semantic_hits: List[Path]) -> Tuple[List[Path], List[bool]]:
+    merged: List[Path] = []
+    semantic_flags: List[bool] = []
+    seen = set()
+    for p in primary_hits:
+        k = _path_identity_key(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(p)
+        semantic_flags.append(False)
+    for p in semantic_hits:
+        k = _path_identity_key(p)
+        if k in seen:
+            continue
+        seen.add(k)
+        merged.append(p)
+        semantic_flags.append(True)
+    return merged, semantic_flags
+
+
 def _parse_semantic_find_query(rest: str) -> Optional[str]:
     """Parse `/find "需求"` style semantic query.
     Supports English/Chinese single and double quotes.
@@ -447,6 +536,67 @@ def _parse_semantic_find_query(rest: str) -> Optional[str]:
         return None
     q = s[1:end].strip()
     return q or None
+
+
+def _is_brief_or_generic_find_query(query: str) -> bool:
+    q = str(query or "").strip()
+    if not q:
+        return False
+    compact = re.sub(r"\s+", "", q).lower()
+    if compact in _FIND_GENERIC_TERMS or compact in _FIND_SUBJECT_SHORT_TERMS:
+        return True
+    parts = [x for x in re.split(r"[\s,，、/|]+", q) if x]
+    if len(parts) == 1 and len(compact) <= 2:
+        return True
+    if len(parts) <= 2:
+        normalized_parts = [re.sub(r"\s+", "", p).lower() for p in parts]
+        if normalized_parts and all((p in _FIND_GENERIC_TERMS or p in _FIND_SUBJECT_SHORT_TERMS) for p in normalized_parts):
+            return True
+    return False
+
+
+def _build_find_guidance_message(query: str = "", no_result: bool = False) -> str:
+    compact = re.sub(r"\s+", "", str(query or "")).lower()
+    if _is_brief_or_generic_find_query(query):
+        if ("数电" in compact) or ("数字电子" in compact):
+            return (
+                "提示：你也可以把需求说得更具体一些，结果通常会更准。\n"
+                "例如：\n"
+                "/find 数字电子技术教材\n"
+                "/find 数电实验报告模板\n"
+                "/find 数电期末复习题及答案"
+            )
+        if ("高数" in compact) or ("高等数学" in compact):
+            return (
+                "提示：你也可以把需求说得更具体一些，结果通常会更准。\n"
+                "例如：\n"
+                "/find 高等数学教材同济版\n"
+                "/find 高数期末复习重点总结\n"
+                "/find 适合考试复习的高数题库"
+            )
+        return (
+            "提示：你也可以把需求说得更具体一些，结果通常会更准。\n"
+            "例如：\n"
+            "/find 数字电子技术教材\n"
+            "/find 数电实验报告模板\n"
+            "/find 适合考试复习的高数题库"
+        )
+    if no_result:
+        return (
+            "你也可以换一种更自然、更具体的说法试试，例如：\n"
+            "/find 数字电子技术教材\n"
+            "/find 期末复习用的数电资料\n"
+            "/find 带答案的数理方程课后题"
+        )
+    return (
+        "提示：/find 支持直接描述需求，越具体通常越准确。\n"
+        "例如：\n"
+        "/find 数字电子技术教材\n"
+        "/find 期末复习用的高数资料\n"
+        "/find 带答案的数理方程习题"
+    )
+
+
 def _evt_mentions_me(evt: dict) -> bool:
     self_id = str(evt.get("self_id") or "").strip()
     msg = evt.get("message")
@@ -2010,9 +2160,12 @@ async def _handle_explicit_command(
                 "",
                 "资料检索：",
                 "/ls [root/子目录]  查看目录",
-                "/find 关键词 [可选: root/子目录]  关键词搜索",
-                '/find "需求"  语义检索（支持中英文单双引号，最多返回10条）',
+                "/find 搜索内容 [可选: root/子目录]  支持关键词，也支持直接描述需求",
                 "/get 序号（如 /get 1 2 3 4）  获取文件/文件夹（文件夹自动打包）",
+                "提示：/find 不用只输关键词，也可以直接说你想找什么。",
+                "例如：/find 数字电子技术教材",
+                "例如：/find 期末复习用的高数资料",
+                "例如：/find 带答案的数理方程习题",
                 "提示：可直接回复序号进入下级目录。",
             ])
         lines.extend([
@@ -2216,22 +2369,27 @@ async def _handle_explicit_command(
         if semantic_mode:
             kw = str(semantic_q or "").strip()
             in_dir = None
-            if (aisvc is None) or (not aisvc.semantic_ready):
-                await reply(api, ctx, "AI 语义检索暂时不可用（向量库或配置未就绪）。", logsvc)
-                return
-            try:
-                hits = await aisvc.semantic_find_paths(kw, limit=10)
-            except Exception:
-                await reply(api, ctx, aisvc.fallback_error_reply, logsvc)
-                return
         else:
             kw, in_dir = _parse_find_args(rest, filesvc)
+        try:
+            primary_hits = await asyncio.to_thread(filesvc.find, ctx, kw, in_dir=in_dir)
+        except Exception as e:
+            logsvc.log.exception(f"/find failed: kw={kw!r} in_dir={in_dir!r} err={e}")
+            await reply(api, ctx, "搜索失败，请稍后再试。", logsvc)
+            return
+
+        semantic_hits: List[Path] = []
+        if _semantic_merge_allowed_for_in_dir(in_dir) and (aisvc is not None) and aisvc.semantic_ready:
             try:
-                hits = await asyncio.to_thread(filesvc.find, ctx, kw, in_dir=in_dir)
+                semantic_hits = await aisvc.semantic_find_paths(kw, limit=10)
             except Exception as e:
-                logsvc.log.exception(f"/find failed: kw={kw!r} in_dir={in_dir!r} err={e}")
-                await reply(api, ctx, "搜索失败，请稍后再试。", logsvc)
-                return
+                logsvc.log.warning(f"/find semantic supplement failed: kw={kw!r} in_dir={in_dir!r} err={e}")
+                semantic_hits = []
+            semantic_hits = _filter_paths_under_base(
+                semantic_hits,
+                _semantic_filter_base_for_in_dir(in_dir),
+            )
+        hits, semantic_flags = _merge_find_hits(primary_hits, semantic_hits)
         k = conv_key(ctx)
         _mark_last_find_cache(state, k, hits, kw)
         if not hits:
@@ -2239,13 +2397,18 @@ async def _handle_explicit_command(
                 await reply(api, ctx, "没找到符合语义的文件，试试换个说法或用普通关键词 /find。", logsvc)
             else:
                 await reply(api, ctx, "没找到匹配文件或文件夹。", logsvc)
+            await reply(api, ctx, _build_find_guidance_message(query=kw, no_result=True), logsvc)
             return
-        dir_lines: List[str] = []
-        file_lines: List[str] = []
+        exact_lines: List[str] = []
+        semantic_lines: List[str] = []
         has_large = False
         for i, p in enumerate(hits, 1):
             if p.is_dir():
-                dir_lines.append(f"{i}. 📁 {p.name}/")
+                row = f"{i}. 📁 {p.name}/"
+                if semantic_flags[i - 1]:
+                    semantic_lines.append(row)
+                else:
+                    exact_lines.append(row)
                 continue
             suffix = ""
             try:
@@ -2255,24 +2418,27 @@ async def _handle_explicit_command(
                     has_large = True
             except Exception as e:
                 logsvc.log.warning(f"/find stat failed: path={p} err={e}")
-            file_lines.append(f"{i}. 📄 {p.name}{suffix}")
-        lines = ["语义检索结果：" if semantic_mode else "搜索结果："]
-        lines.append(f"📁 文件夹命中：")
-        if dir_lines:
-            lines.extend(dir_lines)
-        else:
-            lines.append("（无）")
-        lines.append(f"📄 文件命中：")
-        if file_lines:
-            lines.extend(file_lines)
-        else:
-            lines.append("（无）")
+            row = f"{i}. 📄 {p.name}{suffix}"
+            if semantic_flags[i - 1]:
+                semantic_lines.append(row)
+            else:
+                exact_lines.append(row)
+        lines = ["搜索结果："]
+        if exact_lines:
+            lines.append("")
+            lines.append("【精准匹配】")
+            lines.extend(exact_lines)
+        if semantic_lines:
+            lines.append("")
+            lines.append("【智能推荐】")
+            lines.extend(semantic_lines)
+        lines.append("")
         lines.append("用 /get 序号（如/get 1 2 3 4）获取文件；文件夹会先打包成 zip。")
         lines.append("直接回复序号可进入目录并继续按数字下钻。")
         if has_large:
             lines.append("标记“大文件”的条目发送可能较慢，请耐心等待。")
-        lines.append("\n新！增！功！能！\n/find \"需求\"现在可以ai智能查找了！！！")
         await reply(api, ctx, "\n".join(lines), logsvc)
+        await reply(api, ctx, _build_find_guidance_message(query=kw), logsvc)
         return
     if cmd == "get":
         k = conv_key(ctx)
