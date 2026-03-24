@@ -76,3 +76,32 @@ def test_lookup_keyword_answers_returns_empty_when_no_match(monkeypatch) -> None
     monkeypatch.setattr(commands, "_reload_keyword_answer_cache_if_needed", lambda: None)
 
     assert commands._lookup_keyword_answers("bye") == []
+
+
+def test_media_or_emoji_only_message_placeholder_text() -> None:
+    evt = {"message": "[\u56fe\u7247]"}
+    assert commands._is_media_or_emoji_only_message(evt, "[\u56fe\u7247]")
+
+
+def test_media_or_emoji_only_message_cq_image_only() -> None:
+    evt = {"message": "[CQ:image,file=abc.jpg]"}
+    assert commands._is_media_or_emoji_only_message(evt, "[CQ:image,file=abc.jpg]")
+
+
+def test_media_or_emoji_only_message_segment_image_only() -> None:
+    evt = {
+        "message": [
+            {"type": "image", "data": {"file": "abc.jpg"}},
+        ]
+    }
+    assert commands._is_media_or_emoji_only_message(evt, "[\u56fe\u7247]")
+
+
+def test_media_or_emoji_only_message_segment_with_text_is_not_filtered() -> None:
+    evt = {
+        "message": [
+            {"type": "image", "data": {"file": "abc.jpg"}},
+            {"type": "text", "data": {"text": "\u4f60\u597d"}},
+        ]
+    }
+    assert not commands._is_media_or_emoji_only_message(evt, "\u4f60\u597d")

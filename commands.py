@@ -51,6 +51,12 @@ _STATE_SWEEP_MIN_INTERVAL_SECONDS = 30.0
 _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_GROUP_NOTICE_SECONDS = 10.0 * 60.0
+_MEDIA_OR_EMOJI_SEG_TYPES = {"image", "face", "mface", "market_face"}
+_MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
+    r"^\[\s*(?:\u56fe\u7247|\u8868\u60c5|\u52a8\u753b\u8868\u60c5)\s*\]$",
+    flags=re.IGNORECASE,
+)
+_CQ_SEG_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,[^\]]*)?\]")
 _FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
 _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
 
@@ -204,6 +210,41 @@ def _lookup_keyword_answers(text: str) -> List[str]:
             best_key = key
             best_replies = replies
     return list(best_replies or [])
+
+
+def _is_media_or_emoji_only_message(evt: dict, text: str) -> bool:
+    msg = evt.get("message")
+    if isinstance(msg, list):
+        has_text = False
+        has_media_or_emoji = False
+        for seg in msg:
+            if not isinstance(seg, dict):
+                continue
+            tp = str(seg.get("type") or "").strip().lower()
+            if tp == "text":
+                data = seg.get("data") or {}
+                t = str(data.get("text") or "").strip()
+                if t:
+                    has_text = True
+            elif tp in _MEDIA_OR_EMOJI_SEG_TYPES:
+                has_media_or_emoji = True
+        if has_media_or_emoji and (not has_text):
+            return True
+
+    s = str(text or "").strip()
+    if not s:
+        return False
+    if _MEDIA_OR_EMOJI_PLACEHOLDER_RE.fullmatch(s):
+        return True
+    if "[CQ:" in s:
+        types = [x.lower() for x in _CQ_SEG_RE.findall(s)]
+        if types:
+            tail = _CQ_SEG_RE.sub("", s).strip()
+            if (not tail) and all(tp in _MEDIA_OR_EMOJI_SEG_TYPES for tp in types):
+                return True
+    return False
+
+
 def _fmt_mb(n_bytes: int) -> str:
     try:
         return f"{(float(n_bytes) / (1024 * 1024)):.2f}MB"
@@ -2064,6 +2105,7 @@ async def _handle_ai_chat_trigger(
 async def _handle_plain_text_input(
     api,
     ctx,
+    evt: dict,
     t: str,
     logsvc: LogService,
     state: BotState,
@@ -2076,6 +2118,8 @@ async def _handle_plain_text_input(
         if fixed_answers:
             for msg in fixed_answers:
                 await reply(api, ctx, msg, logsvc)
+            return True
+        if _is_media_or_emoji_only_message(evt, t):
             return True
         keyword_answers = _lookup_keyword_answers(t)
         if keyword_answers:
@@ -2698,7 +2742,7 @@ async def dispatch(
     logsvc.log_in(ctx, t)
     if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc):
         return
-    if await _handle_plain_text_input(api, ctx, t, logsvc, state):
+    if await _handle_plain_text_input(api, ctx, evt, t, logsvc, state):
         return
     await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc)
 
