@@ -1,0 +1,43 @@
+# Keyword reply config (separate from answer.txt)
+# This file is only for "message contains keyword" matching.
+# It shares the same block format as answer.txt:
+# 1) q: trigger keyword (multiple q: lines = synonyms)
+# 2) a: one-line reply (multiple a: lines = multiple messages)
+# 3) a:| multi-line reply (following lines must start with two spaces or one tab)
+# 4) empty line ends current block
+#
+# Example:
+# q:hello
+# q:hi
+# a:hello
+#
+# q:manual
+# a:|
+#   line 1
+#   line 2
+
+q:原神
+a:唉原批
+
+q:三国杀
+a:唉蒸批
+
+q:雀魂
+q:麻将
+a:唉麻批
+
+q:repo
+q:REPO
+a:什么搜打撤游戏
+
+q:农
+q:打农
+q:王者
+a:唉农批
+
+q:二游
+q:二次元
+q:动画
+q:ciallo
+q:Ciallo
+a:唉臭二次元

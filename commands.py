@@ -38,6 +38,9 @@ LARGE_FILE_WARN_BYTES = int(LARGE_FILE_WARN_MB) * 1024 * 1024
 ANSWER_FILE_PATH = Path(__file__).resolve().parent / "answer.txt"
 _ANSWER_CACHE_MTIME: Optional[float] = None
 _ANSWER_CACHE: Dict[str, List[str]] = {}
+KEYWORD_ANSWER_FILE_PATH = Path(__file__).resolve().parent / "keyword_answer.txt"
+_KEYWORD_ANSWER_CACHE_MTIME: Optional[float] = None
+_KEYWORD_ANSWER_CACHE: Dict[str, List[str]] = {}
 _GROUP_NOTICE_FILE_SUFFIXES = {".pdf", ".doc", ".docx"}
 _URL_RE = re.compile(r"(https?://[^\s<>\"]+)", flags=re.IGNORECASE)
 _GROUP_NOTICE_MAX_CANDIDATES = 3
@@ -160,9 +163,47 @@ def _reload_answer_cache_if_needed() -> None:
     except Exception:
         _ANSWER_CACHE = {}
     _ANSWER_CACHE_MTIME = mtime
+
+
+def _reload_keyword_answer_cache_if_needed() -> None:
+    global _KEYWORD_ANSWER_CACHE_MTIME, _KEYWORD_ANSWER_CACHE
+    try:
+        mtime = float(KEYWORD_ANSWER_FILE_PATH.stat().st_mtime)
+    except Exception:
+        _KEYWORD_ANSWER_CACHE = {}
+        _KEYWORD_ANSWER_CACHE_MTIME = None
+        return
+    if _KEYWORD_ANSWER_CACHE_MTIME is not None and abs(_KEYWORD_ANSWER_CACHE_MTIME - mtime) < 1e-6:
+        return
+    try:
+        txt = KEYWORD_ANSWER_FILE_PATH.read_text(encoding="utf-8")
+        _KEYWORD_ANSWER_CACHE = _parse_answer_txt(txt)
+    except Exception:
+        _KEYWORD_ANSWER_CACHE = {}
+    _KEYWORD_ANSWER_CACHE_MTIME = mtime
+
+
 def _lookup_fixed_answers(text: str) -> List[str]:
     _reload_answer_cache_if_needed()
     return list(_ANSWER_CACHE.get(_normalize_answer_q(text), []))
+
+
+def _lookup_keyword_answers(text: str) -> List[str]:
+    _reload_keyword_answer_cache_if_needed()
+    normalized = _normalize_answer_q(text)
+    if not normalized:
+        return []
+
+    # 关键词触发：选最长关键词，长度相同按 keyword_answer.txt 中出现顺序。
+    best_key = ""
+    best_replies: Optional[List[str]] = None
+    for key, replies in _KEYWORD_ANSWER_CACHE.items():
+        if not key or key not in normalized:
+            continue
+        if (best_replies is None) or (len(key) > len(best_key)):
+            best_key = key
+            best_replies = replies
+    return list(best_replies or [])
 def _fmt_mb(n_bytes: int) -> str:
     try:
         return f"{(float(n_bytes) / (1024 * 1024)):.2f}MB"
@@ -2034,6 +2075,11 @@ async def _handle_plain_text_input(
         fixed_answers = _lookup_fixed_answers(t)
         if fixed_answers:
             for msg in fixed_answers:
+                await reply(api, ctx, msg, logsvc)
+            return True
+        keyword_answers = _lookup_keyword_answers(t)
+        if keyword_answers:
+            for msg in keyword_answers:
                 await reply(api, ctx, msg, logsvc)
             return True
         return True
