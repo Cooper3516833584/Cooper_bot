@@ -441,12 +441,19 @@ async def reply(
             return f"retcode={rc} {msg}"
         return f"retcode={rc}" if rc != "" else "send failed"
 
+    skip_context_once = False
+    try:
+        skip_context_once = bool(getattr(ctx, "_skip_reply_context_once", False))
+        if skip_context_once:
+            setattr(ctx, "_skip_reply_context_once", False)
+    except Exception:
+        skip_context_once = False
+
     target = f"g:{send_group_id}" if send_scene == "group" and send_group_id is not None else f"u:{send_user_id}"
     reply_key = f"{send_scene}:{target}:{text.strip()}"
     if not _claim_recent_reply(reply_key):
         logsvc.log.info(f"消息发送去重：已拦截重复回复 target={target}")
         return
-
     resp = await _send_once()
     if resp is None:
         logsvc.log.info(
@@ -460,6 +467,8 @@ async def reply(
 
     if _ok(resp):
         logsvc.log_out(ctx, text)
+        if not skip_context_once:
+            _remember_bot_reply_message(ctx, text, logsvc, send_scene, send_group_id, send_user_id)
     else:
         logsvc.log.warning(
             f"reply send failed: scene={send_scene}, group={send_group_id}, user={send_user_id}, detail={_detail(resp)}"
@@ -738,6 +747,94 @@ def _ai_chat_session_key(ctx) -> Optional[str]:
         except Exception:
             return None
     return None
+
+
+def _remember_non_ai_chat_message(ctx, text: str, logsvc: LogService, aisvc: Optional["AIService"] = None) -> None:
+    if aisvc is None:
+        return
+    remember_fn = getattr(aisvc, "remember_user_message", None)
+    if not callable(remember_fn):
+        return
+    session_key = _ai_chat_session_key(ctx)
+    if not session_key:
+        return
+    try:
+        remember_fn(session_key, text)
+    except Exception as e:
+        logsvc.log.warning(f"AI chat context non-aichat write failed: session={session_key[:80]} err={e}")
+
+
+def _ai_chat_session_key_for_target(scene: str, group_id: Optional[int], user_id: Optional[int]) -> Optional[str]:
+    s = str(scene or "").strip().lower()
+    if s == "group":
+        if group_id is None:
+            return None
+        try:
+            return f"group:{int(group_id)}"
+        except Exception:
+            return None
+    if s.startswith("private"):
+        if user_id is None:
+            return None
+        try:
+            return f"private:{int(user_id)}"
+        except Exception:
+            return None
+    return None
+
+
+def _remember_bot_reply_message(
+    ctx,
+    text: str,
+    logsvc: LogService,
+    send_scene: str,
+    send_group_id: Optional[int],
+    send_user_id: Optional[int],
+) -> None:
+    aisvc = getattr(ctx, "_ai_chat_context_aisvc", None)
+    if aisvc is None:
+        return
+    remember_fn = getattr(aisvc, "remember_assistant_message", None)
+    if not callable(remember_fn):
+        return
+    session_key = _ai_chat_session_key_for_target(send_scene, send_group_id, send_user_id)
+    if not session_key:
+        return
+    try:
+        remember_fn(session_key, text)
+    except Exception as e:
+        logsvc.log.warning(f"AI chat context bot-reply write failed: session={session_key[:80]} err={e}")
+
+
+def _remember_notice_digest_context(
+    ctx,
+    source: str,
+    out: str,
+    logsvc: LogService,
+    aisvc: Optional["AIService"] = None,
+) -> bool:
+    if aisvc is None:
+        return False
+    session_key = _ai_chat_session_key(ctx)
+    if not session_key:
+        return False
+
+    try:
+        remember_user_fn = getattr(aisvc, "remember_user_message", None)
+        if callable(remember_user_fn):
+            remember_user_fn(session_key, str(source or ""))
+    except Exception as e:
+        logsvc.log.warning(f"AI chat context notice-source write failed: session={session_key[:80]} err={e}")
+
+    assistant_saved = False
+    try:
+        remember_assistant_fn = getattr(aisvc, "remember_assistant_message", None)
+        if callable(remember_assistant_fn):
+            remember_assistant_fn(session_key, str(out or ""))
+            assistant_saved = True
+    except Exception as e:
+        logsvc.log.warning(f"AI chat context notice-reply write failed: session={session_key[:80]} err={e}")
+    return assistant_saved
 
 
 def _is_notice_file_name(name: str) -> bool:
@@ -1073,6 +1170,12 @@ async def _run_group_notice_digest(
                 logsvc.log.info(f"群通知解析：生成结果为静默或空内容 kind={kind} target={debug_target[:160]}")
                 continue
 
+            notice_ctx_saved = _remember_notice_digest_context(ctx, source, out, logsvc, aisvc)
+            if notice_ctx_saved:
+                try:
+                    setattr(ctx, "_skip_reply_context_once", True)
+                except Exception:
+                    pass
             await reply(api, ctx, out, logsvc)
             logsvc.log.info(f"群通知解析：已发送回复 kind={kind} target={debug_target[:160]}")
             return
@@ -1095,6 +1198,10 @@ def _schedule_group_notice_digest(
         return
     if not getattr(aisvc, "notice_ready", False):
         return
+    try:
+        setattr(ctx, "_ai_chat_context_aisvc", aisvc)
+    except Exception:
+        pass
     task = asyncio.create_task(_run_group_notice_digest(api, ctx, evt, text, logsvc, state, handin, aisvc))
 
     def _done(t: asyncio.Task) -> None:
@@ -2092,6 +2199,10 @@ async def _handle_ai_chat_trigger(
             session_key = _ai_chat_session_key(ctx)
             if session_key:
                 out = (await aisvc.chat_with_context(session_key, ai_input)).strip()
+                try:
+                    setattr(ctx, "_skip_reply_context_once", True)
+                except Exception:
+                    pass
             else:
                 out = (await aisvc.chat(ai_input)).strip()
             if not out:
@@ -2731,6 +2842,10 @@ async def dispatch(
     perm=None,
     aisvc: Optional["AIService"] = None,
 ):
+    try:
+        setattr(ctx, "_ai_chat_context_aisvc", aisvc)
+    except Exception:
+        pass
     _sweep_bot_state_ttl(state)
     await _ensure_group_context_and_schedule_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
     if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc):
@@ -2742,6 +2857,7 @@ async def dispatch(
     logsvc.log_in(ctx, t)
     if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc):
         return
+    _remember_non_ai_chat_message(ctx, t, logsvc, aisvc)
     if await _handle_plain_text_input(api, ctx, evt, t, logsvc, state):
         return
     await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc)

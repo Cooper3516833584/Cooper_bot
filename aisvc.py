@@ -81,7 +81,7 @@ class AIService:
     _ALLOWED_SUFFIXES = {".pdf", ".doc", ".docx", ".ppt", ".pptx"}
     _EBOOK_SUFFIXES = {".epub", ".mobi"}
     _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
-    _CHAT_CONTEXT_MAX_TURNS = 15
+    _CHAT_CONTEXT_MAX_MESSAGES = 100
     _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
     _AUTO_ORGANIZE_EBOOK_SUBJECT = "课外书"
     _AUTO_ORGANIZE_MARKS_FILENAME = "ai_material_scan_marks.json"
@@ -190,6 +190,12 @@ class AIService:
 
     async def chat_with_context(self, session_key: str, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
+
+    def remember_user_message(self, session_key: str, message_text: str) -> None:
+        self._remember_chat_message(session_key, "user", message_text)
+
+    def remember_assistant_message(self, session_key: str, message_text: str) -> None:
+        self._remember_chat_message(session_key, "assistant", message_text)
 
     async def extract_notice_file_head(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         return await asyncio.to_thread(
@@ -2416,19 +2422,9 @@ class AIService:
             if normalized is None:
                 return None
             out.append(normalized)
-
-        if (len(out) % 2) != 0:
-            return None
-        for i in range(0, len(out), 2):
-            if out[i].get("role") != "user":
-                return None
-            if out[i + 1].get("role") != "assistant":
-                return None
-
-        max_turns = max(1, int(self._CHAT_CONTEXT_MAX_TURNS))
-        max_items = max_turns * 2
-        if len(out) > max_items:
-            out = out[-max_items:]
+        max_messages = max(1, int(self._CHAT_CONTEXT_MAX_MESSAGES))
+        if len(out) > max_messages:
+            out = out[-max_messages:]
         return out
 
     def _load_active_chat_history(self, session_key: str, now_ts: Optional[float] = None) -> List[Dict[str, str]]:
@@ -2476,11 +2472,28 @@ class AIService:
         checked = self._validate_and_trim_chat_history(out)
         if checked is None:
             self._chat_sessions.pop(session_key, None)
-            self.log.warning(f"AI chat context invalid turn structure, reset: session={session_key[:80]}")
+            self.log.warning(f"AI chat context invalid message structure, reset: session={session_key[:80]}")
             return []
         if len(checked) != len(out):
             self._chat_sessions[session_key] = {"messages": checked, "last_active_ts": last_active_ts}
         return checked
+
+    def _remember_chat_message(self, session_key: str, role: str, content: str) -> None:
+        key = str(session_key or "").strip()
+        if not key:
+            return
+        msg = self._normalize_chat_history_item({"role": role, "content": content})
+        if msg is None:
+            return
+        now_ts = float(time.time())
+        with self._chat_sessions_lock:
+            history = self._load_active_chat_history_locked(key, now_ts)
+            history.append(msg)
+            checked = self._validate_and_trim_chat_history(history)
+            if checked is None:
+                checked = [msg]
+                self.log.warning(f"AI chat context invalid after append, reset to current message: session={key[:80]}")
+            self._chat_sessions[key] = {"messages": checked, "last_active_ts": now_ts}
 
     def _save_chat_turn(self, session_key: str, user_input: str, assistant_output: str) -> None:
         key = str(session_key or "").strip()

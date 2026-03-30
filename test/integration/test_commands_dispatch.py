@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -106,10 +107,18 @@ class _FakeAIService:
     def __init__(self) -> None:
         self.bot_nick = "Cooepr_bot"
         self.chat_ready = True
+        self.notice_ready = True
         self.semantic_ready = False
         self.fallback_error_reply = "fallback"
+        self.remember_user_message = Mock()
+        self.remember_assistant_message = Mock()
         self.chat_with_context = AsyncMock(return_value="fake-ai-reply")
         self.chat = AsyncMock(return_value="fake-ai-reply")
+        self.extract_notice_url_head = AsyncMock(return_value="")
+        self.classify_notice = AsyncMock(return_value=False)
+        self.reason_notice = AsyncMock(return_value="")
+        self.sanitize_reasoner_output = lambda text: str(text)
+        self.is_notice_silent = lambda _text: False
         self.semantic_find_paths = AsyncMock(return_value=[])
 
 
@@ -250,6 +259,129 @@ async def test_command_private_vs_group_route(dispatch_harness) -> None:
     session_keys = {call.args[0] for call in aisvc.chat_with_context.await_args_list}
     assert f"private:{private_ctx.user_id}" in session_keys
     assert f"group:{group_ctx.group_id}" in session_keys
+
+
+@pytest.mark.asyncio
+async def test_non_aichat_message_is_remembered_for_context(dispatch_harness) -> None:
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+    ctx = _make_ctx(scene="group", group_id=20001, level=1, user_id=10002)
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="/find calculus",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.remember_user_message.assert_called_once_with(f"group:{ctx.group_id}", "/find calculus")
+
+
+@pytest.mark.asyncio
+async def test_non_aichat_auto_reply_is_remembered_for_context(monkeypatch) -> None:
+    async def _noop_group_context(*_args, **_kwargs):
+        return None
+
+    async def _noop_pre_state(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(commands, "_ensure_group_context_and_schedule_digest", _noop_group_context)
+    monkeypatch.setattr(commands, "_handle_pre_dispatch_state", _noop_pre_state)
+
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+    ctx = _make_ctx(scene="group", group_id=20001, level=1, user_id=10002)
+
+    await commands.dispatch(
+        api=SimpleNamespace(send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0})),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="/ping",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.remember_assistant_message.assert_called_with(f"group:{ctx.group_id}", "pong")
+
+
+@pytest.mark.asyncio
+async def test_aichat_reply_does_not_duplicate_assistant_memory(monkeypatch) -> None:
+    async def _noop_group_context(*_args, **_kwargs):
+        return None
+
+    async def _noop_pre_state(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(commands, "_ensure_group_context_and_schedule_digest", _noop_group_context)
+    monkeypatch.setattr(commands, "_handle_pre_dispatch_state", _noop_pre_state)
+
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=1, user_id=10001)
+
+    await commands.dispatch(
+        api=SimpleNamespace(send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0})),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="C你好",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.remember_assistant_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_link_digest_reply_is_remembered_in_aichat_context(monkeypatch) -> None:
+    async def _noop_pre_state(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(commands, "_handle_pre_dispatch_state", _noop_pre_state)
+
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+    aisvc.extract_notice_url_head = AsyncMock(return_value="preview text")
+    aisvc.classify_notice = AsyncMock(return_value=True)
+    aisvc.reason_notice = AsyncMock(return_value="digest-reply")
+    aisvc.sanitize_reasoner_output = lambda text: str(text)
+    aisvc.is_notice_silent = lambda _text: False
+    ctx = _make_ctx(scene="group", group_id=20001, level=1, user_id=10002)
+
+    await commands.dispatch(
+        api=SimpleNamespace(send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0})),
+        ctx=ctx,
+        evt={
+            "post_type": "message",
+            "message_type": "group",
+            "message": [{"type": "text", "data": {"text": "https://example.com/notice"}}],
+            "raw_message": "https://example.com/notice",
+        },
+        text="https://example.com/notice",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    await asyncio.sleep(0.05)
+
+    aisvc.remember_assistant_message.assert_called_once_with(f"group:{ctx.group_id}", "digest-reply")
 
 
 @pytest.mark.asyncio

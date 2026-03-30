@@ -69,19 +69,34 @@ def test_chat_context_expires_after_30_minutes(monkeypatch, controlled_time) -> 
     assert second_messages[-1]["content"] == "second"
 
 
-def test_chat_context_trims_to_latest_15_turns(controlled_time) -> None:
+def test_chat_context_trims_to_latest_100_messages(controlled_time) -> None:
     svc = _new_service()
     session = "group:30001"
 
-    for i in range(20):
+    for i in range(70):
         svc._save_chat_turn(session, f"q{i}", f"a{i}")
         controlled_time.advance(1)
 
     history = svc._load_active_chat_history(session)
-    assert len(history) == 30
-    assert history[0] == {"role": "user", "content": "q5"}
-    assert history[1] == {"role": "assistant", "content": "a5"}
-    assert history[-1] == {"role": "assistant", "content": "a19"}
+    assert len(history) == 100
+    assert history[0] == {"role": "user", "content": "q20"}
+    assert history[1] == {"role": "assistant", "content": "a20"}
+    assert history[-1] == {"role": "assistant", "content": "a69"}
+
+
+def test_chat_context_keeps_non_aichat_user_messages(controlled_time) -> None:
+    svc = _new_service()
+    session = "group:30002"
+
+    svc.remember_user_message(session, "normal-1")
+    controlled_time.advance(1)
+    svc.remember_user_message(session, "normal-2")
+
+    history = svc._load_active_chat_history(session)
+    assert history == [
+        {"role": "user", "content": "normal-1"},
+        {"role": "user", "content": "normal-2"},
+    ]
 
 
 def test_chat_context_isolated_between_group_and_private(monkeypatch, controlled_time) -> None:
@@ -107,7 +122,7 @@ def test_chat_context_invalid_history_resets_but_session_still_works(monkeypatch
 
     svc._chat_sessions["group:broken"] = {
         "last_active_ts": controlled_time.time(),
-        "messages": [{"role": "assistant", "content": "bad-structure"}],
+        "messages": [{"role": "system", "content": "bad-structure"}],
     }
 
     out = svc._chat_with_context_sync("group:broken", "fresh question")
