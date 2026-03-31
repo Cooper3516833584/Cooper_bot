@@ -60,6 +60,8 @@ _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
 _CQ_SEG_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,[^\]]*)?\]")
 _COUNT_NAME_SPLIT_RE = re.compile(r"[\s,，、;；/|]+")
 _COUNT_NAME_PREFIX_RE = re.compile(r"^[\d\.\)\(、\-_:：]+")
+_COUNT_END_RE = re.compile(r"^/?end[\s。.!！?？]*$", flags=re.IGNORECASE)
+_COUNT_END_CN_RE = re.compile(r"^结束[\s。.!！?？]*$")
 _FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
 _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
 
@@ -496,9 +498,16 @@ def _split_args(text: str):
 
 
 def _parse_count_names(text: str) -> List[str]:
-    raw = str(text or "").strip()
+    raw = unicodedata.normalize("NFKC", str(text or "")).strip()
     if not raw:
         return []
+    # 兼容常见输入：
+    # - 行首编号：1、张三 / 2.李四 / 3)王五
+    # - 行内连续编号：1. 张三 2. 李四
+    # - CQ @ 段
+    raw = re.sub(r"\d+\s*[、,，.\)）:：\-]\s*", "\n", raw)
+    raw = re.sub(r"(?i)\[CQ:at,[^\]]+\]", " ", raw)
+
     out: List[str] = []
     for one in _COUNT_NAME_SPLIT_RE.split(raw):
         token = _COUNT_NAME_PREFIX_RE.sub("", one.strip())
@@ -506,6 +515,15 @@ def _parse_count_names(text: str) -> List[str]:
         if token:
             out.append(token)
     return out
+
+
+def _is_count_end_input(text: str) -> bool:
+    s = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if not s:
+        return False
+    if _COUNT_END_RE.fullmatch(s):
+        return True
+    return bool(_COUNT_END_CN_RE.fullmatch(s))
 
 
 def _dedup_names_keep_order(names: List[str]) -> List[str]:
@@ -528,6 +546,7 @@ def _build_count_list_text(submitted_names: List[str], roster: List[Tuple[str, s
     if submitted:
         for i, name in enumerate(submitted, 1):
             lines.append(f"{i}. {name}")
+        lines.append("可用 /countremove 序号 移除已提交名单中的人名。")
     else:
         lines.append("（暂无）")
 
@@ -562,6 +581,7 @@ def _build_count_list_text(submitted_names: List[str], roster: List[Tuple[str, s
         lines.append("不在班级名册中的已提交姓名：")
         for i, name in enumerate(outside_roster, 1):
             lines.append(f"{i}. {name}")
+        lines.append("（可按其在“已提交名单”中的序号使用 /countremove）")
     return "\n".join(lines)
 
 
@@ -2204,7 +2224,17 @@ async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogServ
     return True
 
 
-async def _handle_count_name_input(api, ctx, text: str, logsvc: LogService, state: BotState) -> bool:
+async def _handle_count_name_input(
+    api,
+    ctx,
+    evt: dict,
+    text: str,
+    logsvc: LogService,
+    state: BotState,
+    aisvc: Optional["AIService"] = None,
+) -> bool:
+    _ = evt
+    _ = aisvc
     session_key = conv_key(ctx)
     session = state.pending_count_session.get(session_key)
     if not isinstance(session, dict):
@@ -2213,15 +2243,24 @@ async def _handle_count_name_input(api, ctx, text: str, logsvc: LogService, stat
     t = str(text or "").strip()
     if not t:
         return True
-    if t.startswith("/") or t.startswith("／"):
-        return False
-
-    logsvc.log_in(ctx, t)
-    if t.casefold() == "end":
+    if _is_count_end_input(t):
+        logsvc.log_in(ctx, t)
         state.pending_count_session.pop(session_key, None)
         await reply(api, ctx, "本次 /count 统计已结束，临时名单已清空。", logsvc)
         return True
+    if t.startswith("/") or t.startswith("／"):
+        plain = t[1:].strip()
+        if not plain:
+            return True
+        cmdx, _rest = _split_args(plain)
+        cmdx = str(cmdx or "").lower()
+        if cmdx in ("count", "countlist", "countremove"):
+            return False
+        logsvc.log_in(ctx, t)
+        await reply(api, ctx, "当前处于 /count 统计模式，请先发送 end 结束后再使用其他功能。", logsvc)
+        return True
 
+    logsvc.log_in(ctx, t)
     raw_names = _parse_count_names(t)
     if not raw_names:
         session["ts"] = time.time()
@@ -2281,6 +2320,7 @@ async def _handle_pre_dispatch_state(
     state: BotState,
     handin: HandinService,
     filesvc: FileService,
+    aisvc: Optional["AIService"] = None,
 ):
     if ctx.scene.startswith("private"):
         handled = await _handle_private_file(api, ctx, evt, logsvc, state, handin)
@@ -2301,7 +2341,7 @@ async def _handle_pre_dispatch_state(
         handled = await _handle_private_number_choice(api, ctx, text, logsvc, state, handin, filesvc)
         if handled:
             return True
-    handled = await _handle_count_name_input(api, ctx, text, logsvc, state)
+    handled = await _handle_count_name_input(api, ctx, evt, text, logsvc, state, aisvc)
     if handled:
         return True
     handled = await _handle_cancel_number_choice(api, ctx, text, logsvc, state, handin)
@@ -2496,7 +2536,7 @@ async def _handle_explicit_command(
         key = conv_key(ctx)
         session = state.pending_count_session.get(key)
         if not isinstance(session, dict):
-            await reply(api, ctx, "当前没有进行中的 /count 统计，请先发送 /count。", logsvc)
+            await reply(api, ctx, "当前会话没有进行中的 /count 统计，请先在本会话发送 /count。", logsvc)
             return
         session["ts"] = time.time()
         names = _dedup_names_keep_order(list(session.get("names") or []))
@@ -2510,6 +2550,26 @@ async def _handle_explicit_command(
                 roster = []
         await reply(api, ctx, _build_count_list_text(names, roster), logsvc)
         return
+    if cmd == "countremove":
+        key = conv_key(ctx)
+        session = state.pending_count_session.get(key)
+        if not isinstance(session, dict):
+            await reply(api, ctx, "当前会话没有进行中的 /count 统计，请先在本会话发送 /count。", logsvc)
+            return
+        arg = (rest or "").strip()
+        if not re.fullmatch(r"\d{1,4}", arg):
+            await reply(api, ctx, "用法：/countremove 序号（序号来自 /countlist 的“已提交名单”）", logsvc)
+            return
+        idx = int(arg)
+        names = _dedup_names_keep_order(list(session.get("names") or []))
+        if idx < 1 or idx > len(names):
+            await reply(api, ctx, f"序号无效：{idx}（当前已提交名单共 {len(names)} 人）", logsvc)
+            return
+        removed = names.pop(idx - 1)
+        session["names"] = names
+        session["ts"] = time.time()
+        await reply(api, ctx, f"已移除：{removed}\n当前已提交 {len(names)} 人。可发送 /countlist 查看。", logsvc)
+        return
     if cmd in ("help", "h"):
         lines = [
             "命令速览：",
@@ -2517,8 +2577,9 @@ async def _handle_explicit_command(
             "/help 或 /h",
             "/ping",
             "/whoami",
-            "/count  开始临时收集名单（发送 end 结束并清空）",
+            "/count  开始临时收集名单（模式内仅收集名单；发送 end 结束并清空）",
             "/countlist  查看已提交名单和未交名单",
+            "/countremove 序号  移除已提交名单中的人名",
         ]
         if ctx.level >= 3:
             lines.extend([
@@ -3019,7 +3080,7 @@ async def dispatch(
         pass
     _sweep_bot_state_ttl(state)
     await _ensure_group_context_and_schedule_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
-    if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc):
+    if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc, aisvc):
         return
     t = (text or "").strip()
     if not t:

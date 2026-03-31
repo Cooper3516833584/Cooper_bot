@@ -40,6 +40,18 @@ def _make_filesvc() -> SimpleNamespace:
     return SimpleNamespace(roots=[SimpleNamespace(name="public"), SimpleNamespace(name="friend")])
 
 
+def _make_private_ctx() -> SimpleNamespace:
+    return SimpleNamespace(
+        scene="private_friend",
+        user_id=10001,
+        nickname="tester",
+        card="tester",
+        group_id=None,
+        group_name=None,
+        level=1,
+    )
+
+
 @pytest.mark.asyncio
 async def test_count_flow_collect_countlist_and_end(monkeypatch) -> None:
     replies: list[str] = []
@@ -130,9 +142,9 @@ async def test_count_flow_collect_countlist_and_end(monkeypatch) -> None:
     assert "没有进行中的 /count 统计" in replies[-1]
 
 
-def test_parse_count_names_supports_multiple_separators() -> None:
-    names = commands._parse_count_names("1.Alice，Bob / Carol； 2)Dave")
-    assert names == ["Alice", "Bob", "Carol", "Dave"]
+def test_parse_count_names_supports_numbered_multiline() -> None:
+    names = commands._parse_count_names("1、Alice\n2、Bob\n3)Carol\n4.Dave\n5.   Eve  6.Frank")
+    assert names == ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"]
 
 
 @pytest.mark.asyncio
@@ -160,3 +172,163 @@ async def test_help_includes_count_commands(monkeypatch) -> None:
     assert replies
     assert "/count  开始临时收集名单" in replies[-1]
     assert "/countlist  查看已提交名单和未交名单" in replies[-1]
+    assert "/countremove 序号" in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_count_end_accepts_slash_and_punctuation(monkeypatch) -> None:
+    replies: list[str] = []
+
+    async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
+        _ = force_private_user_id
+        replies.append(str(text))
+
+    monkeypatch.setattr(commands, "reply", _fake_reply)
+
+    state = commands.BotState()
+    ctx = _make_ctx()
+    key = commands.conv_key(ctx)
+    state.pending_count_session[key] = {"names": ["Alice"], "ts": 1.0}
+
+    handled = await commands._handle_pre_dispatch_state(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="/END。",
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=SimpleNamespace(_tasks={}),
+        filesvc=_make_filesvc(),
+    )
+
+    assert handled is True
+    assert key not in state.pending_count_session
+    assert replies
+    assert "已结束" in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_count_mode_collects_plain_text_even_if_like_ai_content(monkeypatch) -> None:
+    replies: list[str] = []
+
+    async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
+        _ = force_private_user_id
+        replies.append(str(text))
+
+    monkeypatch.setattr(commands, "reply", _fake_reply)
+
+    state = commands.BotState()
+    ctx = _make_ctx()
+    key = commands.conv_key(ctx)
+    state.pending_count_session[key] = {"names": ["Alice"], "ts": 1.0}
+
+    handled = await commands._handle_pre_dispatch_state(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="朱稷",
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=SimpleNamespace(_tasks={}),
+        filesvc=_make_filesvc(),
+    )
+
+    assert handled is True
+    assert state.pending_count_session[key]["names"] == ["Alice", "朱稷"]
+    assert replies
+    assert "已记录" in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_count_mode_blocks_other_commands(monkeypatch) -> None:
+    replies: list[str] = []
+
+    async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
+        _ = force_private_user_id
+        replies.append(str(text))
+
+    monkeypatch.setattr(commands, "reply", _fake_reply)
+
+    state = commands.BotState()
+    ctx = _make_ctx()
+    key = commands.conv_key(ctx)
+    state.pending_count_session[key] = {"names": ["Alice"], "ts": 1.0}
+
+    handled = await commands._handle_pre_dispatch_state(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="/ping",
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=SimpleNamespace(_tasks={}),
+        filesvc=_make_filesvc(),
+    )
+
+    assert handled is True
+    assert state.pending_count_session[key]["names"] == ["Alice"]
+    assert replies
+    assert "/count 统计模式" in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_countlist_is_bound_to_same_context(monkeypatch) -> None:
+    replies: list[str] = []
+
+    async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
+        _ = force_private_user_id
+        replies.append(str(text))
+
+    monkeypatch.setattr(commands, "reply", _fake_reply)
+
+    state = commands.BotState()
+    group_ctx = _make_ctx()
+    private_ctx = _make_private_ctx()
+    state.pending_count_session[commands.conv_key(group_ctx)] = {"names": ["Alice"], "ts": 1.0}
+
+    await commands._handle_explicit_command(
+        api=SimpleNamespace(),
+        ctx=private_ctx,
+        t="/countlist",
+        filesvc=_make_filesvc(),
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=SimpleNamespace(_tasks={}, _get_roster=lambda: [("U1", "Alice")]),
+        perm=None,
+        aisvc=None,
+    )
+
+    assert replies
+    assert "当前会话没有进行中的 /count 统计" in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_countremove_removes_by_submitted_index(monkeypatch) -> None:
+    replies: list[str] = []
+
+    async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
+        _ = force_private_user_id
+        replies.append(str(text))
+
+    monkeypatch.setattr(commands, "reply", _fake_reply)
+
+    state = commands.BotState()
+    ctx = _make_ctx()
+    key = commands.conv_key(ctx)
+    state.pending_count_session[key] = {"names": ["Alice", "Bob", "Outsider"], "ts": 1.0}
+
+    await commands._handle_explicit_command(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        t="/countremove 3",
+        filesvc=_make_filesvc(),
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=SimpleNamespace(_tasks={}),
+        perm=None,
+        aisvc=None,
+    )
+
+    assert state.pending_count_session[key]["names"] == ["Alice", "Bob"]
+    assert replies
+    assert "已移除：Outsider" in replies[-1]
