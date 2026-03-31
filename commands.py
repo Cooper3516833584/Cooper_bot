@@ -50,6 +50,7 @@ _RECENT_REPLY_KEYS: Dict[str, float] = {}
 _STATE_SWEEP_MIN_INTERVAL_SECONDS = 30.0
 _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
+_STATE_TTL_PENDING_COUNT_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_GROUP_NOTICE_SECONDS = 10.0 * 60.0
 _MEDIA_OR_EMOJI_SEG_TYPES = {"image", "face", "mface", "market_face"}
 _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
@@ -57,6 +58,8 @@ _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _CQ_SEG_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,[^\]]*)?\]")
+_COUNT_NAME_SPLIT_RE = re.compile(r"[\s,，、;；/|]+")
+_COUNT_NAME_PREFIX_RE = re.compile(r"^[\d\.\)\(、\-_:：]+")
 _FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
 _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
 
@@ -283,6 +286,8 @@ class BotState:
     pending_handin_choose: Dict[int, dict] = field(default_factory=dict)
     # Handin: user_id -> {"task_id": str, "path": str, "name": str, "ts": float}
     pending_handin_overwrite: Dict[int, dict] = field(default_factory=dict)
+    # Count: conv_key -> {"names": [str, ...], "ts": float}
+    pending_count_session: Dict[str, dict] = field(default_factory=dict)
     # Group notice digest dedup cache: notice_key -> ts
     recent_group_notice_keys: Dict[str, float] = field(default_factory=dict)
     # Opportunistic cleanup guard.
@@ -375,6 +380,14 @@ def _sweep_bot_state_ttl(state: BotState, *, now: Optional[float] = None, force:
             latest = now_ts
         if latest < stale_pending_before:
             _clear_pending_handin_user(state, uid)
+
+    stale_count_before = now_ts - _STATE_TTL_PENDING_COUNT_SECONDS
+    for ck, item in list(state.pending_count_session.items()):
+        ts = _entry_ts(item)
+        if ts <= 0.0:
+            ts = now_ts
+        if ts < stale_count_before:
+            state.pending_count_session.pop(ck, None)
 
     stale_notice_before = now_ts - _STATE_TTL_GROUP_NOTICE_SECONDS
     for k, ts in list(state.recent_group_notice_keys.items()):
@@ -480,6 +493,76 @@ def _split_args(text: str):
     cmd = parts[0]
     rest = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
     return cmd, rest
+
+
+def _parse_count_names(text: str) -> List[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    out: List[str] = []
+    for one in _COUNT_NAME_SPLIT_RE.split(raw):
+        token = _COUNT_NAME_PREFIX_RE.sub("", one.strip())
+        token = token.strip().strip("，、,;；。.!！?？")
+        if token:
+            out.append(token)
+    return out
+
+
+def _dedup_names_keep_order(names: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for one in names:
+        name = str(one or "").strip()
+        if (not name) or (name in seen):
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _build_count_list_text(submitted_names: List[str], roster: List[Tuple[str, str]]) -> str:
+    submitted = _dedup_names_keep_order(submitted_names or [])
+
+    lines: List[str] = []
+    lines.append(f"已提交名单（{len(submitted)}）：")
+    if submitted:
+        for i, name in enumerate(submitted, 1):
+            lines.append(f"{i}. {name}")
+    else:
+        lines.append("（暂无）")
+
+    roster_names: List[str] = []
+    seen_roster = set()
+    for _, nm in roster or []:
+        name = str(nm or "").strip()
+        if (not name) or (name in seen_roster):
+            continue
+        seen_roster.add(name)
+        roster_names.append(name)
+
+    if not roster_names:
+        lines.append("")
+        lines.append("⚠️ 班级名册不可用，暂时无法计算未交名单。")
+        return "\n".join(lines)
+
+    submitted_set = set(submitted)
+    missing = [name for name in roster_names if name not in submitted_set]
+    outside_roster = [name for name in submitted if name not in seen_roster]
+
+    lines.append("")
+    lines.append(f"未交名单（{len(missing)}）：")
+    if missing:
+        for i, name in enumerate(missing, 1):
+            lines.append(f"{i}. {name}")
+    else:
+        lines.append("✅ 无，已全部提交。")
+
+    if outside_roster:
+        lines.append("")
+        lines.append("不在班级名册中的已提交姓名：")
+        for i, name in enumerate(outside_roster, 1):
+            lines.append(f"{i}. {name}")
+    return "\n".join(lines)
 
 
 def _parse_find_args(rest: str, filesvc: FileService) -> Tuple[str, Optional[str]]:
@@ -2119,6 +2202,51 @@ async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogServ
     lines.append("也可用 /get 序号（如/get 1 2 3 4）获取当前列表中的文件/文件夹。")
     await reply(api, ctx, "\n".join(lines), logsvc)
     return True
+
+
+async def _handle_count_name_input(api, ctx, text: str, logsvc: LogService, state: BotState) -> bool:
+    session_key = conv_key(ctx)
+    session = state.pending_count_session.get(session_key)
+    if not isinstance(session, dict):
+        return False
+
+    t = str(text or "").strip()
+    if not t:
+        return True
+    if t.startswith("/") or t.startswith("／"):
+        return False
+
+    logsvc.log_in(ctx, t)
+    if t.casefold() == "end":
+        state.pending_count_session.pop(session_key, None)
+        await reply(api, ctx, "本次 /count 统计已结束，临时名单已清空。", logsvc)
+        return True
+
+    raw_names = _parse_count_names(t)
+    if not raw_names:
+        session["ts"] = time.time()
+        await reply(api, ctx, "未识别到有效姓名，请继续输入；发送 /countlist 查看，发送 end 结束。", logsvc)
+        return True
+
+    current = _dedup_names_keep_order(list(session.get("names") or []))
+    current_set = set(current)
+    added = 0
+    for name in raw_names:
+        if name in current_set:
+            continue
+        current_set.add(name)
+        current.append(name)
+        added += 1
+    session["names"] = current
+    session["ts"] = time.time()
+
+    if added <= 0:
+        await reply(api, ctx, f"这条消息中的姓名已存在，当前共 {len(current)} 人。发送 /countlist 查看，发送 end 结束。", logsvc)
+        return True
+    await reply(api, ctx, f"已记录 {added} 人，当前共 {len(current)} 人。发送 /countlist 查看，发送 end 结束。", logsvc)
+    return True
+
+
 async def _ensure_group_context_and_schedule_digest(
     api,
     ctx,
@@ -2173,6 +2301,9 @@ async def _handle_pre_dispatch_state(
         handled = await _handle_private_number_choice(api, ctx, text, logsvc, state, handin, filesvc)
         if handled:
             return True
+    handled = await _handle_count_name_input(api, ctx, text, logsvc, state)
+    if handled:
+        return True
     handled = await _handle_cancel_number_choice(api, ctx, text, logsvc, state, handin)
     if handled:
         return True
@@ -2341,6 +2472,44 @@ async def _handle_explicit_command(
             return
         await reply(api, ctx, f"已设置 {target_uid} 的等级为 {stored}（生效等级 {effective}）。", logsvc)
         return
+    if cmd == "count":
+        key = conv_key(ctx)
+        old = state.pending_count_session.get(key)
+        old_names = _dedup_names_keep_order(list((old or {}).get("names") or []))
+        state.pending_count_session[key] = {"names": [], "ts": time.time()}
+        if old_names:
+            await reply(
+                api,
+                ctx,
+                "已重新开始 /count 统计，并清空上一次临时名单。\n请分多次发送姓名；发送 /countlist 查看，发送 end 结束并清空。",
+                logsvc,
+            )
+        else:
+            await reply(
+                api,
+                ctx,
+                "已进入 /count 统计模式。\n请分多次发送姓名；发送 /countlist 查看，发送 end 结束并清空。",
+                logsvc,
+            )
+        return
+    if cmd == "countlist":
+        key = conv_key(ctx)
+        session = state.pending_count_session.get(key)
+        if not isinstance(session, dict):
+            await reply(api, ctx, "当前没有进行中的 /count 统计，请先发送 /count。", logsvc)
+            return
+        session["ts"] = time.time()
+        names = _dedup_names_keep_order(list(session.get("names") or []))
+        roster: List[Tuple[str, str]] = []
+        get_roster = getattr(handin, "_get_roster", None)
+        if callable(get_roster):
+            try:
+                roster = list(get_roster() or [])
+            except Exception as e:
+                logsvc.log.warning(f"/countlist get roster failed: err={e}")
+                roster = []
+        await reply(api, ctx, _build_count_list_text(names, roster), logsvc)
+        return
     if cmd in ("help", "h"):
         lines = [
             "命令速览：",
@@ -2348,6 +2517,8 @@ async def _handle_explicit_command(
             "/help 或 /h",
             "/ping",
             "/whoami",
+            "/count  开始临时收集名单（发送 end 结束并清空）",
+            "/countlist  查看已提交名单和未交名单",
         ]
         if ctx.level >= 3:
             lines.extend([
