@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 from collections import defaultdict
 import csv
 import json
@@ -19,12 +19,14 @@ from rapidocr import RapidOCR
 _OCR_ENGINE_LOCK = threading.Lock()
 _OCR_ENGINE: RapidOCR | None = None
 
+# 閽堝鏁欏缁胯壊榛戞澘鐨勭粡楠?HSV 鑼冨洿锛堣緝鏃ч槇鍊兼洿鏀舵暃锛屽噺灏戦潪榛戞澘璇Е鍙戯級
+BOARD_GREEN_LOWER = np.array([38, 35, 25], dtype=np.uint8)
+BOARD_GREEN_UPPER = np.array([92, 255, 255], dtype=np.uint8)
+
 
 def _suppress_rapidocr_noise() -> None:
     """
-    RapidOCR 默认会输出大量 info/warning（如模型路径、空检测提示）。
-    这里统一压到 ERROR，仅在真正异常时输出。
-    """
+    RapidOCR 榛樿浼氳緭鍑哄ぇ閲?info/warning锛堝妯″瀷璺緞銆佺┖妫€娴嬫彁绀猴級銆?    杩欓噷缁熶竴鍘嬪埌 ERROR锛屼粎鍦ㄧ湡姝ｅ紓甯告椂杈撳嚭銆?    """
     candidates = ["RapidOCR", "rapidocr"]
     for name in candidates:
         lg = logging.getLogger(name)
@@ -39,11 +41,11 @@ def _suppress_rapidocr_noise() -> None:
 
 
 # =========================
-# 基础工具
+# 鍩虹宸ュ叿
 # =========================
 
 def order_points(pts: np.ndarray) -> np.ndarray:
-    """将四个点按 tl, tr, br, bl 排序"""
+    """灏嗗洓涓偣鎸?tl, tr, br, bl 鎺掑簭"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1).reshape(-1)
@@ -56,7 +58,7 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 
 
 def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """透视变换"""
+    """閫忚鍙樻崲"""
     rect = order_points(pts.astype(np.float32))
     (tl, tr, br, bl) = rect
 
@@ -88,7 +90,7 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 def parse_manual_points(s: str | None) -> np.ndarray | None:
     """
-    手动四点格式:
+    鎵嬪姩鍥涚偣鏍煎紡:
     "x1,y1;x2,y2;x3,y3;x4,y4"
     """
     if not s:
@@ -101,25 +103,22 @@ def parse_manual_points(s: str | None) -> np.ndarray | None:
     pts = np.array(pts, dtype=np.float32)
 
     if pts.shape != (4, 2):
-        raise ValueError('manual_points 必须是 4 个点，例如: "x1,y1;x2,y2;x3,y3;x4,y4"')
+        raise ValueError('manual_points 蹇呴』鏄?4 涓偣锛屼緥濡? "x1,y1;x2,y2;x3,y3;x4,y4"')
 
     return pts
 
 
 # =========================
-# 1. 黑板区域检测
+# 1. 榛戞澘鍖哄煙妫€娴?
 # =========================
 
 def detect_board_auto(image: np.ndarray) -> np.ndarray:
     """
-    自动检测绿色黑板并透视矫正
+    鑷姩妫€娴嬬豢鑹查粦鏉垮苟閫忚鐭
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # 针对教室绿色黑板的经验阈值
-    lower_green = np.array([35, 20, 20], dtype=np.uint8)
-    upper_green = np.array([95, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower_green, upper_green)
+    mask = cv2.inRange(hsv, BOARD_GREEN_LOWER, BOARD_GREEN_UPPER)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -157,11 +156,11 @@ def detect_board_auto(image: np.ndarray) -> np.ndarray:
 
     warped = four_point_transform(image, pts)
 
-    # 横板优先
+    # 妯澘浼樺厛
     if warped.shape[0] > warped.shape[1]:
         warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
 
-    # 略裁边框
+    # 鐣ヨ杈规
     hh, ww = warped.shape[:2]
     mx = int(ww * 0.02)
     my = int(hh * 0.02)
@@ -181,16 +180,21 @@ def get_board(image: np.ndarray, manual_points: np.ndarray | None = None) -> np.
 
 def _green_board_mask(image: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    lower_green = np.array([35, 20, 20], dtype=np.uint8)
-    upper_green = np.array([95, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower_green, upper_green)
+    mask = cv2.inRange(hsv, BOARD_GREEN_LOWER, BOARD_GREEN_UPPER)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     return mask
 
 
-def _has_green_board_contour(mask: np.ndarray, image_shape: tuple[int, ...], min_area_ratio: float = 0.08) -> bool:
+def _has_green_board_contour(
+    mask: np.ndarray,
+    image_shape: tuple[int, ...],
+    min_area_ratio: float = 0.18,
+    min_rect_area_ratio: float = 0.20,
+    min_extent: float = 0.45,
+    min_aspect: float = 1.10,
+) -> bool:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return False
@@ -198,12 +202,27 @@ def _has_green_board_contour(mask: np.ndarray, image_shape: tuple[int, ...], min
     img_area = max(h * w, 1)
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area >= img_area * float(min_area_ratio):
-            return True
+        if area < img_area * float(min_area_ratio):
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        rect_area = max(bw * bh, 1)
+        rect_ratio = float(rect_area) / float(img_area)
+        if rect_ratio < max(float(min_rect_area_ratio), float(min_area_ratio) * 1.15):
+            continue
+
+        aspect = float(bw) / float(max(bh, 1))
+        if aspect < float(min_aspect):
+            continue
+
+        extent = float(area) / float(rect_area)
+        if extent < float(min_extent):
+            continue
+        return True
     return False
 
 
-def is_green_blackboard(image: np.ndarray, min_area_ratio: float = 0.08, min_green_ratio: float = 0.12) -> bool:
+def is_green_blackboard(image: np.ndarray, min_area_ratio: float = 0.18, min_green_ratio: float = 0.18) -> bool:
     if image is None or image.size == 0:
         return False
     mask = _green_board_mask(image)
@@ -213,17 +232,33 @@ def is_green_blackboard(image: np.ndarray, min_area_ratio: float = 0.08, min_gre
     return _has_green_board_contour(mask, image.shape, min_area_ratio=float(min_area_ratio))
 
 
-def extract_green_board(image: np.ndarray, min_area_ratio: float = 0.08, min_green_ratio: float = 0.12) -> tuple[bool, np.ndarray]:
+def extract_green_board(image: np.ndarray, min_area_ratio: float = 0.18, min_green_ratio: float = 0.18) -> tuple[bool, np.ndarray]:
     if image is None or image.size == 0:
         return False, image
     ok = is_green_blackboard(image, min_area_ratio=min_area_ratio, min_green_ratio=min_green_ratio)
     if not ok:
         return False, image
+
+    # For near-board photos, skip perspective warp to avoid thinning chalk strokes.
+    mask = _green_board_mask(image)
+    green_ratio = float(np.count_nonzero(mask)) / float(mask.size or 1)
+    if green_ratio >= 0.45:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            h, w = image.shape[:2]
+            img_area = max(h * w, 1)
+            cnt = max(contours, key=cv2.contourArea)
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            bbox_ratio = float(bw * bh) / float(img_area)
+            aspect = float(bw) / float(max(bh, 1))
+            if bbox_ratio >= 0.60 and 0.90 <= aspect <= 3.50:
+                return True, image
+
     return True, get_board(image)
 
 
 # =========================
-# 2. 图像增强
+# 2. 鍥惧儚澧炲己
 # =========================
 
 def resize_for_ocr(img: np.ndarray, target_width: int = 1800) -> np.ndarray:
@@ -237,7 +272,7 @@ def resize_for_ocr(img: np.ndarray, target_width: int = 1800) -> np.ndarray:
 
 def enhance_variants(board: np.ndarray) -> dict[str, np.ndarray]:
     """
-    生成多个图像版本，OCR 后选最好的一版
+    鐢熸垚澶氫釜鍥惧儚鐗堟湰锛孫CR 鍚庨€夋渶濂界殑涓€鐗?
     """
     board = resize_for_ocr(board, target_width=1800)
 
@@ -262,7 +297,7 @@ def enhance_variants(board: np.ndarray) -> dict[str, np.ndarray]:
         -5,
     )
 
-    # 去小噪点
+    # 鍘诲皬鍣偣
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     cleaned = np.zeros_like(binary)
     for i in range(1, num_labels):
@@ -270,7 +305,7 @@ def enhance_variants(board: np.ndarray) -> dict[str, np.ndarray]:
         if 12 <= area <= 50000:
             cleaned[labels == i] = 255
 
-    # 转成白底黑字版本，有时更利于 OCR
+    # 杞垚鐧藉簳榛戝瓧鐗堟湰锛屾湁鏃舵洿鍒╀簬 OCR
     white_bg = 255 - cleaned
 
     adaptive = cv2.adaptiveThreshold(
@@ -294,13 +329,13 @@ def enhance_variants(board: np.ndarray) -> dict[str, np.ndarray]:
 
 
 # =========================
-# 3. RapidOCR 输出解析
+# 3. RapidOCR 杈撳嚭瑙ｆ瀽
 # =========================
 
 def quad_to_xyxy(box: Any) -> list[int] | None:
     """
-    把 box 统一转成 [x1, y1, x2, y2]
-    支持:
+    鎶?box 缁熶竴杞垚 [x1, y1, x2, y2]
+    鏀寔:
     - [x1, y1, x2, y2]
     - [[x, y], [x, y], [x, y], [x, y]]
     """
@@ -339,7 +374,7 @@ def quad_to_xyxy(box: Any) -> list[int] | None:
 
 def _unwrap_rapidocr_result(raw: Any) -> Any:
     """
-    兼容 RapidOCR 可能返回:
+    鍏煎 RapidOCR 鍙兘杩斿洖:
     - result
     - (result, elapse)
     """
@@ -392,13 +427,13 @@ def _build_item(box: Any, text: Any, score: Any) -> dict | None:
 
 def parse_rapidocr_output(raw: Any) -> list[dict]:
     """
-    兼容不同 RapidOCR 返回格式，并处理 txts=None 的情况
+    鍏煎涓嶅悓 RapidOCR 杩斿洖鏍煎紡锛屽苟澶勭悊 txts=None 鐨勬儏鍐?
     """
     data = _unwrap_rapidocr_result(raw)
     if data is None:
         return []
 
-    # 情况 1: 对象属性
+    # 鎯呭喌 1: 瀵硅薄灞炴€?
     if hasattr(data, "boxes") or hasattr(data, "txts") or hasattr(data, "scores"):
         boxes = _safe_list(getattr(data, "boxes", None))
         txts = _safe_list(getattr(data, "txts", None))
@@ -419,7 +454,7 @@ def parse_rapidocr_output(raw: Any) -> list[dict]:
                 items.append(item)
         return items
 
-    # 情况 2: dict
+    # 鎯呭喌 2: dict
     if isinstance(data, dict):
         boxes = _safe_list(data.get("boxes"))
         txts = _safe_list(data.get("txts", data.get("texts", data.get("rec_texts"))))
@@ -446,7 +481,7 @@ def parse_rapidocr_output(raw: Any) -> list[dict]:
 
         return []
 
-    # 情况 3: list
+    # 鎯呭喌 3: list
     if isinstance(data, list):
         items = []
         for elem in data:
@@ -473,7 +508,7 @@ def parse_rapidocr_output(raw: Any) -> list[dict]:
 
         return items
 
-    # 情况 4: 兜底尝试 __dict__
+    # 鎯呭喌 4: 鍏滃簳灏濊瘯 __dict__
     if hasattr(data, "__dict__"):
         return parse_rapidocr_output(vars(data))
 
@@ -482,7 +517,7 @@ def parse_rapidocr_output(raw: Any) -> list[dict]:
 
 def run_ocr_on_image(engine: RapidOCR, image: np.ndarray) -> list[dict]:
     """
-    将图像写成临时文件后喂给 RapidOCR
+    灏嗗浘鍍忓啓鎴愪复鏃舵枃浠跺悗鍠傜粰 RapidOCR
     """
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         temp_path = f.name
@@ -501,7 +536,7 @@ def run_ocr_on_image(engine: RapidOCR, image: np.ndarray) -> list[dict]:
 
 
 # =========================
-# 4. OCR 文本后处理
+# 4. OCR 鏂囨湰鍚庡鐞?
 # =========================
 
 PAGE_RE = re.compile(r"\bP\s*(\d{1,4})\b", re.IGNORECASE)
@@ -514,6 +549,7 @@ OCR_DIGIT_TRANS = str.maketrans(
         "Q": "0",
         "I": "1",
         "L": "1",
+        "K": "4",
         "Z": "2",
         "S": "5",
         "B": "8",
@@ -617,6 +653,52 @@ def question_sort_key(q: str) -> tuple[int, int, int, int]:
     return (a, b, c, first_sub)
 
 
+def question_triplet_str(q: str) -> tuple[str, str, str] | None:
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})", q)
+    if not m:
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
+def _is_compact_ambiguous_question_token(token: str) -> bool:
+    """
+    褰㈠ "1.56" 鐨勭揣鍑戝啓娉曞湪 OCR 涓涔夊緢澶э紝甯哥敱 "1.6.1" 鎵洸鑰屾潵銆?    杩欓噷浠呭仛鏍囪锛屼笉鐩存帴涓㈠純锛屽悗缁粨鍚堟敮鎸佸害鍐嶈繃婊ゃ€?    """
+    t = normalize_text(token).strip()
+    if not t or t.startswith("P"):
+        return False
+    t = t.replace(" ", "")
+    if "(" in t or ")" in t:
+        return False
+
+    # 鍙鈥滃崟涓偣 + 鍓?鍚?浣嶆暟瀛椻€濆仛姝т箟鏍囪锛屽 1.56 / 2.26
+    if t.count(".") != 1:
+        return False
+    parts = [x for x in t.split(".") if x]
+    if len(parts) != 2:
+        return False
+    left = _normalize_digit_token(parts[0])
+    right = _normalize_digit_token(parts[1])
+    if not left or not right:
+        return False
+    return len(left) == 1 and len(right) == 2
+
+
+def _is_joined_triplet_ambiguous_token(token: str) -> bool:
+    """
+    Tokens like "141"/"156" (without delimiters) are easy OCR confusions.
+    Mark them as ambiguous and let merge stage decide with context.
+    """
+    t = normalize_text(token).strip()
+    if not t or t.startswith("P"):
+        return False
+    t = t.replace(" ", "")
+    if "." in t or "(" in t or ")" in t:
+        return False
+    t = re.sub(r"[^0-9OILKSZBG]", "", t)
+    digits = _normalize_digit_token(t)
+    return len(digits) == 3
+
+
 def _unique_keep_order(values: list[Any]) -> list[Any]:
     seen = set()
     out = []
@@ -644,7 +726,7 @@ def _build_question_from_parts(
         elif len(left) == 1 and len(right) == 2:
             triplet = [left, right[0], right[1]]
         elif len(left) == 1 and prefix is not None and left == prefix[0]:
-            # 形如 "2.2(2)" 时，通常是缺失字符导致，不直接补成 2.2.2
+            # 褰㈠ "2.2(2)" 鏃讹紝閫氬父鏄己澶卞瓧绗﹀鑷达紝涓嶇洿鎺ヨˉ鎴?2.2.2
             if len(right) == 1 and sub_nums:
                 return None
             triplet = [left, prefix[1], right]
@@ -717,7 +799,7 @@ def repair_question_token(
     q = q.replace(" ", "")
     q = re.sub(r"(?<=\d)\.(?=\()", "", q)
     q = re.sub(r"(?<!\()(\d+)\)", r"(\1)", q)
-    q = re.sub(r"[^\dOILSZBG\.\(\)]", "", q)
+    q = re.sub(r"[^\dOILKSZBG\.\(\)]", "", q)
     q = re.sub(r"\.+", ".", q).strip(".")
     if not q:
         return None
@@ -899,16 +981,35 @@ def extract_page_from_line(
 def extract_questions_from_line(
     line: dict,
     known_prefixes: list[tuple[str, str]] | None = None,
-) -> list[str]:
+) -> list[tuple[str, float, bool]]:
     """
-    ????????????
+    Parse question ids from one OCR text line.
+    Returns tuples: (question, score_factor, ambiguous_source).
     """
     text = normalize_text(line["text"])
     tokens = line.get("tokens", [])
     known_prefixes = known_prefixes or []
 
-    first_pass = []
-    unresolved_tokens = []
+    qs: list[str] = []
+    q_factor: dict[str, float] = {}
+    q_ambiguous: dict[str, bool] = {}
+    unresolved_tokens: list[str] = []
+
+    def _add_question(candidate: str | None, factor: float, ambiguous: bool) -> None:
+        if not is_valid_question(candidate):
+            return
+        q = str(candidate)
+        prev = q_factor.get(q)
+        if prev is None:
+            qs.append(q)
+            q_factor[q] = float(factor)
+            q_ambiguous[q] = bool(ambiguous)
+            return
+        if factor > prev:
+            q_factor[q] = float(factor)
+            q_ambiguous[q] = bool(ambiguous)
+        elif abs(factor - prev) <= 1e-8 and q_ambiguous.get(q, False) and not ambiguous:
+            q_ambiguous[q] = False
 
     for tok in tokens:
         tok_norm = normalize_text(tok)
@@ -919,34 +1020,43 @@ def extract_questions_from_line(
 
         candidate = repair_question_token(tok_norm)
         if is_valid_question(candidate):
-            first_pass.append(candidate)
+            amb = _is_compact_ambiguous_question_token(tok_norm) or _is_joined_triplet_ambiguous_token(tok_norm)
+            _add_question(candidate, factor=(0.58 if amb else 1.00), ambiguous=amb)
         else:
             unresolved_tokens.append(tok_norm)
 
-    local_prefixes = [question_prefix(q) for q in first_pass if question_prefix(q) is not None]
+    local_prefixes = [question_prefix(q) for q in qs if question_prefix(q) is not None]
     prefix_candidates = _unique_keep_order(local_prefixes + known_prefixes)
 
-    qs = list(first_pass)
-
     for tok_norm in unresolved_tokens:
-        candidate = repair_question_token(tok_norm, preferred_prefixes=prefix_candidates)
+        pref_for_tok = prefix_candidates
+        # Avoid cross-line prefix bleed for compact 3-digit tokens like "156":
+        # when current line already has a local prefix, prefer local-only repair.
+        if _is_joined_triplet_ambiguous_token(tok_norm) and local_prefixes:
+            pref_for_tok = _unique_keep_order(local_prefixes)
+        candidate = repair_question_token(tok_norm, preferred_prefixes=pref_for_tok)
         if is_valid_question(candidate):
-            qs.append(candidate)
+            amb = _is_compact_ambiguous_question_token(tok_norm) or _is_joined_triplet_ambiguous_token(tok_norm)
+            _add_question(candidate, factor=(0.56 if amb else 0.92), ambiguous=amb)
 
-    # 整行兜底：补偿 token 分割错误
-    line_chunks = re.findall(r"[0-9OILSZBG\.\(\)'`’‘\+\-]{3,}", text)
+    # Whole-line fallback: recover from token split/merge noise.
+    line_chunks = re.findall(r"[0-9OILKSZBG\.\(\)'`鈥欌€榎+\-]{3,}", text)
     for chunk in line_chunks:
-        candidate = repair_question_token(chunk, preferred_prefixes=prefix_candidates)
+        pref_for_chunk = prefix_candidates
+        if _is_joined_triplet_ambiguous_token(chunk) and local_prefixes:
+            pref_for_chunk = _unique_keep_order(local_prefixes)
+        candidate = repair_question_token(chunk, preferred_prefixes=pref_for_chunk)
         if is_valid_question(candidate):
-            qs.append(candidate)
+            amb = _is_compact_ambiguous_question_token(chunk) or _is_joined_triplet_ambiguous_token(chunk)
+            _add_question(candidate, factor=(0.50 if amb else 0.68), ambiguous=amb)
 
-        # 连写兜底，例如 "141.1.43" -> 1.4.1 + 1.4.3
+        # Joined fallback, e.g. "141.1.43" -> 1.4.1 + 1.4.3
         joined = chunk.strip(".")
         m_join = re.fullmatch(r"(\d{3})\.(\d)\.(\d{2})", joined)
         if m_join:
             q1 = repair_question_token(m_join.group(1), preferred_prefixes=prefix_candidates)
             if is_valid_question(q1):
-                qs.append(q1)
+                _add_question(q1, factor=0.72, ambiguous=True)
 
             local_pref = question_prefix(q1) if is_valid_question(q1) else None
             pref_for_q2 = prefix_candidates
@@ -958,19 +1068,19 @@ def extract_questions_from_line(
                 preferred_prefixes=pref_for_q2,
             )
             if is_valid_question(q2):
-                qs.append(q2)
+                _add_question(q2, factor=0.72, ambiguous=True)
 
-    # ????
+    # De-dup while preserving order.
     seen = set()
-    out = []
+    out: list[str] = []
     for q in qs:
         if q in seen:
             continue
         seen.add(q)
         out.append(q)
 
-    # 如果同前缀已存在带括号题号，避免把括号数字误当成末级编号（如 2.2.1(2) -> 2.2.2）
-    cleaned = []
+    # If one question has bracket sub-number, avoid treating that sub-number as a new question.
+    cleaned: list[str] = []
     for q in out:
         m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})", q)
         if m is None:
@@ -996,8 +1106,10 @@ def extract_questions_from_line(
 
         cleaned.append(q)
 
-    return cleaned
-
+    with_meta: list[tuple[str, float, bool]] = []
+    for q in cleaned:
+        with_meta.append((q, float(q_factor.get(q, 1.0)), bool(q_ambiguous.get(q, False))))
+    return with_meta
 
 def extract_assignments_from_lines(lines: list[dict]) -> list[dict]:
     """
@@ -1019,13 +1131,14 @@ def extract_assignments_from_lines(lines: list[dict]) -> list[dict]:
 
         questions = extract_questions_from_line(line, known_prefixes=known_prefixes)
 
-        for q in questions:
+        for q, q_factor, q_ambiguous in questions:
             extracted.append(
                 {
                     "page": current_page,
                     "question": q,
                     "line_text": line["text"],
-                    "line_score": line["score"],
+                    "line_score": float(line["score"]) * float(q_factor),
+                    "q_ambiguous": bool(q_ambiguous),
                 }
             )
             pref = question_prefix(q)
@@ -1050,13 +1163,15 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
     overall_page_weights: dict[str, float] = defaultdict(float)
     order_idx = 0
 
-    for vr in variant_results:
+    for vr_idx, vr in enumerate(variant_results):
+        variant_name = str(vr.get("variant") or f"variant_{vr_idx}")
         for item in vr.get("assignments", []):
             q = repair_question_token(str(item.get("question", "")))
             if not is_valid_question(q):
                 continue
 
             line_score = float(item.get("line_score", 0.0))
+            q_ambiguous = bool(item.get("q_ambiguous", False))
 
             page_raw = item.get("page")
             page = None
@@ -1073,11 +1188,16 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                     "best_line_text": str(item.get("line_text", "")),
                     "page_weights": defaultdict(float),
                     "count": 0,
+                    "variants": set(),
+                    "ambiguous_hits": 0,
                 }
                 order_idx += 1
 
             rec = merged[q]
             rec["count"] += 1
+            rec["variants"].add(variant_name)
+            if q_ambiguous:
+                rec["ambiguous_hits"] += 1
             if line_score > rec["best_score"]:
                 rec["best_score"] = line_score
                 rec["best_line_text"] = str(item.get("line_text", ""))
@@ -1091,7 +1211,7 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
     if overall_page_weights:
         default_page = max(overall_page_weights.items(), key=lambda x: x[1])[0]
 
-    # 先按 base 合并：同一底题号保留支持度更高的完整形式
+    # Merge by question base: keep the stronger full form.
     best_form_by_base: dict[str, tuple[str, tuple[float, int]]] = {}
     for q, rec in merged.items():
         base = question_base(q)
@@ -1104,7 +1224,7 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
         q for q in (v[0] for v in best_form_by_base.values()) if q in merged
     }
 
-    # 主导第一段（章节）用于剔除明显离群噪声
+    # Dominant first segment (chapter) for outlier filtering.
     first_seg_weights: dict[int, float] = defaultdict(float)
     for q in selected_questions:
         m = re.match(r"^(\d{1,2})\.", q)
@@ -1115,21 +1235,141 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
     if first_seg_weights:
         dominant_first_seg = max(first_seg_weights.items(), key=lambda x: x[1])[0]
 
-    # 前缀密集度，用于抑制同前缀下低置信单次噪声
+    # Prefix density for suppressing low-confidence singleton noise.
     prefix_density: dict[tuple[str, str], int] = defaultdict(int)
     for q in selected_questions:
         pref = question_prefix(q)
         if pref is not None:
             prefix_density[pref] += 1
 
+    # If both short and long tail forms exist (e.g. 1 and 11), downweight likely OCR adhesion.
+    likely_suffix_noise: set[str] = set()
+    prefix_to_questions: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for q in selected_questions:
+        pref = question_prefix(q)
+        if pref is not None:
+            prefix_to_questions[pref].append(q)
+    for qs in prefix_to_questions.values():
+        triples = []
+        for q in qs:
+            triplet = question_triplet_str(q)
+            if triplet is not None:
+                triples.append((q, triplet[2]))
+        for q_long, c_long in triples:
+            if len(c_long) < 2:
+                continue
+            rec_long = merged[q_long]
+            for q_short, c_short in triples:
+                if q_short == q_long:
+                    continue
+                if len(c_long) != len(c_short) + 1 or not c_long.startswith(c_short):
+                    continue
+                rec_short = merged[q_short]
+                long_support = len(rec_long["variants"])
+                short_support = len(rec_short["variants"])
+                if short_support < long_support:
+                    continue
+                if rec_short["best_score"] + 0.03 < rec_long["best_score"]:
+                    continue
+                if long_support <= 2 and rec_long["best_score"] < 0.92:
+                    likely_suffix_noise.add(q_long)
+                    break
+
+    # Tail-length distribution under each prefix, used to suppress long-tail outliers.
+    prefix_tail_len_weights: dict[tuple[str, str], dict[int, float]] = defaultdict(dict)
+    prefix_tail_support: dict[tuple[tuple[str, str], str], int] = {}
+    prefix_tail_numbers: dict[tuple[str, str], set[int]] = defaultdict(set)
+    prefix_tail_best_q: dict[tuple[tuple[str, str], str], str] = {}
+    for q in selected_questions:
+        pref = question_prefix(q)
+        triplet = question_triplet_str(q)
+        if pref is None or triplet is None:
+            continue
+        seg_len = len(triplet[2])
+        cur = prefix_tail_len_weights[pref].get(seg_len, 0.0)
+        support = int(len(merged[q]["variants"]))
+        prefix_tail_len_weights[pref][seg_len] = cur + max(1.0, float(support))
+        key_tail = (pref, triplet[2])
+        prev_support = prefix_tail_support.get(key_tail, 0)
+        if support > prev_support:
+            prefix_tail_support[key_tail] = support
+            prefix_tail_best_q[key_tail] = q
+        try:
+            prefix_tail_numbers[pref].add(int(triplet[2]))
+        except ValueError:
+            pass
+
     out = []
     for q in selected_questions:
         rec = merged[q]
+        variant_support = len(rec["variants"])
+
+        triplet = question_triplet_str(q)
+        if q in likely_suffix_noise:
+            continue
+        pref = question_prefix(q)
+        # Ambiguous singleton suppression:
+        # keep low-tail candidates (e.g. 1.4.1), but suppress high-tail noise like 1.5.6.
+        if (
+            pref is not None
+            and triplet is not None
+            and prefix_density.get(pref, 0) >= 2
+            and rec["count"] == 1
+            and rec.get("ambiguous_hits", 0) >= 1
+            and rec["best_score"] < 0.82
+        ):
+            try:
+                tail_num = int(triplet[2])
+            except ValueError:
+                tail_num = -1
+            tail_nums = prefix_tail_numbers.get(pref, set())
+            has_low_tail = any(n <= 3 for n in tail_nums if n != tail_num)
+            if tail_num >= 5 and has_low_tail:
+                continue
+        if triplet is not None and pref is not None:
+            seg_len = len(triplet[2])
+            seg_w = prefix_tail_len_weights.get(pref, {})
+            if seg_w:
+                dominant_len = max(seg_w.items(), key=lambda x: x[1])[0]
+                if (
+                    dominant_len == 1
+                    and seg_len >= 3
+                    and len(prefix_to_questions.get(pref, [])) >= 2
+                    and variant_support <= 1
+                    and rec["best_score"] < 0.90
+                ):
+                    continue
+                # Repeated-tail noise fallback, e.g. 1.6.11 from 1.6.1 adhesion.
+                if (
+                    dominant_len == 1
+                    and seg_len == 2
+                    and triplet[2][0] == triplet[2][1]
+                    and variant_support <= 1
+                ):
+                    single_tail = triplet[2][0]
+                    single_support = prefix_tail_support.get((pref, single_tail), 0)
+                    single_q = prefix_tail_best_q.get((pref, single_tail))
+                    if single_q is not None:
+                        try:
+                            tail_num = int(triplet[2])
+                            single_num = int(single_tail)
+                        except ValueError:
+                            tail_num = -1
+                            single_num = -1
+
+                        tail_nums = prefix_tail_numbers.get(pref, set())
+                        has_mid = any(single_num < n < tail_num for n in tail_nums)
+                        low_nums = [n for n in tail_nums if n <= 9]
+                        max_low = max(low_nums) if low_nums else single_num
+                        large_jump = (tail_num - max_low) >= 6 if tail_num >= 0 and max_low >= 0 else False
+                        if single_support >= variant_support and has_mid and large_jump:
+                            continue
+
         page = default_page
         if rec["page_weights"]:
             page = max(rec["page_weights"].items(), key=lambda x: x[1])[0]
 
-        # 页码仅单次、且置信较弱时，优先回退到主流页码
+        # Weak single-page evidence: fall back to dominant page.
         if (
             default_page is not None
             and page != default_page
@@ -1138,7 +1378,7 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
         ):
             page = default_page
 
-        # 过滤章节离群噪声（如 9.2.2、6.1.1）
+        # Filter chapter outliers.
         m_first = re.match(r"^(\d{1,2})\.", q)
         if dominant_first_seg is not None and m_first is not None:
             first_seg = int(m_first.group(1))
@@ -1150,7 +1390,7 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                 if cur_w > 0 and dom_w >= 2.5 * cur_w and rec["best_score"] < 0.85:
                     continue
 
-        # 过滤同前缀下的低置信单次噪声（如 4.4.1）
+        # Filter low-confidence singletons under dense same-prefix clusters.
         pref = question_prefix(q)
         if (
             pref is not None
@@ -1170,11 +1410,12 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
             }
         )
 
+    # Keep board reading order first; use page/question sort as fallback.
     out.sort(
         key=lambda x: (
+            x["_order"],
             _parse_page_num(x["page"]) if x["page"] is not None else 99999,
             *question_sort_key(x["question"]),
-            x["_order"],
         )
     )
 
@@ -1185,8 +1426,8 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
 
 def choose_best_variant(variant_results: list[dict]) -> dict:
     """
-    优先选“提取题号数量更多”的版本；
-    数量相同则选平均置信度更高的版本。
+    浼樺厛閫夆€滄彁鍙栭鍙锋暟閲忔洿澶氣€濈殑鐗堟湰锛?
+    鏁伴噺鐩稿悓鍒欓€夊钩鍧囩疆淇″害鏇撮珮鐨勭増鏈€?
     """
     best = None
     for vr in variant_results:
@@ -1223,7 +1464,7 @@ def draw_boxes(image: np.ndarray, items: list[dict]) -> np.ndarray:
 
 
 # =========================
-# 5. 单图 / 批处理
+# 5. 鍗曞浘 / 鎵瑰鐞?
 # =========================
 
 def process_one_image(
@@ -1234,7 +1475,7 @@ def process_one_image(
 ) -> dict:
     image = cv2.imread(str(image_path))
     if image is None:
-        raise ValueError(f"读图失败: {image_path}")
+        raise ValueError(f"璇诲浘澶辫触: {image_path}")
 
     board = get_board(image, manual_points=manual_points)
     variants = enhance_variants(board)
@@ -1370,8 +1611,8 @@ def process_board_image(board: np.ndarray, engine: RapidOCR | None = None) -> di
 def recognize_homework_from_array(
     image: np.ndarray,
     engine: RapidOCR | None = None,
-    min_area_ratio: float = 0.08,
-    min_green_ratio: float = 0.12,
+    min_area_ratio: float = 0.18,
+    min_green_ratio: float = 0.18,
 ) -> dict:
     if image is None or image.size == 0:
         return {
@@ -1400,12 +1641,12 @@ def recognize_homework_from_array(
 def recognize_homework_from_path(
     image_path: str | Path,
     engine: RapidOCR | None = None,
-    min_area_ratio: float = 0.08,
-    min_green_ratio: float = 0.12,
+    min_area_ratio: float = 0.18,
+    min_green_ratio: float = 0.18,
 ) -> dict:
     image = cv2.imread(str(image_path))
     if image is None:
-        raise ValueError(f"读取图片失败：{image_path}")
+        raise ValueError(f"读取图片失败: {image_path}")
     out = recognize_homework_from_array(
         image,
         engine=engine,
@@ -1432,13 +1673,13 @@ def main() -> None:
     parser.add_argument(
         "--input",
         default=".",
-        help="单张图片路径，或图片目录；默认当前目录",
+        help="单张图片路径，或图片目录；默认为当前目录",
     )
-    parser.add_argument("--output", default="output_hw", help="输出目录")
+    parser.add_argument("--output", default="output_hw", help="杈撳嚭鐩綍")
     parser.add_argument(
         "--manual_points",
         default="",
-        help='可选，手动指定黑板四点: "x1,y1;x2,y2;x3,y3;x4,y4"',
+        help='鍙€夛紝鎵嬪姩鎸囧畾榛戞澘鍥涚偣: "x1,y1;x2,y2;x3,y3;x4,y4"',
     )
     args = parser.parse_args()
 
@@ -1450,7 +1691,7 @@ def main() -> None:
 
     image_files = collect_images(input_path)
     if not image_files:
-        raise ValueError("没有找到图片")
+        raise ValueError("娌℃湁鎵惧埌鍥剧墖")
 
     results = []
     for img_path in image_files:
@@ -1476,3 +1717,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

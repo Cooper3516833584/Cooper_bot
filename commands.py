@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
 import html
+import importlib
 import re
 import time
 import shutil
@@ -1252,6 +1253,12 @@ async def _handle_blackboard_ocr_images(api, ctx, evt: dict, logsvc: LogService)
     ocr_mod = _load_blackboard_ocr(logsvc=logsvc)
     if ocr_mod is None:
         return False
+    try:
+        # 避免长驻进程使用旧版识别逻辑，按需热刷新模块。
+        ocr_mod = importlib.reload(ocr_mod)
+    except Exception as e:
+        if logsvc is not None:
+            logsvc.log.warning(f"黑板题号识别模块热刷新失败：{e}")
 
     temp_files: List[Path] = []
     has_green_board = False
@@ -1287,10 +1294,11 @@ async def _handle_blackboard_ocr_images(api, ctx, evt: dict, logsvc: LogService)
     if not has_green_board:
         return False
 
-    if merged_lines:
-        out = "题号识别结果：\n" + "\n".join(merged_lines)
-    else:
-        out = "题号识别结果：\n未识别到有效题号。"
+    # 题号过少时不输出，避免误触发场景下产生干扰回复
+    if len(merged_lines) < 3:
+        return False
+
+    out = "题号识别结果：\n" + "\n".join(merged_lines)
     await reply(api, ctx, out, logsvc)
     return True
 
