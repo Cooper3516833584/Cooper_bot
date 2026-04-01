@@ -5,11 +5,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
+import html
 import re
 import time
 import shutil
 import uuid
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from filesvc import FileService
 from logsvc import LogService
 from handinsvc import HandinService, parse_mmdd_hhmm, pretty_ts, extract_name_from_filename, extract_student_id
@@ -31,6 +35,8 @@ from config import (
     FIND_DIR_LIMIT,
     FIND_FILE_LIMIT,
     AI_BOT_NICK,
+    NAPCAT_TEMP_CONTAINER_DIR,
+    NAPCAT_TEMP_HOST_DIR,
 )
 if TYPE_CHECKING:
     from aisvc import AIService
@@ -58,12 +64,19 @@ _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _CQ_SEG_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,[^\]]*)?\]")
+_CQ_IMAGE_RE = re.compile(r"\[CQ:image,([^\]]+)\]", flags=re.IGNORECASE)
 _COUNT_NAME_SPLIT_RE = re.compile(r"[\s,，、;；/|]+")
 _COUNT_NAME_PREFIX_RE = re.compile(r"^[\d\.\)\(、\-_:：]+")
 _COUNT_END_RE = re.compile(r"^/?end[\s。.!！?？]*$", flags=re.IGNORECASE)
 _COUNT_END_CN_RE = re.compile(r"^结束[\s。.!！?？]*$")
 _FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
 _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
+
+
+_BLACKBOARD_OCR_TEMP_DIR = (DATA_DIR / "temp" / "blackboard_ocr").resolve()
+_BLACKBOARD_OCR_IMPORT_ERROR: Optional[str] = None
+_BLACKBOARD_OCR_IMPORTED = False
+_BLACKBOARD_OCR_MODULE = None
 
 
 def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECONDS) -> bool:
@@ -986,6 +999,300 @@ def _extract_urls_from_evt(evt: dict) -> List[str]:
         _push(str(msg or ""))
 
     return urls
+
+
+def _parse_cq_kvs(raw: str) -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    for kv in str(raw or "").split(","):
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        key = str(k).strip().lower()
+        if not key:
+            continue
+        data[key] = html.unescape(str(v).strip())
+    return data
+
+
+def _normalize_image_src(raw: str) -> str:
+    s = html.unescape(str(raw or "").strip())
+    # 某些客户端会把 query 分隔符编码成 &amp;，这里恢复为 &
+    s = s.replace("&amp;", "&")
+    return s
+
+
+def _extract_images_from_evt(evt: dict) -> List[dict]:
+    out: List[dict] = []
+    seen = set()
+
+    def _push(item: dict) -> None:
+        url = _normalize_image_src(item.get("url") or "")
+        file = _normalize_image_src(item.get("file") or "")
+        fid = str(item.get("file_id") or "").strip()
+        key = (url, file, fid)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(
+            {
+                "url": url,
+                "file": file,
+                "file_id": fid,
+                "name": str(item.get("name") or "").strip(),
+                "size": str(item.get("size") or "").strip(),
+            }
+        )
+
+    msg = evt.get("message")
+    if isinstance(msg, list):
+        for seg in msg:
+            if not isinstance(seg, dict):
+                continue
+            tp = str(seg.get("type") or "").strip().lower()
+            if tp != "image":
+                continue
+            data = seg.get("data") or {}
+            _push(
+                {
+                    "url": data.get("url") or "",
+                    "file": data.get("file") or "",
+                    "file_id": data.get("file_id") or data.get("id") or "",
+                    "name": data.get("name") or data.get("file") or "",
+                    "size": data.get("file_size") or data.get("size") or "",
+                }
+            )
+
+    raw = str(evt.get("raw_message") or "")
+    for m in _CQ_IMAGE_RE.findall(raw):
+        kvs = _parse_cq_kvs(m)
+        _push(
+            {
+                "url": kvs.get("url") or "",
+                "file": kvs.get("file") or "",
+                "file_id": kvs.get("file_id") or kvs.get("id") or "",
+                "name": kvs.get("name") or kvs.get("file") or "",
+                "size": kvs.get("file_size") or kvs.get("size") or "",
+            }
+        )
+
+    return out
+
+
+def _sanitize_temp_image_name(raw_name: str, fallback_stem: str = "img") -> str:
+    nm = str(raw_name or "").strip()
+    p = Path(nm)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", (p.stem or fallback_stem)).strip("._-") or fallback_stem
+    ext = (p.suffix or "").lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+        ext = ".jpg"
+    return f"{stem}{ext}"
+
+
+def _safe_delete_ocr_temp_file(path: Path, logsvc: Optional[LogService] = None) -> None:
+    try:
+        rp = Path(path).resolve()
+        root = _BLACKBOARD_OCR_TEMP_DIR
+        if rp != root and root not in rp.parents:
+            if logsvc is not None:
+                logsvc.log.warning(f"跳过清理非识别临时目录文件：{rp}")
+            return
+        if rp.exists() and rp.is_file():
+            rp.unlink(missing_ok=True)
+    except Exception as e:
+        if logsvc is not None:
+            logsvc.log.warning(f"识别临时文件清理失败：path={path} err={e}")
+
+
+def _cleanup_ocr_temp_files(paths: List[Path], logsvc: Optional[LogService] = None) -> None:
+    for p in paths:
+        _safe_delete_ocr_temp_file(Path(p), logsvc=logsvc)
+
+
+def _resolve_local_source_path(src: str) -> Optional[Path]:
+    raw = str(src or "").strip()
+    if not raw:
+        return None
+
+    if raw.startswith("file:///"):
+        u = urllib.parse.urlsplit(raw)
+        local = urllib.parse.unquote(u.path)
+        if local.startswith("/") and len(local) >= 4 and local[2] == ":":
+            local = local[1:]
+        raw = local
+
+    cdir = str(NAPCAT_TEMP_CONTAINER_DIR).rstrip("/")
+    temp_root = Path(NAPCAT_TEMP_HOST_DIR).resolve()
+
+    if raw.startswith("/"):
+        if raw.startswith(cdir + "/") or raw == cdir:
+            rel = raw[len(cdir):].lstrip("/\\")
+            cand = (temp_root / rel).resolve()
+        else:
+            cand = (temp_root / Path(raw).name).resolve()
+        if cand != temp_root and temp_root not in cand.parents:
+            return None
+        return cand
+
+    win_abs = re.match(r"^[A-Za-z]:[\\/]", raw) is not None
+    if win_abs:
+        cand = Path(raw).resolve()
+        if cand != temp_root and temp_root not in cand.parents:
+            return None
+        return cand
+
+    return None
+
+
+async def _resolve_image_source(api, entry: dict) -> str:
+    src = _normalize_image_src(entry.get("url") or "")
+    if src:
+        return src
+
+    file_id = str(entry.get("file_id") or "").strip()
+    if file_id:
+        resp = await api.get_file(file_id, timeout=60.0, retries=1, retry_delay=1.0)
+        if resp and resp.get("status") == "ok":
+            data = resp.get("data")
+            if isinstance(data, str):
+                src = _normalize_image_src(data)
+            else:
+                data = data or {}
+                src = _normalize_image_src(
+                    data.get("url")
+                    or data.get("download_url")
+                    or data.get("file")
+                    or data.get("file_path")
+                    or data.get("path")
+                    or ""
+                )
+            if src:
+                return src
+
+    file_val = _normalize_image_src(entry.get("file") or "")
+    if file_val.startswith("http://") or file_val.startswith("https://") or file_val.startswith("file:///") or file_val.startswith("/"):
+        return file_val
+
+    if file_val:
+        resp2 = await api.call("get_image", {"file": file_val}, timeout=30.0)
+        if resp2 and resp2.get("status") == "ok":
+            data2 = resp2.get("data")
+            if isinstance(data2, str):
+                src2 = _normalize_image_src(data2)
+            else:
+                data2 = data2 or {}
+                src2 = _normalize_image_src(data2.get("url") or data2.get("file") or "")
+            if src2:
+                return src2
+
+    return ""
+
+
+async def _download_image_for_ocr(api, entry: dict, logsvc: Optional[LogService] = None) -> Optional[Path]:
+    src = await _resolve_image_source(api, entry)
+    if not src:
+        return None
+
+    _BLACKBOARD_OCR_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    name = _sanitize_temp_image_name(entry.get("name") or entry.get("file") or "image")
+    dst = _BLACKBOARD_OCR_TEMP_DIR / f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}_{name}"
+    dst = dst.resolve()
+
+    try:
+        if src.startswith("http://") or src.startswith("https://"):
+            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+
+            def _http_download() -> None:
+                with urllib.request.urlopen(req, timeout=45.0) as resp, open(dst, "wb") as f:
+                    shutil.copyfileobj(resp, f)
+
+            await asyncio.to_thread(_http_download)
+            return dst
+
+        local_src = _resolve_local_source_path(src)
+        if local_src and local_src.exists() and local_src.is_file():
+            await asyncio.to_thread(shutil.copy2, local_src, dst)
+            return dst
+    except (urllib.error.URLError, OSError) as e:
+        # 图片下载链接存在时效/转义差异，属于可预期失败，不刷告警。
+        _safe_delete_ocr_temp_file(dst, logsvc=logsvc)
+        return None
+    except Exception as e:
+        if logsvc is not None:
+            logsvc.log.warning(f"题号识别图片下载出现异常：src={src[:120]} err={e}")
+        _safe_delete_ocr_temp_file(dst, logsvc=logsvc)
+        return None
+
+    return None
+
+
+def _load_blackboard_ocr(logsvc: Optional[LogService] = None):
+    global _BLACKBOARD_OCR_IMPORTED, _BLACKBOARD_OCR_IMPORT_ERROR, _BLACKBOARD_OCR_MODULE
+    if _BLACKBOARD_OCR_IMPORTED:
+        return _BLACKBOARD_OCR_MODULE
+
+    try:
+        import blackboard_ocr as _mod
+
+        _BLACKBOARD_OCR_MODULE = _mod
+        _BLACKBOARD_OCR_IMPORT_ERROR = None
+    except Exception as e:
+        _BLACKBOARD_OCR_MODULE = None
+        _BLACKBOARD_OCR_IMPORT_ERROR = str(e)
+        if logsvc is not None:
+            logsvc.log.warning(f"黑板题号识别模块加载失败：{e}")
+    _BLACKBOARD_OCR_IMPORTED = True
+    return _BLACKBOARD_OCR_MODULE
+
+
+async def _handle_blackboard_ocr_images(api, ctx, evt: dict, logsvc: LogService) -> bool:
+    images = _extract_images_from_evt(evt)
+    if not images:
+        return False
+
+    ocr_mod = _load_blackboard_ocr(logsvc=logsvc)
+    if ocr_mod is None:
+        return False
+
+    temp_files: List[Path] = []
+    has_green_board = False
+    merged_lines: List[str] = []
+    seen_lines = set()
+
+    try:
+        for img in images:
+            p = await _download_image_for_ocr(api, img, logsvc=logsvc)
+            if p is None:
+                continue
+            temp_files.append(p)
+
+            try:
+                result = await asyncio.to_thread(ocr_mod.recognize_homework_from_path, p)
+            except Exception as e:
+                logsvc.log.warning(f"黑板题号识别执行失败：path={p} err={e}")
+                continue
+
+            if not bool(result.get("is_green_blackboard")):
+                continue
+
+            has_green_board = True
+            lines = ocr_mod.format_assignment_lines(list(result.get("assignments") or []))
+            for line in lines:
+                if line in seen_lines:
+                    continue
+                seen_lines.add(line)
+                merged_lines.append(line)
+    finally:
+        _cleanup_ocr_temp_files(temp_files, logsvc=logsvc)
+
+    if not has_green_board:
+        return False
+
+    if merged_lines:
+        out = "题号识别结果：\n" + "\n".join(merged_lines)
+    else:
+        out = "题号识别结果：\n未识别到有效题号。"
+    await reply(api, ctx, out, logsvc)
+    return True
 
 
 async def _resolve_src_by_get_file_for_notice(
@@ -3081,6 +3388,8 @@ async def dispatch(
     _sweep_bot_state_ttl(state)
     await _ensure_group_context_and_schedule_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
     if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc, aisvc):
+        return
+    if await _handle_blackboard_ocr_images(api, ctx, evt, logsvc):
         return
     t = (text or "").strip()
     if not t:
