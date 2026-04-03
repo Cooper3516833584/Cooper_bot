@@ -19,14 +19,16 @@ from rapidocr import RapidOCR
 _OCR_ENGINE_LOCK = threading.Lock()
 _OCR_ENGINE: RapidOCR | None = None
 
-# 閽堝鏁欏缁胯壊榛戞澘鐨勭粡楠?HSV 鑼冨洿锛堣緝鏃ч槇鍊兼洿鏀舵暃锛屽噺灏戦潪榛戞澘璇Е鍙戯級
+# 针对教室绿色黑板的经验 HSV 范围（较旧阈值更收敛，减少非黑板误触发）
 BOARD_GREEN_LOWER = np.array([38, 35, 25], dtype=np.uint8)
 BOARD_GREEN_UPPER = np.array([92, 255, 255], dtype=np.uint8)
 
 
 def _suppress_rapidocr_noise() -> None:
     """
-    RapidOCR 榛樿浼氳緭鍑哄ぇ閲?info/warning锛堝妯″瀷璺緞銆佺┖妫€娴嬫彁绀猴級銆?    杩欓噷缁熶竴鍘嬪埌 ERROR锛屼粎鍦ㄧ湡姝ｅ紓甯告椂杈撳嚭銆?    """
+    RapidOCR 默认会输出大量 info/warning（如模型路径、空检测提示）。
+    这里统一压到 ERROR，仅在真正异常时输出。
+    """
     candidates = ["RapidOCR", "rapidocr"]
     for name in candidates:
         lg = logging.getLogger(name)
@@ -41,11 +43,11 @@ def _suppress_rapidocr_noise() -> None:
 
 
 # =========================
-# 鍩虹宸ュ叿
+# 基础工具
 # =========================
 
 def order_points(pts: np.ndarray) -> np.ndarray:
-    """灏嗗洓涓偣鎸?tl, tr, br, bl 鎺掑簭"""
+    """将四个点按 tl, tr, br, bl 排序"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1).reshape(-1)
@@ -58,7 +60,7 @@ def order_points(pts: np.ndarray) -> np.ndarray:
 
 
 def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """閫忚鍙樻崲"""
+    """透视变换"""
     rect = order_points(pts.astype(np.float32))
     (tl, tr, br, bl) = rect
 
@@ -90,7 +92,7 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 def parse_manual_points(s: str | None) -> np.ndarray | None:
     """
-    鎵嬪姩鍥涚偣鏍煎紡:
+    手动四点格式：
     "x1,y1;x2,y2;x3,y3;x4,y4"
     """
     if not s:
@@ -103,18 +105,18 @@ def parse_manual_points(s: str | None) -> np.ndarray | None:
     pts = np.array(pts, dtype=np.float32)
 
     if pts.shape != (4, 2):
-        raise ValueError('manual_points 蹇呴』鏄?4 涓偣锛屼緥濡? "x1,y1;x2,y2;x3,y3;x4,y4"')
+        raise ValueError('manual_points 必须是 4 个点，例如 "x1,y1;x2,y2;x3,y3;x4,y4"')
 
     return pts
 
 
 # =========================
-# 1. 榛戞澘鍖哄煙妫€娴?
+# 1. 黑板区域检测
 # =========================
 
 def detect_board_auto(image: np.ndarray) -> np.ndarray:
     """
-    鑷姩妫€娴嬬豢鑹查粦鏉垮苟閫忚鐭
+    自动检测绿色黑板并进行透视矫正
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
@@ -156,11 +158,11 @@ def detect_board_auto(image: np.ndarray) -> np.ndarray:
 
     warped = four_point_transform(image, pts)
 
-    # 妯澘浼樺厛
+    # 横版优先
     if warped.shape[0] > warped.shape[1]:
         warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
 
-    # 鐣ヨ杈规
+    # 裁掉边框
     hh, ww = warped.shape[:2]
     mx = int(ww * 0.02)
     my = int(hh * 0.02)
@@ -258,7 +260,7 @@ def extract_green_board(image: np.ndarray, min_area_ratio: float = 0.18, min_gre
 
 
 # =========================
-# 2. 鍥惧儚澧炲己
+# 2. 图像增强
 # =========================
 
 def resize_for_ocr(img: np.ndarray, target_width: int = 1800) -> np.ndarray:
@@ -272,7 +274,7 @@ def resize_for_ocr(img: np.ndarray, target_width: int = 1800) -> np.ndarray:
 
 def enhance_variants(board: np.ndarray) -> dict[str, np.ndarray]:
     """
-    鐢熸垚澶氫釜鍥惧儚鐗堟湰锛孫CR 鍚庨€夋渶濂界殑涓€鐗?
+    生成多个图像版本，OCR 后选最好的一个
     """
     orig_h, orig_w = board.shape[:2]
     board = resize_for_ocr(board, target_width=1800)
@@ -298,7 +300,7 @@ def enhance_variants(board: np.ndarray) -> dict[str, np.ndarray]:
         -5,
     )
 
-    # 鍘诲皬鍣偣
+    # 去小噪点
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     cleaned = np.zeros_like(binary)
     for i in range(1, num_labels):
@@ -306,7 +308,7 @@ def enhance_variants(board: np.ndarray) -> dict[str, np.ndarray]:
         if 12 <= area <= 50000:
             cleaned[labels == i] = 255
 
-    # 杞垚鐧藉簳榛戝瓧鐗堟湰锛屾湁鏃舵洿鍒╀簬 OCR
+    # 转成白底黑字版本，有时更利于 OCR
     white_bg = 255 - cleaned
 
     adaptive = cv2.adaptiveThreshold(
@@ -342,13 +344,13 @@ def enhance_variants(board: np.ndarray) -> dict[str, np.ndarray]:
 
 
 # =========================
-# 3. RapidOCR 杈撳嚭瑙ｆ瀽
+# 3. RapidOCR 输出解析
 # =========================
 
 def quad_to_xyxy(box: Any) -> list[int] | None:
     """
-    鎶?box 缁熶竴杞垚 [x1, y1, x2, y2]
-    鏀寔:
+    将 box 统一转成 [x1, y1, x2, y2]
+    支持:
     - [x1, y1, x2, y2]
     - [[x, y], [x, y], [x, y], [x, y]]
     """
@@ -387,7 +389,7 @@ def quad_to_xyxy(box: Any) -> list[int] | None:
 
 def _unwrap_rapidocr_result(raw: Any) -> Any:
     """
-    鍏煎 RapidOCR 鍙兘杩斿洖:
+    兼容 RapidOCR 可能返回:
     - result
     - (result, elapse)
     """
@@ -440,13 +442,13 @@ def _build_item(box: Any, text: Any, score: Any) -> dict | None:
 
 def parse_rapidocr_output(raw: Any) -> list[dict]:
     """
-    鍏煎涓嶅悓 RapidOCR 杩斿洖鏍煎紡锛屽苟澶勭悊 txts=None 鐨勬儏鍐?
+    兼容不同 RapidOCR 返回格式，并处理 txts=None 的情况
     """
     data = _unwrap_rapidocr_result(raw)
     if data is None:
         return []
 
-    # 鎯呭喌 1: 瀵硅薄灞炴€?
+    # 情况 1: 对象属性
     if hasattr(data, "boxes") or hasattr(data, "txts") or hasattr(data, "scores"):
         boxes = _safe_list(getattr(data, "boxes", None))
         txts = _safe_list(getattr(data, "txts", None))
@@ -467,7 +469,7 @@ def parse_rapidocr_output(raw: Any) -> list[dict]:
                 items.append(item)
         return items
 
-    # 鎯呭喌 2: dict
+    # 情况 2: dict
     if isinstance(data, dict):
         boxes = _safe_list(data.get("boxes"))
         txts = _safe_list(data.get("txts", data.get("texts", data.get("rec_texts"))))
@@ -494,7 +496,7 @@ def parse_rapidocr_output(raw: Any) -> list[dict]:
 
         return []
 
-    # 鎯呭喌 3: list
+    # 情况 3: list
     if isinstance(data, list):
         items = []
         for elem in data:
@@ -521,7 +523,7 @@ def parse_rapidocr_output(raw: Any) -> list[dict]:
 
         return items
 
-    # 鎯呭喌 4: 鍏滃簳灏濊瘯 __dict__
+    # 情况 4: 兜底尝试 __dict__
     if hasattr(data, "__dict__"):
         return parse_rapidocr_output(vars(data))
 
@@ -530,7 +532,7 @@ def parse_rapidocr_output(raw: Any) -> list[dict]:
 
 def run_ocr_on_image(engine: RapidOCR, image: np.ndarray) -> list[dict]:
     """
-    灏嗗浘鍍忓啓鎴愪复鏃舵枃浠跺悗鍠傜粰 RapidOCR
+    将图像写成临时文件后喂给 RapidOCR
     """
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         temp_path = f.name
@@ -549,7 +551,7 @@ def run_ocr_on_image(engine: RapidOCR, image: np.ndarray) -> list[dict]:
 
 
 # =========================
-# 4. OCR 鏂囨湰鍚庡鐞?
+# 4. OCR 文本后处理
 # =========================
 
 PAGE_RE = re.compile(r"\bP\s*(\d{2,3})\b", re.IGNORECASE)
@@ -603,7 +605,7 @@ def normalize_text(s: str) -> str:
     for k, v in repl.items():
         s = s.replace(k, v)
 
-    # ??????????
+    # 合并连续的点号噪声
     s = s.replace("??", ".")
 
     s = re.sub(r"\bP\s+(\d+)\b", r"P\1", s)
@@ -679,7 +681,9 @@ def question_triplet_str(q: str) -> tuple[str, str, str] | None:
 
 def _is_compact_ambiguous_question_token(token: str) -> bool:
     """
-    褰㈠ "1.56" 鐨勭揣鍑戝啓娉曞湪 OCR 涓涔夊緢澶э紝甯哥敱 "1.6.1" 鎵洸鑰屾潵銆?    杩欓噷浠呭仛鏍囪锛屼笉鐩存帴涓㈠純锛屽悗缁粨鍚堟敮鎸佸害鍐嶈繃婊ゃ€?    """
+    形如 "1.56" 的紧凑写法在 OCR 里歧义很强，常由 "1.6.1" 一类内容粘连/误识别而来。
+    这里只做可疑标记，不直接删除，后续再结合支持度过滤。
+    """
     t = normalize_text(token).strip()
     if not t or t.startswith("P"):
         return False
@@ -687,7 +691,7 @@ def _is_compact_ambiguous_question_token(token: str) -> bool:
     if "(" in t or ")" in t:
         return False
 
-    # 鍙鈥滃崟涓偣 + 鍓?鍚?浣嶆暟瀛椻€濆仛姝т箟鏍囪锛屽 1.56 / 2.26
+    # 只对“单个点 + 前后两位数字”做歧义标记，如 1.56 / 2.26
     if t.count(".") != 1:
         return False
     parts = [x for x in t.split(".") if x]
@@ -743,7 +747,7 @@ def _build_question_from_parts(
         elif len(left) == 1 and len(right) == 2:
             triplet = [left, right[0], right[1]]
         elif len(left) == 1 and prefix is not None and left == prefix[0]:
-            # 褰㈠ "2.2(2)" 鏃讹紝閫氬父鏄己澶卞瓧绗﹀鑷达紝涓嶇洿鎺ヨˉ鎴?2.2.2
+            # 形如 "2.2(2)" 时，通常是缺失字符导致，不直接补成 2.2.2
             if len(right) == 1 and sub_nums:
                 return None
             triplet = [left, prefix[1], right]
@@ -751,7 +755,7 @@ def _build_question_from_parts(
         digits = parts[0]
         if len(digits) == 3:
             if prefix is None:
-                # ?????????????????? 446/141/422
+                # 无前缀时仅放行含重复数字的 3 位串，如 446/141/422
                 if digits[0] == digits[1] or digits[0] == digits[2] or digits[1] == digits[2]:
                     triplet = [digits[0], digits[1], digits[2]]
             else:
@@ -862,7 +866,7 @@ def repair_question_token(
 
 def group_items_to_lines(items: list[dict]) -> list[dict]:
     """
-    ??y ?????OCR box ??????????
+    按 y 坐标聚类 OCR box，并合并成行文本
     """
     items = [x for x in items if x["score"] >= 0.20 and x["text"].strip()]
     items = sorted(items, key=lambda x: (x["yc"], x["xc"]))
@@ -908,8 +912,8 @@ def group_items_to_lines(items: list[dict]) -> list[dict]:
 
 def repair_page_token(token: str) -> str:
     """
-    ?????OCR ????????token ?????? P206
-    ???:
+    修复 OCR 易混淆的页码 token，标准化为 P206
+    示例:
     - 206   -> P206
     - P206  -> P206
     - PZ06  -> P206
@@ -953,13 +957,13 @@ def extract_page_from_line(
     known_prefixes: list[tuple[str, str]] | None = None,
 ) -> str | None:
     """
-    ???????????????
+    从单行文本中提取页码
     """
     text = line["text"]
     tokens = line.get("tokens", [])
     known_prefixes = known_prefixes or []
 
-    # ?? Pxxx ???
+    # 先找 Pxxx 直出
     m = PAGE_RE.search(text)
     if m:
         return f"P{m.group(1)}"
@@ -975,11 +979,11 @@ def extract_page_from_line(
 
     page = f"P{m.group(1)}"
 
-    # ?? P ????????
+    # 若原 token 以 P 开头，直接采用修复结果
     if first_raw.startswith("P"):
         return page
 
-    # ? P ????????????????????????
+    # 非 P 前缀时，需要同一行存在题号证据再认定为页码
     if "." in first_raw or "(" in first_raw or ")" in first_raw:
         return None
     if len(tokens) < 2:
@@ -997,7 +1001,7 @@ def extract_page_from_line(
     current_num = _parse_page_num(current_page)
     new_num = _parse_page_num(page)
     if current_num is not None and new_num is not None:
-        # ??????????????????
+        # 与当前页差距过大时视为误识别
         if abs(new_num - current_num) > 40:
             return None
 
@@ -1195,12 +1199,12 @@ def extract_questions_from_line(
 
 def extract_assignments_from_lines(lines: list[dict]) -> list[dict]:
     """
-    ???:
+    示例:
     P210 4.4.2 4.4.5
     4.4.6 4.4.8
     4.4.11
 
-    ???????????Pxxx?????????????
+    自动继承最近一次识别到的 Pxxx 作为题号页码。
     """
     current_page = None
     known_prefixes: list[tuple[str, str]] = []
@@ -1228,7 +1232,7 @@ def extract_assignments_from_lines(lines: list[dict]) -> list[dict]:
                 known_prefixes = [pref] + [x for x in known_prefixes if x != pref]
                 known_prefixes = known_prefixes[:8]
 
-    # ???????
+    # 去重（保持顺序）
     seen = set()
     deduped = []
     for item in extracted:
@@ -1686,8 +1690,8 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
 
 def choose_best_variant(variant_results: list[dict]) -> dict:
     """
-    浼樺厛閫夆€滄彁鍙栭鍙锋暟閲忔洿澶氣€濈殑鐗堟湰锛?
-    鏁伴噺鐩稿悓鍒欓€夊钩鍧囩疆淇″害鏇撮珮鐨勭増鏈€?
+    优先选“提取题号数量更多”的版本；
+    数量相同则选平均置信度更高的版本。
     """
     best = None
     for vr in variant_results:
@@ -1724,7 +1728,7 @@ def draw_boxes(image: np.ndarray, items: list[dict]) -> np.ndarray:
 
 
 # =========================
-# 5. 鍗曞浘 / 鎵瑰鐞?
+# 5. 单图 / 批处理
 # =========================
 
 def process_one_image(
@@ -1735,7 +1739,7 @@ def process_one_image(
 ) -> dict:
     image = cv2.imread(str(image_path))
     if image is None:
-        raise ValueError(f"璇诲浘澶辫触: {image_path}")
+        raise ValueError(f"读取图片失败: {image_path}")
 
     board = get_board(image, manual_points=manual_points)
     variants = enhance_variants(board)
@@ -1935,11 +1939,11 @@ def main() -> None:
         default=".",
         help="单张图片路径，或图片目录；默认为当前目录",
     )
-    parser.add_argument("--output", default="output_hw", help="杈撳嚭鐩綍")
+    parser.add_argument("--output", default="output_hw", help="输出目录")
     parser.add_argument(
         "--manual_points",
         default="",
-        help='鍙€夛紝鎵嬪姩鎸囧畾榛戞澘鍥涚偣: "x1,y1;x2,y2;x3,y3;x4,y4"',
+        help='可选，手动指定黑板四点: "x1,y1;x2,y2;x3,y3;x4,y4"',
     )
     args = parser.parse_args()
 
@@ -1951,7 +1955,7 @@ def main() -> None:
 
     image_files = collect_images(input_path)
     if not image_files:
-        raise ValueError("娌℃湁鎵惧埌鍥剧墖")
+        raise ValueError("没有找到图片")
 
     results = []
     for img_path in image_files:
