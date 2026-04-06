@@ -1,0 +1,36 @@
+{
+  "image": "02CF3A6F0C29C7128F0CF67328BCA7EC.jpg",
+  "best_variant": "ensemble/board_binary",
+  "assignments": [
+    {
+      "page": "P210",
+      "question": "4.4.2",
+      "line_text": "P210 44.2 4.45",
+      "line_score": 0.9637333333333333
+    },
+    {
+      "page": "P210",
+      "question": "4.4.5",
+      "line_text": "P210 4.4.2 4.4.5",
+      "line_score": 0.9006033333333333
+    },
+    {
+      "page": "P210",
+      "question": "4.4.6",
+      "line_text": "446 448",
+      "line_score": 0.5693889
+    },
+    {
+      "page": "P210",
+      "question": "4.4.8",
+      "line_text": "446 44.8",
+      "line_score": 0.8880300000000001
+    },
+    {
+      "page": "P210",
+      "question": "4.4.11",
+      "line_text": "4 4.11 1",
+      "line_score": 0.95663
+    }
+  ]
+}

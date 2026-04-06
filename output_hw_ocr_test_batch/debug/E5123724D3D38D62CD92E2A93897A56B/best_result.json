@@ -1,0 +1,36 @@
+{
+  "image": "E5123724D3D38D62CD92E2A93897A56B.jpg",
+  "best_variant": "ensemble/board_clahe",
+  "assignments": [
+    {
+      "page": "P37",
+      "question": "1.5.2",
+      "line_text": "P37 1.5.2 1.61 1.6.3",
+      "line_score": 0.85981
+    },
+    {
+      "page": "P37",
+      "question": "1.6.1",
+      "line_text": "P37 1.5.2 1.61 1.6.3",
+      "line_score": 0.49868979999999996
+    },
+    {
+      "page": "P37",
+      "question": "1.6.3",
+      "line_text": "P37 1.5.2 1.61 1.6.3",
+      "line_score": 0.85981
+    },
+    {
+      "page": "P37",
+      "question": "1.4.3",
+      "line_text": "1.4.3",
+      "line_score": 0.88678
+    },
+    {
+      "page": "P37",
+      "question": "1.4.1",
+      "line_text": "1长11.4.3",
+      "line_score": 0.557179
+    }
+  ]
+}

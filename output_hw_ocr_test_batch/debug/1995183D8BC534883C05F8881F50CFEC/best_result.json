@@ -1,0 +1,30 @@
+{
+  "image": "1995183D8BC534883C05F8881F50CFEC.jpg",
+  "best_variant": "ensemble/board_original",
+  "assignments": [
+    {
+      "page": "P206",
+      "question": "4.1.6",
+      "line_text": "206 412 4.1.6",
+      "line_score": 0.92532
+    },
+    {
+      "page": "P206",
+      "question": "4.1.2",
+      "line_text": "P2016 41.2 4.1.6",
+      "line_score": 0.8691533333333333
+    },
+    {
+      "page": "P208",
+      "question": "4.2.2",
+      "line_text": "P208 42.2 42.4",
+      "line_score": 0.85033
+    },
+    {
+      "page": "P208",
+      "question": "4.2.4",
+      "line_text": "P208 42、2 42.4",
+      "line_score": 0.8877066666666668
+    }
+  ]
+}

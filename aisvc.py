@@ -82,6 +82,7 @@ class AIService:
     _EBOOK_SUFFIXES = {".epub", ".mobi"}
     _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
     _CHAT_CONTEXT_MAX_MESSAGES = 100
+    _CHAT_TEMPERATURE = 0.65
     _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
     _AUTO_ORGANIZE_EBOOK_SUBJECT = "课外书"
     _AUTO_ORGANIZE_MARKS_FILENAME = "ai_material_scan_marks.json"
@@ -2357,7 +2358,7 @@ class AIService:
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": content},
             ],
-            "temperature": 0.4,
+            "temperature": float(self._CHAT_TEMPERATURE),
         }
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
@@ -2389,7 +2390,7 @@ class AIService:
         payload = {
             "model": self.chat_model,
             "messages": [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
-            "temperature": 0.4,
+            "temperature": float(self._CHAT_TEMPERATURE),
         }
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)

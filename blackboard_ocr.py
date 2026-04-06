@@ -556,7 +556,7 @@ def run_ocr_on_image(engine: RapidOCR, image: np.ndarray) -> list[dict]:
 
 PAGE_RE = re.compile(r"\bP\s*(\d{2,3})\b", re.IGNORECASE)
 QUESTION_RE = re.compile(r"\b\d+(?:\.\d+)+(?:\(\d+\))*\b")
-VALID_QUESTION_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{1,3}(?:\(\d+\))*$")
+VALID_QUESTION_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{1,2}(?:\(\d+\))*$")
 
 OCR_DIGIT_TRANS = str.maketrans(
     {
@@ -638,32 +638,32 @@ def is_valid_question(q: str | None) -> bool:
     if not VALID_QUESTION_RE.fullmatch(q):
         return False
 
-    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})", q)
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,2})", q)
     if not m:
         return False
 
     a, b, c = map(int, m.groups())
-    if not (1 <= a <= 30 and 1 <= b <= 30 and 1 <= c <= 999):
+    if not (1 <= a <= 30 and 1 <= b <= 30 and 1 <= c <= 99):
         return False
     return True
 
 
 def question_prefix(q: str) -> tuple[str, str] | None:
-    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.\d{1,3}", q)
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.\d{1,2}", q)
     if not m:
         return None
     return m.group(1), m.group(2)
 
 
 def question_base(q: str) -> str:
-    m = re.match(r"^(\d{1,2}\.\d{1,2}\.\d{1,3})", q)
+    m = re.match(r"^(\d{1,2}\.\d{1,2}\.\d{1,2})", q)
     if not m:
         return q
     return m.group(1)
 
 
 def question_sort_key(q: str) -> tuple[int, int, int, int]:
-    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})", q)
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,2})", q)
     if not m:
         return (999, 999, 999, 999)
     a, b, c = map(int, m.groups())
@@ -673,7 +673,7 @@ def question_sort_key(q: str) -> tuple[int, int, int, int]:
 
 
 def question_triplet_str(q: str) -> tuple[str, str, str] | None:
-    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})", q)
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,2})", q)
     if not m:
         return None
     return m.group(1), m.group(2), m.group(3)
@@ -746,6 +746,9 @@ def _build_question_from_parts(
             triplet = [left[0], left[1], right]
         elif len(left) == 1 and len(right) == 2:
             triplet = [left, right[0], right[1]]
+        elif len(left) == 1 and len(right) == 3:
+            # 形如 "4.416"/"4.418" 的写法，按 "4.4.16"/"4.4.18" 解释。
+            triplet = [left, right[0], right[1:]]
         elif len(left) == 1 and prefix is not None and left == prefix[0]:
             # 形如 "2.2(2)" 时，通常是缺失字符导致，不直接补成 2.2.2
             if len(right) == 1 and sub_nums:
@@ -1136,7 +1139,7 @@ def extract_questions_from_line(
     # If one question has bracket sub-number, avoid treating that sub-number as a new question.
     cleaned: list[str] = []
     for q in out:
-        m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})", q)
+        m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,2})", q)
         if m is None:
             cleaned.append(q)
             continue
@@ -1147,7 +1150,7 @@ def extract_questions_from_line(
             for other in out:
                 if other == q or "(" not in other:
                     continue
-                m2 = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})", other)
+                m2 = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,2})", other)
                 if m2 is None:
                     continue
                 if m2.group(1) == a and m2.group(2) == b:
@@ -1165,7 +1168,7 @@ def extract_questions_from_line(
     # in the same line, treat the high-tail one as likely OCR drift (e.g. 1.5.6 vs 1.4.3).
     parsed_cleaned: list[tuple[int, str, int, int, int]] = []
     for idx, q in enumerate(cleaned):
-        m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})", q)
+        m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,2})", q)
         if m is None:
             continue
         try:
@@ -1423,6 +1426,27 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
         except ValueError:
             pass
 
+    # Under one prefix, if many strong two-digit tails exist, weak single-digit tails
+    # are usually OCR drift (e.g. 4.4.4/4.4.7 amid 4.4.16/18/20/25/29/32).
+    prefix_strong_two_digit_tails: dict[tuple[str, str], set[int]] = defaultdict(set)
+    prefix_strong_low_tail_count: dict[tuple[str, str], int] = defaultdict(int)
+    for q in selected_questions:
+        pref = question_prefix(q)
+        triplet = question_triplet_str(q)
+        if pref is None or triplet is None:
+            continue
+        try:
+            tail_num = int(triplet[2])
+        except ValueError:
+            continue
+        rec_q = merged[q]
+        support_q = int(len(rec_q["variants"]))
+        score_q = float(rec_q["best_score"])
+        if tail_num >= 10 and support_q >= 2 and score_q >= 0.85:
+            prefix_strong_two_digit_tails[pref].add(tail_num)
+        if tail_num <= 9 and support_q >= 3 and score_q >= 0.90:
+            prefix_strong_low_tail_count[pref] += 1
+
     out = []
     for q in selected_questions:
         rec = merged[q]
@@ -1457,6 +1481,16 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                 tail_num_for_soft = int(triplet[2])
             except ValueError:
                 tail_num_for_soft = -1
+            if (
+                seg_len == 1
+                and tail_num_for_soft >= 1
+                and len(prefix_strong_two_digit_tails.get(pref, set())) >= 3
+                and prefix_strong_low_tail_count.get(pref, 0) == 0
+                and rec["count"] <= 2
+                and variant_support <= 2
+                and rec["best_score"] < 0.90
+            ):
+                continue
             # Weak outlier section under same chapter (e.g. 4.1.1 amid strong 4.4.* cluster).
             sec_weights = first_second_weights.get(triplet[0], {})
             if len(sec_weights) >= 2:
@@ -1981,4 +2015,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

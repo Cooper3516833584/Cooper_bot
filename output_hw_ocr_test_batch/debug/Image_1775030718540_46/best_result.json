@@ -1,0 +1,36 @@
+{
+  "image": "Image_1775030718540_46.jpg",
+  "best_variant": "ensemble/board_clahe",
+  "assignments": [
+    {
+      "page": "P210",
+      "question": "4.4.2",
+      "line_text": "P210 4.4.2 4.45",
+      "line_score": 0.9328233333333333
+    },
+    {
+      "page": "P210",
+      "question": "4.4.5",
+      "line_text": "P210 4.4.2 4.4.5",
+      "line_score": 0.9080400000000001
+    },
+    {
+      "page": "P210",
+      "question": "4.4.6",
+      "line_text": "44.6 +48",
+      "line_score": 0.830445
+    },
+    {
+      "page": "P210",
+      "question": "4.4.11",
+      "line_text": "44.11",
+      "line_score": 0.96128
+    },
+    {
+      "page": "P210",
+      "question": "4.4.8",
+      "line_text": "44.8",
+      "line_score": 0.78308
+    }
+  ]
+}

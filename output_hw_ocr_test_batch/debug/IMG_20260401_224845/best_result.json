@@ -1,0 +1,36 @@
+{
+  "image": "IMG_20260401_224845.jpg",
+  "best_variant": "ensemble/board_enhanced",
+  "assignments": [
+    {
+      "page": "P206",
+      "question": "4.1.6",
+      "line_text": "206 412 4.1.6",
+      "line_score": 0.9529033333333333
+    },
+    {
+      "page": "P206",
+      "question": "4.1.2",
+      "line_text": "206 412 4.1.6",
+      "line_score": 0.5336258666666667
+    },
+    {
+      "page": "P208",
+      "question": "4.2.2",
+      "line_text": "20 42.2 42.4",
+      "line_score": 0.9446333333333333
+    },
+    {
+      "page": "P208",
+      "question": "4.2.4",
+      "line_text": "20 42.2 42.4",
+      "line_score": 0.9446333333333333
+    },
+    {
+      "page": "P200",
+      "question": "4.5.2",
+      "line_text": "200 45.2 4.2.4",
+      "line_score": 0.8513933333333333
+    }
+  ]
+}

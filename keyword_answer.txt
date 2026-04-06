@@ -34,9 +34,9 @@ q:ciallo
 q:Ciallo
 a:唉臭二次元
 
-#q:go
-#q:cs
-#a:go学长收收味
+q:go
+q:cs
+a:go学长收收味
 
 q:三角洲
 q:打洲

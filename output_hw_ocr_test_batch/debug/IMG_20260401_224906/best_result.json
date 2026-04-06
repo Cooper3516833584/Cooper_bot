@@ -1,0 +1,24 @@
+{
+  "image": "IMG_20260401_224906.jpg",
+  "best_variant": "ensemble/board_enhanced",
+  "assignments": [
+    {
+      "page": "P75",
+      "question": "2.3.5",
+      "line_text": "P5 2.3.5",
+      "line_score": 0.788135
+    },
+    {
+      "page": "P75",
+      "question": "2.4.2",
+      "line_text": "2.4.2",
+      "line_score": 0.954
+    },
+    {
+      "page": "P75",
+      "question": "2.4.3",
+      "line_text": "2.4.3.U)",
+      "line_score": 0.9445
+    }
+  ]
+}

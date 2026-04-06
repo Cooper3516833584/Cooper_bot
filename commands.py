@@ -54,6 +54,8 @@ _GROUP_NOTICE_MAX_CANDIDATES = 3
 _GROUP_NOTICE_DEDUP_SECONDS = 60.0
 _RECENT_REPLY_DEDUP_SECONDS = 2.0
 _RECENT_REPLY_KEYS: Dict[str, float] = {}
+_AI_REPEAT_GUARD_SECONDS = 5.0 * 60.0
+_AI_REPEAT_GUARD: Dict[str, dict] = {}
 _STATE_SWEEP_MIN_INTERVAL_SECONDS = 30.0
 _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
@@ -92,6 +94,38 @@ def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECON
         return False
     _RECENT_REPLY_KEYS[key] = now
     return True
+
+
+def _normalize_ai_guard_text(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip())
+
+
+def _is_likely_ai_stuck_repeat(session_key: Optional[str], user_input: str, assistant_output: str) -> bool:
+    key = str(session_key or "").strip() or "__stateless__"
+    now = time.time()
+    stale_before = now - float(_AI_REPEAT_GUARD_SECONDS)
+    for k, item in list(_AI_REPEAT_GUARD.items()):
+        if not isinstance(item, dict):
+            _AI_REPEAT_GUARD.pop(k, None)
+            continue
+        try:
+            ts = float(item.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+        if ts < stale_before:
+            _AI_REPEAT_GUARD.pop(k, None)
+
+    user_norm = _normalize_ai_guard_text(user_input)
+    out_norm = _normalize_ai_guard_text(assistant_output)
+    repeated = False
+    prev = _AI_REPEAT_GUARD.get(key)
+    if isinstance(prev, dict):
+        prev_out = _normalize_ai_guard_text(str(prev.get("out") or ""))
+        if prev_out and out_norm and (prev_out == out_norm):
+            repeated = True
+
+    _AI_REPEAT_GUARD[key] = {"user": user_norm, "out": out_norm, "ts": now}
+    return repeated
 def _normalize_answer_q(s: str) -> str:
     # 触发词匹配：忽略首尾空白、大小写，内部连续空白视为一个空格
     return re.sub(r"\s+", " ", (s or "").strip()).casefold()
@@ -834,14 +868,15 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
             if re.search(pat, msg, flags=re.IGNORECASE):
                 has_nick_mention = True
                 msg = re.sub(pat, "", msg, flags=re.IGNORECASE).strip()
+        # get_text 优先使用 raw_message，群聊@常带 [CQ:at,qq=...]，这里移除避免把 bot QQ 误当作用户 QQ。
+        msg = re.sub(r"(?i)\[CQ:at,[^\]]+\]", "", msg).strip()
         if not (_evt_mentions_me(evt) or has_nick_mention):
             return None
         return msg
     if scene.startswith("private"):
-        m = re.match(r"^[cC](.*)$", msg)
-        if not m:
+        if not msg or (msg[0] not in ("c", "C")):
             return None
-        return (m.group(1) or "").strip()
+        return msg[1:].strip()
     return None
 
 
@@ -864,6 +899,26 @@ def _ai_chat_session_key(ctx) -> Optional[str]:
         except Exception:
             return None
     return None
+
+
+def _augment_ai_input_with_sender(ctx, ai_input: str) -> str:
+    msg = str(ai_input or "").strip()
+    if not msg:
+        return msg
+    scene = str(getattr(ctx, "scene", "") or "").strip().lower()
+    try:
+        uid = int(getattr(ctx, "user_id"))
+    except Exception:
+        uid = None
+    if uid is None:
+        return msg
+    if scene == "group":
+        gid = getattr(ctx, "group_id", None)
+        if gid is not None:
+            return f"发言人QQ:{uid}\n群号:{gid}\n{msg}"
+    if scene.startswith("private"):
+        return f"发言人QQ:{uid}\n{msg}"
+    return msg
 
 
 def _remember_non_ai_chat_message(ctx, text: str, logsvc: LogService, aisvc: Optional["AIService"] = None) -> None:
@@ -2675,6 +2730,7 @@ async def _handle_ai_chat_trigger(
 ):
     ai_input = _extract_ai_chat_input(ctx, evt, t, bot_nick=(aisvc.bot_nick if aisvc else AI_BOT_NICK))
     if ai_input is not None:
+        ai_input = _augment_ai_input_with_sender(ctx, ai_input)
         if not ai_input:
             await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊消息前加 C。", logsvc)
             return True
@@ -2691,6 +2747,14 @@ async def _handle_ai_chat_trigger(
                     pass
             else:
                 out = (await aisvc.chat(ai_input)).strip()
+            if out and _is_likely_ai_stuck_repeat(session_key, ai_input, out):
+                retry_prompt = (
+                    "你刚才出现了机械复读。请只根据这条新消息给出新的、准确的回复，不要复述上一条答案。\n"
+                    + ai_input
+                )
+                retry_out = (await aisvc.chat(retry_prompt)).strip()
+                if retry_out:
+                    out = retry_out
             if not out:
                 out = "我这边没收到有效回复，稍后再试一次。"
             await reply(api, ctx, out, logsvc)

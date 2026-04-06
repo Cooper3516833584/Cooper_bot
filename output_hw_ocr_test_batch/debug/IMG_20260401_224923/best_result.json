@@ -1,0 +1,24 @@
+{
+  "image": "IMG_20260401_224923.jpg",
+  "best_variant": "ensemble/board_clahe",
+  "assignments": [
+    {
+      "page": "P75",
+      "question": "2.3.5",
+      "line_text": "2.3.5",
+      "line_score": 0.94959
+    },
+    {
+      "page": "P75",
+      "question": "2.4.2",
+      "line_text": "2.4.2",
+      "line_score": 0.96101
+    },
+    {
+      "page": "P75",
+      "question": "2.4.3(1)",
+      "line_text": "2.4.3.11) 13",
+      "line_score": 0.85049
+    }
+  ]
+}

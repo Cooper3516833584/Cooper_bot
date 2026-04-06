@@ -100,6 +100,8 @@ def dispatch_harness(monkeypatch):
     monkeypatch.setattr(commands, "_ensure_group_context_and_schedule_digest", _noop_group_context)
     monkeypatch.setattr(commands, "_handle_pre_dispatch_state", _noop_pre_state)
     monkeypatch.setattr(commands.asyncio, "to_thread", _immediate_to_thread)
+    if hasattr(commands, "_AI_REPEAT_GUARD"):
+        commands._AI_REPEAT_GUARD.clear()
     return recorder
 
 
@@ -213,7 +215,36 @@ async def test_command_aichat_dispatch(dispatch_harness) -> None:
 
     aisvc.chat_with_context.assert_awaited_once()
     assert aisvc.chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
-    assert aisvc.chat_with_context.await_args.args[1] == "你好"
+    model_input = aisvc.chat_with_context.await_args.args[1]
+    assert f"发言人QQ:{ctx.user_id}" in model_input
+    assert "你好" in model_input
+    assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_command_aichat_private_prefix_allows_newline_payload(dispatch_harness) -> None:
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="C\nhello",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.chat_with_context.assert_awaited_once()
+    assert aisvc.chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
+    model_input = aisvc.chat_with_context.await_args.args[1]
+    assert f"发言人QQ:{ctx.user_id}" in model_input
+    assert "hello" in model_input
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
 
 
@@ -259,6 +290,84 @@ async def test_command_private_vs_group_route(dispatch_harness) -> None:
     session_keys = {call.args[0] for call in aisvc.chat_with_context.await_args_list}
     assert f"private:{private_ctx.user_id}" in session_keys
     assert f"group:{group_ctx.group_id}" in session_keys
+
+
+@pytest.mark.asyncio
+async def test_group_aichat_strips_cq_at_and_uses_sender_qq(dispatch_harness) -> None:
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+    group_ctx = _make_ctx(scene="group", group_id=20001, level=1, user_id=10002)
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=group_ctx,
+        evt={
+            "self_id": "42",
+            "post_type": "message",
+            "message_type": "group",
+            "message": [
+                {"type": "at", "data": {"qq": "42"}},
+                {"type": "text", "data": {"text": " 你能看到我吗"}},
+            ],
+            "raw_message": "[CQ:at,qq=42] 你能看到我吗",
+        },
+        text="[CQ:at,qq=42] 你能看到我吗",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.chat_with_context.assert_awaited_once()
+    assert aisvc.chat_with_context.await_args.args[0] == f"group:{group_ctx.group_id}"
+    model_input = aisvc.chat_with_context.await_args.args[1]
+    assert "发言人QQ:10002" in model_input
+    assert "你能看到我吗" in model_input
+    assert "qq=42" not in model_input
+    assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_aichat_repeat_guard_retries_with_stateless_chat(dispatch_harness) -> None:
+    filesvc = _make_filesvc_stub()
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=1, user_id=10001)
+
+    aisvc = _FakeAIService()
+    aisvc.chat_with_context = AsyncMock(side_effect=["same-output", "same-output"])
+    aisvc.chat = AsyncMock(return_value="retry-output")
+
+    state = commands.BotState()
+    evt = {"post_type": "message", "message_type": "private", "sub_type": "friend"}
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt=evt,
+        text="C第一句",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt=evt,
+        text="C第二句",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    assert aisvc.chat_with_context.await_count == 2
+    aisvc.chat.assert_awaited_once()
+    assert any(one["text"] == "retry-output" for one in dispatch_harness.messages)
 
 
 @pytest.mark.asyncio

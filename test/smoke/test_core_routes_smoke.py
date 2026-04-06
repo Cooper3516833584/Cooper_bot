@@ -100,6 +100,8 @@ def smoke_dispatch_harness(monkeypatch):
     monkeypatch.setattr(commands, "_ensure_group_context_and_schedule_digest", _noop_group_context)
     monkeypatch.setattr(commands, "_handle_pre_dispatch_state", _noop_pre_state)
     monkeypatch.setattr(commands.asyncio, "to_thread", _immediate_to_thread)
+    if hasattr(commands, "_AI_REPEAT_GUARD"):
+        commands._AI_REPEAT_GUARD.clear()
     return recorder
 
 

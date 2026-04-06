@@ -1,0 +1,42 @@
+{
+  "image": "1.jpg",
+  "best_variant": "ensemble/board_gray",
+  "assignments": [
+    {
+      "page": "P213",
+      "question": "4.4.20",
+      "line_text": "4.4.20",
+      "line_score": 0.96162
+    },
+    {
+      "page": "P214",
+      "question": "4.4.25",
+      "line_text": "214 4.4.25",
+      "line_score": 0.901205
+    },
+    {
+      "page": "P214",
+      "question": "4.4.29",
+      "line_text": "4.4.29",
+      "line_score": 0.92243
+    },
+    {
+      "page": "P214",
+      "question": "4.4.32",
+      "line_text": "4.4.32",
+      "line_score": 0.96091
+    },
+    {
+      "page": "P214",
+      "question": "4.4.429",
+      "line_text": "4.429",
+      "line_score": 0.8833932000000001
+    },
+    {
+      "page": "P214",
+      "question": "4.4.7",
+      "line_text": "4.4.7",
+      "line_score": 0.86385
+    }
+  ]
+}

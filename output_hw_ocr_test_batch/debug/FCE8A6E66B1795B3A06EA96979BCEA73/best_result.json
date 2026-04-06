@@ -1,0 +1,36 @@
+{
+  "image": "FCE8A6E66B1795B3A06EA96979BCEA73.jpg",
+  "best_variant": "ensemble/board_enhanced",
+  "assignments": [
+    {
+      "page": "P39",
+      "question": "1.5.2",
+      "line_text": "P39 1.5.2 1.61 1、6.3",
+      "line_score": 0.8578775
+    },
+    {
+      "page": "P39",
+      "question": "1.6.1",
+      "line_text": "P39 1.5.2 1.6.1。 1、6.3",
+      "line_score": 0.82194
+    },
+    {
+      "page": "P39",
+      "question": "1.6.3",
+      "line_text": "P39 1.5.2 1.61 1、6.3",
+      "line_score": 0.8578775
+    },
+    {
+      "page": "P39",
+      "question": "1.4.3",
+      "line_text": "1.4.3",
+      "line_score": 0.92344
+    },
+    {
+      "page": "P39",
+      "question": "1.4.1",
+      "line_text": "1长11.4.3",
+      "line_score": 0.526442
+    }
+  ]
+}
