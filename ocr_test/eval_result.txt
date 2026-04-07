@@ -1,0 +1,65 @@
+
+[NG] 1.jpg  (gt=6 ocr=5 hit=5 fp=0 fn=1)
+   FN(漏) P213  4.4.16
+
+[OK] 2.jpg  (gt=5 ocr=5 hit=5 fp=0 fn=0)
+
+[OK] 3.jpg  (gt=4 ocr=4 hit=4 fp=0 fn=0)
+
+[NG] 4.jpg  (gt=5 ocr=5 hit=0 fp=5 fn=5)
+   FN(漏) P39  1.4.1
+   FN(漏) P39  1.4.3
+   FN(漏) P39  1.5.2
+   FN(漏) P39  1.6.1
+   FN(漏) P39  1.6.3
+   FP(多) P37  1.4.1
+   FP(多) P37  1.4.3
+   FP(多) P37  1.5.2
+   FP(多) P37  1.6.1
+   FP(多) P37  1.6.3
+
+[OK] 5.jpg  (gt=4 ocr=4 hit=4 fp=0 fn=0)
+
+[OK] 6.jpg  (gt=6 ocr=6 hit=6 fp=0 fn=0)
+
+[OK] 7.jpg  (gt=4 ocr=4 hit=4 fp=0 fn=0)
+
+[OK] 8.jpg  (gt=5 ocr=5 hit=5 fp=0 fn=0)
+
+[NG] 9.jpg  (gt=5 ocr=6 hit=5 fp=1 fn=0)
+   FP(多) P39  1.6.11
+Traceback (most recent call last):
+  File "C:\Users\Cooper\Desktop\Cooper_bot\ocr_test\eval_ocr.py", line 145, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\Cooper\Desktop\Cooper_bot\ocr_test\eval_ocr.py", line 110, in main
+    result   = recognize_homework_from_path(str(img_path), engine=engine)
+  File "C:\Users\Cooper\Desktop\Cooper_bot\blackboard_ocr.py", line 1974, in recognize_homework_from_path
+    out = recognize_homework_from_array(
+        image,
+    ...<2 lines>...
+        min_green_ratio=min_green_ratio,
+    )
+  File "C:\Users\Cooper\Desktop\Cooper_bot\blackboard_ocr.py", line 1960, in recognize_homework_from_array
+    data = process_board_image(board, engine=engine)
+  File "C:\Users\Cooper\Desktop\Cooper_bot\blackboard_ocr.py", line 1909, in process_board_image
+    items = run_ocr_on_image(ocr_engine, var_img)
+  File "C:\Users\Cooper\Desktop\Cooper_bot\blackboard_ocr.py", line 546, in run_ocr_on_image
+    raw = engine(temp_path)
+  File "C:\Users\Cooper\AppData\Local\Programs\Python\Python313\Lib\site-packages\rapidocr\main.py", line 113, in __call__
+    det_res, cls_res, rec_res, cropped_img_list = self.run_ocr_steps(img, op_record)
+                                                  ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "C:\Users\Cooper\AppData\Local\Programs\Python\Python313\Lib\site-packages\rapidocr\main.py", line 123, in run_ocr_steps
+    cropped_img_list, det_res = self.detect_and_crop(img, op_record)
+                                ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "C:\Users\Cooper\AppData\Local\Programs\Python\Python313\Lib\site-packages\rapidocr\main.py", line 288, in detect_and_crop
+    det_res = self.text_det(img)
+  File "C:\Users\Cooper\AppData\Local\Programs\Python\Python313\Lib\site-packages\rapidocr\ch_ppocr_det\main.py", line 61, in __call__
+    preds = self.session(prepro_img)
+  File "C:\Users\Cooper\AppData\Local\Programs\Python\Python313\Lib\site-packages\rapidocr\inference_engine\onnxruntime\main.py", line 88, in __call__
+    return self.session.run(self.get_output_names(), input_dict)[0]
+           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Cooper\AppData\Local\Programs\Python\Python313\Lib\site-packages\onnxruntime\capi\onnxruntime_inference_collection.py", line 296, in run
+    return self._sess.run(output_names, input_feed, run_options)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

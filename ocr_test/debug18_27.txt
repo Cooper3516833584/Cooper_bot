@@ -1,0 +1,20 @@
+﻿py :   File "<string>", lin
+e 21
+所在位置 行:1 字符: 1
++ py -c "
++ ~~~~~~~
+    + CategoryInfo         
+     : NotSpecified: (  F  
+  ile "<string>", line 2   
+ 1:String) [], RemoteEx    
+ception
+    + FullyQualifiedErrorI 
+   d : NativeCommandError
+ 
+    print(f'       line: {l
+n[" score\]:.2f}
+                           
+  ^
+SyntaxError: unterminated s
+tring literal (detected at 
+line 21)

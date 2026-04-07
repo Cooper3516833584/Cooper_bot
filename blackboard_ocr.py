@@ -214,7 +214,8 @@ def _has_green_board_contour(
             continue
 
         aspect = float(bw) / float(max(bh, 1))
-        if aspect < float(min_aspect):
+        # 放宽宽高比要求到 0.85，兼容近景拍摄的接近方形黑板图（原值 1.10 会误拒）
+        if aspect < float(min_aspect) and aspect < 0.85:
             continue
 
         extent = float(area) / float(rect_area)
@@ -975,7 +976,28 @@ def extract_page_from_line(
         return None
 
     first_raw = normalize_text(tokens[0]).strip()
-    first_page = repair_page_token(first_raw)
+
+    # 特殊情况：OCR 把 "P208" 读成 "1208"（1 粘在 P 前面）
+    # 尝试剥掉前导数字字符（最多 1 位），看剩余部分是否是合法页码
+    first_for_page = first_raw
+    if (
+        len(first_raw) == 4
+        and first_raw[0].isdigit()
+        and not first_raw.startswith("P")
+        and first_raw[1:].isdigit()
+    ):
+        # 形如 "1208"：前缀粘合，尝试把后三位当页码
+        candidate_body = first_raw[1:]
+        if 2 <= len(candidate_body) <= 3 and candidate_body.isdigit():
+            # 需要同行有题号证据才信任此页码
+            has_q_in_line = any(
+                is_valid_question(repair_question_token(t, preferred_prefixes=known_prefixes))
+                for t in tokens[1:]
+            )
+            if has_q_in_line:
+                return "P" + candidate_body
+
+    first_page = repair_page_token(first_for_page)
     m = PAGE_RE.fullmatch(first_page)
     if not m:
         return None
@@ -1577,15 +1599,19 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                     and rec["best_score"] < 0.90
                 ):
                     continue
-                # Repeated two-digit tail with low support/score: map to single-digit tail.
-                # Example: 1.6.11 -> 1.6.1 when no strong evidence for true 11.
+                # Repeated two-digit tail with low support/score: drop the long form
+                # if the short tail already exists. e.g. 1.6.11 -> dropped when 1.6.1 present.
                 if (
                     seg_len == 2
                     and triplet[2][0] == triplet[2][1]
                     and variant_support <= 1
-                    and rec["best_score"] < 0.78
+                    and rec["best_score"] < 0.88
                 ):
                     tail_nums = prefix_tail_numbers.get(pref, set())
+                    short_tail_num = int(triplet[2][0])
+                    if short_tail_num in tail_nums:
+                        continue
+                    # short tail does not exist: remap instead of dropping
                     if any(n <= 9 for n in tail_nums):
                         q_emit = f"{int(triplet[0])}.{int(triplet[1])}.{int(triplet[2][0])}"
                 # Symmetric case: weak single tail likely split from strong repeated tail.
