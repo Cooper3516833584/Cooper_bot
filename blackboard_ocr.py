@@ -680,6 +680,10 @@ def question_triplet_str(q: str) -> tuple[str, str, str] | None:
     return m.group(1), m.group(2), m.group(3)
 
 
+def question_sub_count(q: str) -> int:
+    return len(re.findall(r"\(\d+\)", q))
+
+
 def _is_compact_ambiguous_question_token(token: str) -> bool:
     """
     形如 "1.56" 的紧凑写法在 OCR 里歧义很强，常由 "1.6.1" 一类内容粘连/误识别而来。
@@ -689,6 +693,9 @@ def _is_compact_ambiguous_question_token(token: str) -> bool:
     if not t or t.startswith("P"):
         return False
     t = t.replace(" ", "")
+    t = t.replace("+", ".")
+    t = re.sub(r"[^0-9OILKSZBG\.\(\)]", ".", t)
+    t = re.sub(r"\.+", ".", t).strip(".")
     if "(" in t or ")" in t:
         return False
 
@@ -714,6 +721,9 @@ def _is_joined_triplet_ambiguous_token(token: str) -> bool:
     if not t or t.startswith("P"):
         return False
     t = t.replace(" ", "")
+    t = t.replace("+", ".")
+    t = re.sub(r"[^0-9OILKSZBG\.\(\)]", ".", t)
+    t = re.sub(r"\.+", ".", t).strip(".")
     if "." in t or "(" in t or ")" in t:
         return False
     t = re.sub(r"[^0-9OILKSZBG\u4EBA\u4E28\u957F]", "", t)
@@ -771,6 +781,17 @@ def _build_question_from_parts(
                         else:
                             return None
                     triplet = [digits[0], mid, digits[2]]
+        elif len(digits) == 4:
+            # 形如 "4416"/"4418" 的紧凑写法，按 "4.4.16"/"4.4.18" 解释。
+            if prefix is not None and digits[0] == prefix[0] and digits[1] == prefix[1]:
+                triplet = [digits[0], digits[1], digits[2:]]
+            elif digits[0] == digits[1] and int(digits[0]) >= 2:
+                # AABA often means A.A.B(A), e.g. 2212 -> 2.2.1(2)
+                if digits[3] == digits[0] and not sub_nums:
+                    triplet = [digits[0], digits[1], digits[2]]
+                    sub_nums = [digits[3]]
+                else:
+                    triplet = [digits[0], digits[1], digits[2:]]
 
     if triplet is None:
         return None
@@ -820,8 +841,20 @@ def repair_question_token(
 
     for ch in ("'", "`", "’", "‘"):
         q = q.replace(ch, ".")
-    q = q.replace("+", "")
+    q = q.replace("+", ".")
     q = q.replace(" ", "")
+    m_fused_tail_sub = re.fullmatch(
+        r"([0-9OILKSZBG\u4EBA\u4E28\u957F]+\.[0-9OILKSZBG\u4EBA\u4E28\u957F]+\.[0-9OILKSZBG\u4EBA\u4E28\u957F]{2,3})\)",
+        q,
+    )
+    if m_fused_tail_sub:
+        parts_raw = [_normalize_digit_token(x) for x in m_fused_tail_sub.group(1).split(".")]
+        if len(parts_raw) == 3 and all(parts_raw) and len(parts_raw[2]) >= 2:
+            tail_digits = parts_raw[2]
+            main_tail = tail_digits[:-1]
+            sub_tail = _normalize_sub_number(tail_digits[-1])
+            if main_tail and sub_tail:
+                q = f"{parts_raw[0]}.{parts_raw[1]}.{main_tail}({sub_tail})"
     q = re.sub(r"(?<=\d)\.(?=\()", "", q)
     q = re.sub(r"(?<!\()(\d+)\)", r"(\1)", q)
     q = re.sub(r"[^\dOILKSZBG\u4EBA\u4E28\u957F\.\(\)]", "", q)
@@ -929,10 +962,10 @@ def repair_page_token(token: str) -> str:
 
     # Page tokens should stay within a narrow OCR confusion charset.
     # This avoids treating text like "人长1" as page number "P141".
-    if not re.fullmatch(r"[PR0-9OILKSZBG]+", raw):
+    if not re.fullmatch(r"[PR0-9OILKSZBG#]+", raw):
         return normalize_text(raw).strip()
 
-    token = normalize_text(raw).strip()
+    token = normalize_text(raw).strip().replace("#", "9")
     if not token:
         return token
 
@@ -976,6 +1009,25 @@ def extract_page_from_line(
         return None
 
     first_raw = normalize_text(tokens[0]).strip()
+
+    # Sometimes OCR splits page token into "P" + "39"/"3#".
+    if first_raw in {"P", "R"} and len(tokens) >= 2:
+        second_raw = normalize_text(tokens[1]).strip()
+        if second_raw:
+            joined_page = repair_page_token(first_raw + second_raw)
+            m_joined = PAGE_RE.fullmatch(joined_page)
+            if m_joined:
+                has_q_in_line = any(
+                    is_valid_question(repair_question_token(t, preferred_prefixes=known_prefixes))
+                    for t in tokens[2:]
+                )
+                if not has_q_in_line:
+                    has_q_in_line = any(
+                        is_valid_question(repair_question_token(t, preferred_prefixes=known_prefixes))
+                        for t in tokens[1:]
+                    )
+                if has_q_in_line:
+                    return f"P{m_joined.group(1)}"
 
     # 特殊情况：OCR 把 "P208" 读成 "1208"（1 粘在 P 前面）
     # 尝试剥掉前导数字字符（最多 1 位），看剩余部分是否是合法页码
@@ -1185,6 +1237,27 @@ def extract_questions_from_line(
 
         cleaned.append(q)
 
+    # Attach detached sub-number token like "2)" to the nearest question in the line,
+    # e.g. "2.4.4 2)" -> "2.4.4(2)".
+    detached_subs: list[str] = []
+    for tok in tokens:
+        tok_norm = normalize_text(tok).strip().replace("+", ".")
+        m_detached = re.fullmatch(r"([0-9OILKSZBG]+)\)", tok_norm)
+        if not m_detached:
+            continue
+        sub_num = _normalize_sub_number(m_detached.group(1))
+        if sub_num:
+            detached_subs.append(sub_num)
+    if detached_subs and cleaned and not any("(" in q for q in cleaned):
+        base_q = cleaned[-1]
+        candidate = base_q + "".join(f"({x})" for x in detached_subs[:2])
+        if is_valid_question(candidate):
+            cleaned[-1] = candidate
+            q_factor[candidate] = float(q_factor.get(base_q, 1.0))
+            q_ambiguous[candidate] = bool(q_ambiguous.get(base_q, False))
+            q_factor.pop(base_q, None)
+            q_ambiguous.pop(base_q, None)
+
     # Line-local conflict downweight:
     # if a high single-digit tail (>=5) appears with a nearby lower-prefix low tail (<=3)
     # in the same line, treat the high-tail one as likely OCR drift (e.g. 1.5.6 vs 1.4.3).
@@ -1250,6 +1323,7 @@ def extract_assignments_from_lines(lines: list[dict]) -> list[dict]:
                     "line_text": line["text"],
                     "line_score": float(line["score"]) * float(q_factor),
                     "q_ambiguous": bool(q_ambiguous),
+                    "page_explicit": bool(page is not None),
                 }
             )
             pref = question_prefix(q)
@@ -1283,14 +1357,20 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
 
             line_score = float(item.get("line_score", 0.0))
             q_ambiguous = bool(item.get("q_ambiguous", False))
+            page_explicit = bool(item.get("page_explicit", False))
 
             page_raw = item.get("page")
             page = None
+            page_weight = 0.0
             if page_raw:
                 page_candidate = repair_page_token(str(page_raw))
                 if PAGE_RE.fullmatch(page_candidate):
                     page = page_candidate
-                    overall_page_weights[page] += line_score
+                    variant_page_factor = (
+                        0.40 if variant_name in {"board_adaptive", "board_adaptive_inv"} else 1.0
+                    )
+                    page_weight = line_score * (1.0 if page_explicit else 0.35) * variant_page_factor
+                    overall_page_weights[page] += page_weight
 
             if q not in merged:
                 merged[q] = {
@@ -1313,7 +1393,7 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                 rec["best_score"] = line_score
                 rec["best_line_text"] = str(item.get("line_text", ""))
             if page is not None:
-                rec["page_weights"][page] += line_score
+                rec["page_weights"][page] += page_weight
 
     if not merged:
         return []
@@ -1322,18 +1402,44 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
     if overall_page_weights:
         default_page = max(overall_page_weights.items(), key=lambda x: x[1])[0]
 
-    # Merge by question base: keep the stronger full form.
-    best_form_by_base: dict[str, tuple[str, tuple[float, int]]] = {}
-    for q, rec in merged.items():
-        base = question_base(q)
-        score_key = (rec["best_score"] + 0.15 * rec["count"], rec["count"])
-        prev = best_form_by_base.get(base)
-        if prev is None or score_key > prev[1]:
-            best_form_by_base[base] = (q, score_key)
+    # Merge by question base while preferring richer sub-number forms
+    # when support/score are close enough.
+    base_to_questions: dict[str, list[str]] = defaultdict(list)
+    for q in merged:
+        base_to_questions[question_base(q)].append(q)
 
-    selected_questions = {
-        q for q in (v[0] for v in best_form_by_base.values()) if q in merged
-    }
+    selected_questions: set[str] = set()
+    for qs in base_to_questions.values():
+        if not qs:
+            continue
+
+        def _core_score(qx: str) -> tuple[float, int]:
+            rec_x = merged[qx]
+            return (rec_x["best_score"] + 0.15 * rec_x["count"], rec_x["count"])
+
+        chosen = max(qs, key=lambda qx: _core_score(qx))
+
+        for cand in qs:
+            if cand == chosen:
+                continue
+            if question_sub_count(cand) <= question_sub_count(chosen):
+                continue
+            if not cand.startswith(chosen):
+                continue
+
+            rec_c = merged[cand]
+            rec_chosen = merged[chosen]
+            cand_support = len(rec_c["variants"])
+
+            if cand_support < 2:
+                continue
+            if rec_c["best_score"] + 1e-6 < rec_chosen["best_score"] - 0.08:
+                continue
+            if rec_c["count"] + 2 < rec_chosen["count"]:
+                continue
+            chosen = cand
+
+        selected_questions.add(chosen)
 
     # Dominant first segment (chapter) for outlier filtering.
     first_seg_weights: dict[int, float] = defaultdict(float)
@@ -1513,6 +1619,19 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                 and rec["best_score"] < 0.90
             ):
                 continue
+            # Very-high singleton tail under a low-tail dense prefix is often OCR drift
+            # (e.g. 2.1.7 amid strong 2.1.1/2/3), while still allowing tail=6 cases.
+            if (
+                seg_len == 1
+                and tail_num_for_soft >= 7
+                and rec["count"] <= 1
+                and variant_support <= 1
+                and rec["best_score"] < 0.82
+            ):
+                tail_nums_this_pref = prefix_tail_numbers.get(pref, set())
+                low_tails_this_pref = [n for n in tail_nums_this_pref if n <= 3]
+                if len(low_tails_this_pref) >= 2 and max(low_tails_this_pref) + 3 <= tail_num_for_soft:
+                    continue
             # Weak outlier section under same chapter (e.g. 4.1.1 amid strong 4.4.* cluster).
             sec_weights = first_second_weights.get(triplet[0], {})
             if len(sec_weights) >= 2:
@@ -1572,6 +1691,7 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                     seg_len == 1
                     and rec["count"] <= 1
                     and variant_support <= 1
+                    and question_sub_count(q) == 0
                     and rec["best_score"] < 0.82
                 ):
                     weak_tail = tail_num_for_soft
@@ -1604,7 +1724,7 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                 if (
                     seg_len == 2
                     and triplet[2][0] == triplet[2][1]
-                    and variant_support <= 1
+                    and variant_support <= 2
                     and rec["best_score"] < 0.88
                 ):
                     tail_nums = prefix_tail_numbers.get(pref, set())
@@ -1634,7 +1754,7 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                     dominant_len == 1
                     and seg_len == 2
                     and triplet[2][0] == triplet[2][1]
-                    and variant_support <= 1
+                    and variant_support <= 2
                 ):
                     single_tail = triplet[2][0]
                     single_support = prefix_tail_support.get((pref, single_tail), 0)
@@ -1683,10 +1803,25 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                 prefix_consensus_strong = (
                     pref_anchor >= 1 and pref_total_w >= second_total_w + 0.10
                 )
+                prefix_consensus_very_strong = pref_total_w >= second_total_w + 0.45
                 if (
                     prefix_consensus_strong
                     and pref_w > 0.0
-                    and pref_w + 1e-6 >= 0.95 * max(cur_w, 1e-9)
+                    and pref_w + 1e-6 >= 0.90 * max(cur_w, 1e-9)
+                ):
+                    page = pref_page
+                elif (
+                    prefix_consensus_very_strong
+                    and pref_w > 0.0
+                    and pref_w + 1e-6 >= 0.85 * max(cur_w, 1e-9)
+                ):
+                    page = pref_page
+                elif (
+                    page != pref_page
+                    and len(prefix_to_questions.get(pref, [])) >= 2
+                    and pref_w > 0.0
+                    and cur_w > 0.0
+                    and (cur_w - pref_w) <= 0.12
                 ):
                     page = pref_page
                 elif prefix_consensus_strong and page is None and pref_w > 0.0:
