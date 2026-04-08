@@ -38,8 +38,7 @@ from blackboard_ocr import recognize_homework_from_path, build_ocr
 # ── 配置 ──────────────────────────────────
 GT_FILE   = Path(__file__).parent / "ground_truth.json"
 IMG_DIR   = Path(__file__).parent
-# 第16张真值有录入错误，手动跳过或修正
-SKIP_IMGS = set()   # 填 {"16.jpg"} 可跳过某张图
+SKIP_IMGS = set()
 # ─────────────────────────────────────────
 
 

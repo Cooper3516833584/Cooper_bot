@@ -5,12 +5,13 @@
 
 [OK] 3.jpg  (gt=4 ocr=4 hit=4 fp=0 fn=0)
 
-[NG] 4.jpg  (gt=5 ocr=4 hit=0 fp=4 fn=5)
+[NG] 4.jpg  (gt=5 ocr=5 hit=0 fp=5 fn=5)
    FN(漏) P39  1.4.1
    FN(漏) P39  1.4.3
    FN(漏) P39  1.5.2
    FN(漏) P39  1.6.1
    FN(漏) P39  1.6.3
+   FP(多) P37  1.4.1
    FP(多) P37  1.4.3
    FP(多) P37  1.5.2
    FP(多) P37  1.6.1
@@ -22,13 +23,9 @@
 
 [OK] 7.jpg  (gt=4 ocr=4 hit=4 fp=0 fn=0)
 
-[NG] 8.jpg  (gt=5 ocr=4 hit=4 fp=0 fn=1)
-   FN(漏) P39  1.4.1
+[OK] 8.jpg  (gt=5 ocr=5 hit=5 fp=0 fn=0)
 
-[NG] 9.jpg  (gt=5 ocr=4 hit=3 fp=1 fn=2)
-   FN(漏) P39  1.4.1
-   FN(漏) P39  1.4.3
-   FP(多) P37  1.4.3
+[OK] 9.jpg  (gt=5 ocr=5 hit=5 fp=0 fn=0)
 
 [OK] 10.jpg  (gt=5 ocr=5 hit=5 fp=0 fn=0)
 
@@ -60,12 +57,13 @@
 
 [OK] 24.jpg  (gt=3 ocr=3 hit=3 fp=0 fn=0)
 
-[NG] 25.jpg  (gt=5 ocr=4 hit=0 fp=4 fn=5)
+[NG] 25.jpg  (gt=5 ocr=5 hit=0 fp=5 fn=5)
    FN(漏) P39  1.4.1
    FN(漏) P39  1.4.3
    FN(漏) P39  1.5.2
    FN(漏) P39  1.6.1
    FN(漏) P39  1.6.3
+   FP(多) P37  1.4.1
    FP(多) P37  1.4.3
    FP(多) P37  1.5.2
    FP(多) P37  1.6.1
@@ -83,26 +81,19 @@
 
 [OK] 31.jpg  (gt=6 ocr=6 hit=6 fp=0 fn=0)
 
-[NG] 32.jpg  (gt=5 ocr=4 hit=0 fp=4 fn=5)
+[NG] 32.jpg  (gt=5 ocr=5 hit=0 fp=5 fn=5)
    FN(漏) P39  1.4.1
    FN(漏) P39  1.4.3
    FN(漏) P39  1.5.2
    FN(漏) P39  1.6.1
    FN(漏) P39  1.6.3
+   FP(多) P37  1.4.1
    FP(多) P37  1.4.3
    FP(多) P37  1.5.2
    FP(多) P37  1.6.1
    FP(多) P37  1.6.3
 
-[OK] 33.jpg  (gt=5 ocr=5 hit=5 fp=0 fn=0)
-
-[OK] 34.jpg  (gt=4 ocr=4 hit=4 fp=0 fn=0)
-
-[OK] 35.jpg  (gt=5 ocr=5 hit=5 fp=0 fn=0)
-
-[OK] 36.jpg  (gt=6 ocr=6 hit=6 fp=0 fn=0)
-
 ==================================================
-总GT条目: 160  命中: 142  漏检: 18  误报: 13
-Precision: 91.6%  Recall: 88.8%  F1: 90.2%
-存在误差的图片(5): ['4.jpg', '8.jpg', '9.jpg', '25.jpg', '32.jpg']
+总GT条目: 140  命中: 125  漏检: 15  误报: 15
+Precision: 89.3%  Recall: 89.3%  F1: 89.3%
+存在误差的图片(3): ['4.jpg', '25.jpg', '32.jpg']

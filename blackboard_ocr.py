@@ -255,7 +255,10 @@ def extract_green_board(image: np.ndarray, min_area_ratio: float = 0.18, min_gre
             bbox_ratio = float(bw * bh) / float(img_area)
             aspect = float(bw) / float(max(bh, 1))
             if bbox_ratio >= 0.60 and 0.90 <= aspect <= 3.50:
-                return True, image
+                poly_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+                cv2.drawContours(poly_mask, [cnt], -1, 255, -1)
+                masked_image = cv2.bitwise_and(image, image, mask=poly_mask)
+                return True, masked_image
 
     return True, get_board(image)
 
@@ -630,7 +633,8 @@ def _normalize_sub_number(s: str) -> str:
         return "1"
     if len(s) > 1 and len(set(s)) == 1:
         s = s[0]
-    return s.lstrip("0") or "0"
+    res = s.lstrip("0")
+    return res if res else "1"
 
 
 def is_valid_question(q: str | None) -> bool:
@@ -1575,6 +1579,17 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
         if tail_num <= 9 and support_q >= 3 and score_q >= 0.90:
             prefix_strong_low_tail_count[pref] += 1
 
+    all_scores = sorted([merged[q]["best_score"] for q in selected_questions])
+    median_score = all_scores[len(all_scores) // 2] if all_scores else 0.0
+
+    trusted_singleton_variants = {
+        "board_original",
+        "board_clahe",
+        "board_gray",
+        "board_enhanced",
+        "board_zoom_clahe",
+    }
+
     out = []
     for q in selected_questions:
         rec = merged[q]
@@ -1639,11 +1654,12 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
                 cur_w = float(sec_weights.get(triplet[1], 0.0))
                 if (
                     triplet[1] != dominant_sec
-                    and rec["count"] <= 1
-                    and variant_support <= 1
-                    and rec["best_score"] < 0.82
+                    and variant_support <= 2
                     and cur_w > 0.0
-                    and dominant_w >= 3.5 * cur_w
+                    and (
+                        (dominant_w >= 3.5 * cur_w and rec["best_score"] < 0.85)
+                        or (dominant_w >= 5.0 * cur_w and rec["best_score"] < 0.92)
+                    )
                 ):
                     continue
             # Sparse section outlier: one weak singleton section while at least two other
@@ -1847,7 +1863,66 @@ def merge_variant_assignments(variant_results: list[dict]) -> list[dict]:
             and rec["count"] == 1
             and rec["best_score"] < 0.80
         ):
-            continue
+            singleton_variant = next(iter(rec["variants"])) if len(rec["variants"]) == 1 else None
+            keep_dense_trusted_singleton = (
+                singleton_variant in trusted_singleton_variants
+                and rec.get("ambiguous_hits", 0) == 0
+                and rec["best_score"] >= 0.75
+            )
+            if not keep_dense_trusted_singleton:
+                continue
+
+        # Dynamic relative thresholding: if the board generally has high scores
+        # (median >= 0.80), we aggressively drop weak isolated phantoms (score < 0.60)
+        # that are far below the median and lack wide variant support.
+        if (
+            median_score >= 0.80
+            and rec["best_score"] < median_score - 0.20
+            and rec["best_score"] < 0.60
+            and len(rec["variants"]) <= 3
+        ):
+            singleton_variant = next(iter(rec["variants"])) if len(rec["variants"]) == 1 else None
+            keep_low_sub_singleton = (
+                singleton_variant in trusted_singleton_variants
+                and question_sub_count(q) > 0
+                and rec.get("ambiguous_hits", 0) == 0
+                and pref is not None
+                and prefix_density.get(pref, 0) >= 2
+                and rec["best_score"] >= 0.55
+            )
+            if not keep_low_sub_singleton:
+                continue
+
+        # Strict garbage collection: if something is seen by only 1 variant out of 7,
+        # and its best score wasn't high (< 0.84), it's overwhelmingly likely
+        # an OCR distortion of an overlapping dense question.
+        if len(rec["variants"]) == 1:
+            singleton_variant = next(iter(rec["variants"]))
+            if (
+                singleton_variant not in trusted_singleton_variants
+                and rec["best_score"] < 0.90
+            ):
+                continue
+        if len(rec["variants"]) == 1 and rec["best_score"] < 0.84:
+            singleton_variant = next(iter(rec["variants"]))
+            keep_trusted_singleton = (
+                singleton_variant in trusted_singleton_variants
+                and rec.get("ambiguous_hits", 0) == 0
+                and pref is not None
+                and prefix_density.get(pref, 0) >= 2
+                and rec["best_score"] >= 0.75
+            )
+            keep_trusted_sub_singleton = (
+                singleton_variant in trusted_singleton_variants
+                and question_sub_count(q) > 0
+                and rec.get("ambiguous_hits", 0) == 0
+                and pref is not None
+                and prefix_density.get(pref, 0) >= 2
+                and rec["best_score"] >= 0.55
+            )
+            if not (keep_trusted_singleton or keep_trusted_sub_singleton):
+                continue
+
 
         out.append(
             {
