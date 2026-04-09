@@ -105,3 +105,23 @@ def test_media_or_emoji_only_message_segment_with_text_is_not_filtered() -> None
         ]
     }
     assert not commands._is_media_or_emoji_only_message(evt, "\u4f60\u597d")
+
+
+def test_keyword_text_message_rejects_video_with_filename_text() -> None:
+    evt = {
+        "message": [
+            {"type": "video", "data": {"file": "abc.mp4"}},
+            {"type": "text", "data": {"text": "abc.mp4"}},
+        ]
+    }
+    assert not commands._is_keyword_text_message(evt, "abc.mp4")
+
+
+def test_keyword_text_message_accepts_text_with_at_segment() -> None:
+    evt = {
+        "message": [
+            {"type": "at", "data": {"qq": "42"}},
+            {"type": "text", "data": {"text": "\u4f60\u597d"}},
+        ]
+    }
+    assert commands._is_keyword_text_message(evt, "[CQ:at,qq=42] \u4f60\u597d")

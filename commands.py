@@ -62,6 +62,7 @@ _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_PENDING_COUNT_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_GROUP_NOTICE_SECONDS = 10.0 * 60.0
 _MEDIA_OR_EMOJI_SEG_TYPES = {"image", "face", "mface", "market_face"}
+_KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES = {"at", "reply"}
 _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
     r"^\[\s*(?:\u56fe\u7247|\u8868\u60c5|\u52a8\u753b\u8868\u60c5)\s*\]$",
     flags=re.IGNORECASE,
@@ -296,6 +297,43 @@ def _is_media_or_emoji_only_message(evt: dict, text: str) -> bool:
             if (not tail) and all(tp in _MEDIA_OR_EMOJI_SEG_TYPES for tp in types):
                 return True
     return False
+
+
+def _is_keyword_text_message(evt: dict, text: str) -> bool:
+    def _is_text_with_allowed_cq(raw: str) -> bool:
+        s = str(raw or "").strip()
+        if not s:
+            return False
+        if "[CQ:" not in s:
+            return True
+        types = [x.lower() for x in _CQ_SEG_RE.findall(s)]
+        if not types:
+            return True
+        tail = _CQ_SEG_RE.sub("", s).strip()
+        if not tail:
+            return False
+        return all(tp in _KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES for tp in types)
+
+    msg = evt.get("message")
+    if isinstance(msg, list):
+        has_text = False
+        for seg in msg:
+            if not isinstance(seg, dict):
+                continue
+            tp = str(seg.get("type") or "").strip().lower()
+            if tp == "text":
+                data = seg.get("data") or {}
+                if str(data.get("text") or "").strip():
+                    has_text = True
+                continue
+            if tp in _KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES:
+                continue
+            return False
+        return has_text
+
+    if isinstance(msg, str) and _is_text_with_allowed_cq(msg):
+        return True
+    return _is_text_with_allowed_cq(text)
 
 
 def _fmt_mb(n_bytes: int) -> str:
@@ -2781,6 +2819,8 @@ async def _handle_plain_text_input(
                 await reply(api, ctx, msg, logsvc)
             return True
         if _is_media_or_emoji_only_message(evt, t):
+            return True
+        if not _is_keyword_text_message(evt, t):
             return True
         keyword_answers = _lookup_keyword_answers(t)
         if keyword_answers:
