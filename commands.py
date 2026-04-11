@@ -1338,6 +1338,76 @@ def _load_blackboard_ocr(logsvc: Optional[LogService] = None):
     return _BLACKBOARD_OCR_MODULE
 
 
+def _retry_low_count_ocr_with_enhancement(ocr_mod, image_path: Path) -> Optional[dict]:
+    """
+    首次题号条数过少时，做轻量图像增强后重试一次识别。
+    仅作为兜底，不影响正常图片主流程。
+    """
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        return None
+
+    if not hasattr(ocr_mod, "recognize_homework_from_array"):
+        return None
+
+    img = cv2.imread(str(image_path))
+    if img is None or getattr(img, "size", 0) == 0:
+        return None
+
+    h, w = img.shape[:2]
+    candidates = []
+
+    # 轻裁切：去掉边缘噪声与畸变，提升分隔符可读性。
+    if h >= 240 and w >= 240:
+        y1 = int(h * 0.06)
+        y2 = int(h * 0.96)
+        x1 = int(w * 0.05)
+        x2 = int(w * 0.98)
+        if (y2 - y1) >= 120 and (x2 - x1) >= 120:
+            cropped = img[y1:y2, x1:x2]
+            candidates.append(cropped)
+
+    # 轻提饱和度：对粉笔/底色对比弱的场景有帮助。
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    sat = hsv.copy()
+    sat[..., 1] = cv2.add(sat[..., 1], 15)
+    sat_img = cv2.cvtColor(sat, cv2.COLOR_HSV2BGR)
+    candidates.append(sat_img)
+
+    # 裁切 + 提饱和度
+    if h >= 240 and w >= 240:
+        y1 = int(h * 0.06)
+        y2 = int(h * 0.96)
+        x1 = int(w * 0.05)
+        x2 = int(w * 0.98)
+        if (y2 - y1) >= 120 and (x2 - x1) >= 120:
+            crop2 = img[y1:y2, x1:x2]
+            hsv2 = cv2.cvtColor(crop2, cv2.COLOR_BGR2HSV)
+            sat2 = hsv2.copy()
+            sat2[..., 1] = cv2.add(sat2[..., 1], 15)
+            sat2_img = cv2.cvtColor(sat2, cv2.COLOR_HSV2BGR)
+            candidates.append(sat2_img)
+            # 轻度提对比：帮助点号/分隔符从粘连字符中分离。
+            candidates.append(cv2.convertScaleAbs(sat2_img, alpha=1.3, beta=8))
+
+    best_result = None
+    best_count = -1
+    for cand in candidates:
+        try:
+            res = ocr_mod.recognize_homework_from_array(cand)
+        except Exception:
+            continue
+        if not bool(res.get("is_green_blackboard")):
+            continue
+        cnt = len(ocr_mod.format_assignment_lines(list(res.get("assignments") or [])))
+        if cnt > best_count:
+            best_count = cnt
+            best_result = res
+
+    return best_result
+
+
 async def _handle_blackboard_ocr_images(api, ctx, evt: dict, logsvc: LogService) -> bool:
     images = _extract_images_from_evt(evt)
     if not images:
@@ -1376,6 +1446,23 @@ async def _handle_blackboard_ocr_images(api, ctx, evt: dict, logsvc: LogService)
 
             has_green_board = True
             lines = ocr_mod.format_assignment_lines(list(result.get("assignments") or []))
+            if len(lines) < 3:
+                # 低条数图片：尝试轻量增强后重扫一次，取更优结果。
+                retry_result = await asyncio.to_thread(_retry_low_count_ocr_with_enhancement, ocr_mod, p)
+                if retry_result is not None:
+                    retry_lines = ocr_mod.format_assignment_lines(list(retry_result.get("assignments") or []))
+                    if len(retry_lines) > len(lines):
+                        lines = retry_lines
+                    if len(lines) < 3 and retry_lines:
+                        # 若单次结果仍偏少，合并两次识别结果补全题号覆盖面。
+                        merged_try = []
+                        seen_try = set()
+                        for x in list(lines) + list(retry_lines):
+                            if x in seen_try:
+                                continue
+                            seen_try.add(x)
+                            merged_try.append(x)
+                        lines = merged_try
             for line in lines:
                 if line in seen_lines:
                     continue

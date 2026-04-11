@@ -25,10 +25,12 @@
 [NG] 8.jpg  (gt=5 ocr=4 hit=4 fp=0 fn=1)
    FN(漏) P39  1.4.1
 
-[NG] 9.jpg  (gt=5 ocr=4 hit=3 fp=1 fn=2)
+[NG] 9.jpg  (gt=5 ocr=4 hit=2 fp=2 fn=3)
    FN(漏) P39  1.4.1
    FN(漏) P39  1.4.3
+   FN(漏) P39  1.6.1
    FP(多) P37  1.4.3
+   FP(多) P39  1.1.43
 
 [OK] 10.jpg  (gt=5 ocr=5 hit=5 fp=0 fn=0)
 
@@ -103,6 +105,6 @@
 [OK] 36.jpg  (gt=6 ocr=6 hit=6 fp=0 fn=0)
 
 ==================================================
-总GT条目: 160  命中: 142  漏检: 18  误报: 13
-Precision: 91.6%  Recall: 88.8%  F1: 90.2%
+总GT条目: 160  命中: 141  漏检: 19  误报: 14
+Precision: 91.0%  Recall: 88.1%  F1: 89.5%
 存在误差的图片(5): ['4.jpg', '8.jpg', '9.jpg', '25.jpg', '32.jpg']

@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 from collections import defaultdict
 import csv
 import json
@@ -611,9 +611,6 @@ def normalize_text(s: str) -> str:
 
     # 合并连续的点号噪声
     s = s.replace("??", ".")
-    s = s.replace("?", ".")
-    s = re.sub(r"(?<=\d)[^0-9A-Z\(\)\s](?=\d)", ".", s)
-    s = re.sub(r"\.{2,}", ".", s)
 
     s = re.sub(r"\bP\s+(\d+)\b", r"P\1", s)
     s = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", s)
@@ -1080,12 +1077,6 @@ def extract_page_from_line(
             has_strong_question = True
             break
     if not has_strong_question:
-        # Fallback to line-level parser for glued/split OCR forms
-        # (e.g. "52.45.2.6", "5.3.25.4.1").
-        parsed_qs = extract_questions_from_line(line, known_prefixes=known_prefixes)
-        if parsed_qs:
-            has_strong_question = True
-    if not has_strong_question:
         return None
 
     current_num = _parse_page_num(current_page)
@@ -1168,24 +1159,6 @@ def extract_questions_from_line(
             if len(split_parts) >= 2:
                 chunk_candidates.extend(split_parts)
         for chk in _unique_keep_order(chunk_candidates):
-            # Joined pair fallback:
-            # "52.45.2.6" / "52++45++2.6" -> "5.2.4" + "5.2.6"
-            # This appears when OCR glues two adjacent questions with same prefix.
-            chk_pair = chk.replace("+", ".")
-            chk_pair = re.sub(r"\.{2,}", ".", chk_pair).strip(".")
-            m_pair = re.fullmatch(r"([1-9])([0-9])\.([0-9])([0-9])\.([0-9])\.([0-9])", chk_pair)
-            if m_pair and m_pair.group(4) == m_pair.group(1) and m_pair.group(5) == m_pair.group(2):
-                q1 = f"{m_pair.group(1)}.{m_pair.group(2)}.{m_pair.group(3)}"
-                q2 = f"{m_pair.group(4)}.{m_pair.group(5)}.{m_pair.group(6)}"
-                _add_question(repair_question_token(q1, preferred_prefixes=prefix_candidates), factor=0.78, ambiguous=False)
-                _add_question(repair_question_token(q2, preferred_prefixes=prefix_candidates), factor=0.78, ambiguous=False)
-            m_pair_dot = re.fullmatch(r"([1-9])\.([0-9])\.([0-9])([0-9])\.([0-9])\.([0-9])", chk_pair)
-            if m_pair_dot and m_pair_dot.group(4) == m_pair_dot.group(1):
-                q1 = f"{m_pair_dot.group(1)}.{m_pair_dot.group(2)}.{m_pair_dot.group(3)}"
-                q2 = f"{m_pair_dot.group(4)}.{m_pair_dot.group(5)}.{m_pair_dot.group(6)}"
-                _add_question(repair_question_token(q1, preferred_prefixes=prefix_candidates), factor=0.78, ambiguous=False)
-                _add_question(repair_question_token(q2, preferred_prefixes=prefix_candidates), factor=0.78, ambiguous=False)
-
             pref_for_chunk = prefix_candidates
             if _is_joined_triplet_ambiguous_token(chk) and local_prefixes:
                 pref_for_chunk = _unique_keep_order(local_prefixes)
