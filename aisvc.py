@@ -192,6 +192,21 @@ class AIService:
     async def chat_with_context(self, session_key: str, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
 
+    async def parse_admin_plan(
+        self,
+        text: str,
+        admin_user_id: int,
+        allowed_tools: Optional[List[str]] = None,
+        max_steps: int = 5,
+    ) -> Optional[dict]:
+        return await asyncio.to_thread(
+            self._parse_admin_plan_sync,
+            str(text or ""),
+            int(admin_user_id),
+            list(allowed_tools or []),
+            int(max_steps),
+        )
+
     def remember_user_message(self, session_key: str, message_text: str) -> None:
         self._remember_chat_message(session_key, "user", message_text)
 
@@ -2366,6 +2381,60 @@ class AIService:
         if not text:
             raise RuntimeError("empty chat response")
         return text
+
+    def _parse_admin_plan_sync(
+        self,
+        text: str,
+        admin_user_id: int,
+        allowed_tools: List[str],
+        max_steps: int,
+    ) -> Optional[dict]:
+        if not self.chat_ready:
+            return None
+        task_text = str(text or "").strip()
+        if not task_text:
+            return None
+        tools = [str(x).strip() for x in (allowed_tools or []) if str(x).strip()]
+        if not tools:
+            return None
+        step_cap = max(1, min(int(max_steps or 5), 5))
+
+        prompt = (
+            "你是管理员自然语言任务规划器。"
+            "你只能把输入拆成白名单工具步骤，不能创建新工具，不能输出代码。"
+            "输出必须是严格 JSON 对象，不要输出 markdown。\n"
+            f"管理员QQ:{int(admin_user_id)}\n"
+            f"可用工具:{json.dumps(tools, ensure_ascii=False)}\n"
+            f"最多步骤:{step_cap}\n"
+            "输出字段要求：\n"
+            "1) summary: 字符串，简短说明\n"
+            "2) need_confirm: 布尔值\n"
+            "3) confidence: 0~1 之间数字\n"
+            "4) steps: 非空数组，且 steps 长度 <= 最多步骤；每项形如 {\"tool\":\"工具名\",\"args\":{...}}\n"
+            "5) tool 必须来自可用工具列表\n"
+            "6) 如需引用上一步文本结果，只能在 args 中使用 \"text_from_step\": 步骤序号(从1开始)\n"
+            "7) 不得输出 Python、shell、函数名调用描述\n"
+            "8) 涉及多个目标会话发送消息、权限修改、取消任务等高风险操作时，need_confirm 必须为 true\n"
+            f"管理员输入:{task_text}"
+        )
+
+        payload = {
+            "model": self.chat_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.0,
+        }
+        url = self._join_url(self.deepseek_base_url, "chat/completions")
+        try:
+            data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
+            text_out = self._extract_chat_text(data)
+            obj = self._parse_json_object(text_out)
+            if not isinstance(obj, dict):
+                return None
+            return obj
+        except Exception as e:
+            self.log.warning(f"admin plan parse failed: {e}")
+            return None
 
     def _chat_with_context_sync(self, session_key: str, user_input: str) -> str:
         if not self.chat_ready:

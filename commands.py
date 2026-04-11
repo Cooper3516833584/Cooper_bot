@@ -18,6 +18,8 @@ import urllib.request
 from filesvc import FileService
 from logsvc import LogService
 from handinsvc import HandinService, parse_mmdd_hhmm, pretty_ts, extract_name_from_filename, extract_student_id
+from admin_nl import handle_admin_nl
+from command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query, run_list_dir_query
 from router import get_files
 from ziputil import open_fast_zip, write_path as zip_write_path
 from config import (
@@ -374,6 +376,8 @@ class BotState:
     pending_handin_choose: Dict[int, dict] = field(default_factory=dict)
     # Handin: user_id -> {"task_id": str, "path": str, "name": str, "ts": float}
     pending_handin_overwrite: Dict[int, dict] = field(default_factory=dict)
+    # Admin NL confirm: user_id -> {"plan": {...}, "ts": float, "source": str}
+    pending_admin_nl_confirm: Dict[int, dict] = field(default_factory=dict)
     # Count: conv_key -> {"names": [str, ...], "ts": float}
     pending_count_session: Dict[str, dict] = field(default_factory=dict)
     # Group notice digest dedup cache: notice_key -> ts
@@ -3170,11 +3174,19 @@ async def _handle_explicit_command(
             return
         # 允许查询已截止任务：用于统计未交/导出等（提交仍只允许进行中）
         if ctx.scene == "group" and ctx.group_id is not None:
-            tasks = handin.list_tasks_by_group(ctx.group_id, include_closed=True)
+            list_res = list_handin_tasks_for_group(
+                handin=handin,
+                group_id=ctx.group_id,
+                include_closed=True,
+                active_only=False,
+                only_gettable=True,
+                sort_mode="active_then_deadline_desc",
+            )
+            tasks = list_res.data.get("tasks") if (list_res.ok and isinstance(list_res.data, dict)) else []
         else:
             tasks = handin.list_tasks(include_closed=True)
-        # 仅保留仍可 /handinget 的任务（归档未被清理）
-        tasks = [t for t in tasks if handin.is_task_gettable(t)]
+            # 仅保留仍可 /handinget 的任务（归档未被清理）
+            tasks = [t for t in tasks if handin.is_task_gettable(t)]
         if not tasks:
             await reply(api, ctx, "当前没有提交任务记录。", logsvc)
             return
@@ -3188,10 +3200,15 @@ async def _handle_explicit_command(
                 return "已结束"
             return "进行中"
         # 进行中优先，其次按截止时间倒序
-        tasks.sort(key=lambda t: (0 if t.is_active(now) else 1, -float(t.deadline_ts)))
+        if not (ctx.scene == "group" and ctx.group_id is not None):
+            tasks.sort(key=lambda t: (0 if t.is_active(now) else 1, -float(t.deadline_ts)))
         text_list = ["提交任务列表："]
         for i, tsk in enumerate(tasks, 1):
-            text_list.append(f"{i}. [{_status_tag(tsk)}] {tsk.name}（群 {tsk.group_id}，截止 {pretty_ts(tsk.deadline_ts)}）")
+            row = get_handin_task_summary(tsk, now_ts=now, pretty_ts_func=pretty_ts, with_status=True, with_group=True)
+            if row.ok:
+                text_list.append(f"{i}. {row.message}")
+            else:
+                text_list.append(f"{i}. [{_status_tag(tsk)}] {tsk.name}（群 {tsk.group_id}，截止 {pretty_ts(tsk.deadline_ts)}）")
         text_list.append("回复数字选择任务，我会发送未提交名单（若姓名识别率过低会改发已提交文件列表；已截止任务也可查询）。")
         # 若在群里发，群里提示，列表私聊
         if ctx.scene == "group":
@@ -3269,7 +3286,15 @@ async def _handle_explicit_command(
             return
         # 群里默认只列本群任务；私聊则列“你创建的任务”（管理员可列全部）
         if ctx.scene == "group" and ctx.group_id is not None:
-            tasks = handin.list_active_tasks_by_group(ctx.group_id)
+            list_res = list_handin_tasks_for_group(
+                handin=handin,
+                group_id=ctx.group_id,
+                include_closed=False,
+                active_only=True,
+                only_gettable=False,
+                sort_mode="deadline_asc",
+            )
+            tasks = list_res.data.get("tasks") if (list_res.ok and isinstance(list_res.data, dict)) else []
             pend_gid = int(ctx.group_id)
         else:
             all_tasks = handin.list_active_tasks()
@@ -3295,8 +3320,8 @@ async def _handle_explicit_command(
         await reply(api, ctx, "权限不足：你当前是 0 级（游客），不能访问资料库。", logsvc)
         return
     if cmd == "ls":
-        ok, out = filesvc.list_dir(ctx, rest if rest else None)
-        await reply(api, ctx, out, logsvc)
+        ls_result = run_list_dir_query(filesvc=filesvc, ctx=ctx, path_arg=(rest if rest else None))
+        await reply(api, ctx, str(ls_result.message or ""), logsvc)
         return
     if cmd == "find":
         # 支持：
@@ -3311,7 +3336,15 @@ async def _handle_explicit_command(
         else:
             kw, in_dir = _parse_find_args(rest, filesvc)
         try:
-            primary_hits = await asyncio.to_thread(filesvc.find, ctx, kw, in_dir=in_dir)
+            find_result = await asyncio.to_thread(
+                run_find_query,
+                filesvc=filesvc,
+                ctx=ctx,
+                keyword=kw,
+                in_dir=in_dir,
+            )
+            find_data = find_result.data if isinstance(find_result.data, dict) else {}
+            primary_hits = list(find_data.get("hits") or [])
         except Exception as e:
             logsvc.log.exception(f"/find failed: kw={kw!r} in_dir={in_dir!r} err={e}")
             await reply(api, ctx, "搜索失败，请稍后再试。", logsvc)
@@ -3595,6 +3628,20 @@ async def dispatch(
         return
     # 记录 IN（只有最终 log_out 才会落盘）
     logsvc.log_in(ctx, t)
+    if await handle_admin_nl(
+        api,
+        ctx,
+        t,
+        logsvc,
+        evt=evt,
+        filesvc=filesvc,
+        state=state,
+        handin=handin,
+        perm=perm,
+        aisvc=aisvc,
+        reply_func=reply,
+    ):
+        return
     if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc):
         return
     _remember_non_ai_chat_message(ctx, t, logsvc, aisvc)
