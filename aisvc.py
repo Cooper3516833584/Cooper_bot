@@ -32,6 +32,7 @@ from config import (
     AI_SYSTEM_PROMPT,
     AI_VECTORS_PATH,
     BASE_DIR,
+    ENABLE_OCR,
 )
 
 try:
@@ -3743,6 +3744,8 @@ class AIService:
         return "\n".join(chunks)[:max_chars]
 
     def _get_rapid_ocr(self):
+        if not bool(ENABLE_OCR):
+            return None
         if RapidOCR is None:
             return None
         if self._rapid_ocr is False:

@@ -103,6 +103,7 @@ ADMIN_USERS = _parse_int_set(_get_env("ADMIN_USERS", ""))
 ENABLE_ADMIN_NL_CONTROL = _get_env_bool("ENABLE_ADMIN_NL_CONTROL", True)
 ENABLE_ADMIN_NL_MULTI_STEP = _get_env_bool("ENABLE_ADMIN_NL_MULTI_STEP", True)
 ENABLE_ADMIN_TARGET_ALIASES = _get_env_bool("ENABLE_ADMIN_TARGET_ALIASES", True)
+ENABLE_OCR = _get_env_bool("ENABLE_OCR", False)
 
 # 群权限：可选的群级别“下限”（通常不需要；你也可以留空）
 GROUP_LEVEL = {

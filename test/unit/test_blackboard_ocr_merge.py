@@ -473,3 +473,14 @@ def test_merge_variant_assignments_smooths_page_by_prefix_consensus() -> None:
     merged = bo.merge_variant_assignments(variant_results)
     got = {(item["question"], item["page"]) for item in merged}
     assert ("4.2.4", "P208") in got
+
+
+def test_format_assignment_lines_returns_empty_when_no_valid_page() -> None:
+    lines = bo.format_assignment_lines(
+        [
+            {"page": None, "question": "1.5.2"},
+            {"page": "P?", "question": "1.6.1"},
+            {"page": "浜洪暱1", "question": "1.4.3"},
+        ]
+    )
+    assert lines == []

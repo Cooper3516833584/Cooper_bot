@@ -70,9 +70,19 @@ async def test_admin_nl_multi_step_switch_off_does_not_call_model_planner(monkey
         aisvc=aisvc,
     )
 
-    assert handled is False
+    assert handled is True
     aisvc.parse_admin_plan.assert_not_awaited()
     assert any("stage=model_planner_disabled" in one for one in logsvc.log.infos)
+    api.send_private_msg.assert_awaited_once()
+    # 检查反馈内容包含提示
+    call_args = api.send_private_msg.call_args
+    assert call_args is not None
+    args, kwargs = call_args
+    # 第一个参数是用户ID
+    assert args[0] == 900001
+    # 第二个参数是文本
+    feedback_text = args[1]
+    assert "无法理解" in feedback_text or "暂时无法规划" in feedback_text
 
 
 @pytest.mark.asyncio
@@ -103,3 +113,36 @@ async def test_admin_nl_single_step_still_works_when_multi_step_off(monkeypatch)
     assert any("stage=plan_rule_hit" in one for one in logsvc.log.infos)
     assert any("tools=send_private_message" in one for one in logsvc.log.infos)
     assert any("stage=executed" in one for one in logsvc.log.infos)
+
+@pytest.mark.asyncio
+async def test_admin_nl_model_planner_miss_sends_feedback(monkeypatch) -> None:
+    monkeypatch.setattr(admin_nl.config, "ADMIN_USERS", {900001})
+    monkeypatch.setattr(admin_nl.config, "ENABLE_ADMIN_NL_CONTROL", True)
+    monkeypatch.setattr(admin_nl.config, "ENABLE_ADMIN_NL_MULTI_STEP", True)
+    ctx = SimpleNamespace(scene="private_friend", user_id=900001)
+    logsvc = _DummyLogService()
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    aisvc = SimpleNamespace(parse_admin_plan=AsyncMock(return_value=None))
+
+    handled = await admin_nl.handle_admin_nl(
+        api=api,
+        ctx=ctx,
+        text="请处理这个管理员任务",
+        logsvc=logsvc,
+        evt={"post_type": "message"},
+        aisvc=aisvc,
+    )
+
+    assert handled is True
+    aisvc.parse_admin_plan.assert_awaited_once()
+    assert any("stage=model_planner_miss" in one for one in logsvc.log.infos)
+    api.send_private_msg.assert_awaited_once()
+    call_args = api.send_private_msg.call_args
+    assert call_args is not None
+    args, kwargs = call_args
+    assert args[0] == 900001
+    feedback_text = args[1]
+    assert "暂时无法规划" in feedback_text or "无法理解" in feedback_text

@@ -40,6 +40,7 @@ from config import (
     AI_BOT_NICK,
     NAPCAT_TEMP_CONTAINER_DIR,
     NAPCAT_TEMP_HOST_DIR,
+    ENABLE_OCR,
 )
 if TYPE_CHECKING:
     from aisvc import AIService
@@ -1413,6 +1414,8 @@ def _retry_low_count_ocr_with_enhancement(ocr_mod, image_path: Path) -> Optional
 
 
 async def _handle_blackboard_ocr_images(api, ctx, evt: dict, logsvc: LogService) -> bool:
+    if not bool(ENABLE_OCR):
+        return False
     images = _extract_images_from_evt(evt)
     if not images:
         return False

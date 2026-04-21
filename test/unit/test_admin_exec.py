@@ -198,6 +198,101 @@ async def test_execute_plan_generate_then_send_uses_generated_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_plan_find_then_send_admin_feedback_does_not_repeat_find_body(tmp_data_dirs: dict) -> None:
+    target = tmp_data_dirs["public_dir"] / "query_hit.txt"
+    target.write_text("ok", encoding="utf-8")
+    filesvc = SimpleNamespace(find=lambda _ctx, _kw, in_dir=None: [target])
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    plan = AdminPlan(
+        source="model",
+        summary="find then send",
+        steps=[
+            AdminStep(tool="find_files", args={"keyword": "query"}),
+            AdminStep(tool="send_group_message", args={"group_id": 123456, "text": "{{last_text}}"}),
+        ],
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.filesvc = filesvc
+
+    summary = await admin_exec.execute_plan(exec_ctx, plan)
+
+    assert summary.ok
+    api.send_group_msg.assert_awaited_once()
+    sent_text = str(api.send_group_msg.await_args.args[1] or "")
+    assert "query_hit.txt" in sent_text
+    assert summary.message == "已完成：向群 123456 发送消息"
+    assert "搜索结果" not in summary.message
+
+
+@pytest.mark.asyncio
+async def test_handle_generate_ai_reply_group_missing_message_does_not_fallback_exec_text() -> None:
+    aisvc = SimpleNamespace(chat_ready=True, chat_with_context=AsyncMock(return_value="should-not-run"))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.aisvc = aisvc
+    exec_ctx.text = "在群123456对“收到请回复”生成AI回复并发出去"
+
+    result = await admin_exec.handle_generate_ai_reply(
+        exec_ctx,
+        {"chat_type": "group", "group_id": 123456},
+    )
+
+    assert result.ok is False
+    assert "不能为空" in str(result.detail or "")
+    aisvc.chat_with_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_generate_ai_reply_private_missing_message_does_not_fallback_exec_text() -> None:
+    aisvc = SimpleNamespace(chat_ready=True, chat_with_context=AsyncMock(return_value="should-not-run"))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.aisvc = aisvc
+    exec_ctx.text = "给123456789这个私聊对“收到请回复”生成AI回复并发送"
+
+    result = await admin_exec.handle_generate_ai_reply(
+        exec_ctx,
+        {"chat_type": "private", "user_id": 123456789},
+    )
+
+    assert result.ok is False
+    assert "不能为空" in str(result.detail or "")
+    aisvc.chat_with_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_generate_ai_reply_with_message_still_works() -> None:
+    aisvc = SimpleNamespace(chat_ready=True, chat_with_context=AsyncMock(return_value="AI回复内容"))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.aisvc = aisvc
+    exec_ctx.text = "不会被拿来当正文"
+
+    result = await admin_exec.handle_generate_ai_reply(
+        exec_ctx,
+        {"chat_type": "private", "user_id": 22334455, "message": "收到请回复"},
+    )
+
+    assert result.ok is True
+    assert result.data["ai_reply"] == "AI回复内容"
+    aisvc.chat_with_context.assert_awaited_once()
+    assert aisvc.chat_with_context.await_args.args[0] == "private:22334455"
+    assert "收到请回复" in aisvc.chat_with_context.await_args.args[1]
+
+
+@pytest.mark.asyncio
 async def test_handle_admin_nl_single_step_success_feedback_summary() -> None:
     api = SimpleNamespace(
         send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
@@ -444,3 +539,253 @@ async def test_execute_plan_cancel_handin_task_tool_success() -> None:
 
     assert summary.ok
     assert "已取消任务「作业1」（群 123）。" in summary.message
+
+
+@pytest.mark.asyncio
+async def test_handle_create_handin_task_success_also_announces_to_group() -> None:
+    handin = SimpleNamespace(create_task=Mock(return_value=(True, "创建提交任务成功：实验一")))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.handin = handin
+
+    result = await admin_exec.handle_create_handin_task(
+        exec_ctx,
+        {
+            "group_id": 123456,
+            "task_name": "实验一",
+            "deadline_ts": 4102444800.0,
+            "reminders": [4102441200.0],
+        },
+    )
+
+    assert result.ok
+    handin.create_task.assert_called_once()
+    api.send_group_msg.assert_awaited_once()
+    call_args = api.send_group_msg.await_args
+    assert call_args.args[0] == 123456
+    ann_text = str(call_args.args[1])
+    assert "实验一" in ann_text
+    assert "截止时间" in ann_text
+    assert result.summary == "在群 123456 创建 handin 任务「实验一」"
+    assert result.data["announcement_text"] == ann_text
+    assert result.data["group_id"] == 123456
+    assert result.data["task_name"] == "实验一"
+    assert isinstance(result.data.get("deadline_pretty"), str)
+    assert isinstance(result.data.get("reminder_pretty_list"), list)
+
+
+@pytest.mark.asyncio
+async def test_handle_create_handin_task_create_success_but_announce_failed() -> None:
+    handin = SimpleNamespace(create_task=Mock(return_value=(True, "创建提交任务成功：实验一")))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "failed", "retcode": 100, "message": "blocked"}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.handin = handin
+
+    result = await admin_exec.handle_create_handin_task(
+        exec_ctx,
+        {
+            "group_id": 123456,
+            "task_name": "实验一",
+            "deadline_ts": 4102444800.0,
+        },
+    )
+
+    assert not result.ok
+    handin.create_task.assert_called_once()
+    api.send_group_msg.assert_awaited_once()
+    assert "任务已创建，但群公告发送失败" in str(result.detail or "")
+    assert "retcode=100" in str(result.detail or "")
+    assert result.summary == "在群 123456 创建 handin 任务「实验一」"
+    assert result.data["group_id"] == 123456
+    assert result.data["task_name"] == "实验一"
+    assert "announcement_text" in result.data
+
+
+@pytest.mark.asyncio
+async def test_handle_create_handin_task_backend_create_failed_no_announce() -> None:
+    handin = SimpleNamespace(create_task=Mock(return_value=(False, "任务已存在")))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.handin = handin
+
+    result = await admin_exec.handle_create_handin_task(
+        exec_ctx,
+        {
+            "group_id": 123456,
+            "task_name": "实验一",
+            "deadline_ts": 4102444800.0,
+        },
+    )
+
+    assert not result.ok
+    assert "任务已存在" in str(result.detail or "")
+    handin.create_task.assert_called_once()
+    api.send_group_msg.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_group_message_missing_text_does_not_leak_admin_command() -> None:
+    """send_group_message 缺少正文时不应泄露管理员原始控制指令"""
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    # 设置管理员原始控制指令
+    exec_ctx.text = "在群123发：今晚交作业"
+    # 调用 handle_send_group_message，只提供 group_id，不提供 text
+    result = await admin_exec.handle_send_group_message(exec_ctx, {"group_id": 123456})
+    assert not result.ok
+    assert "text 不能为空" in result.detail or "text 不能为空" in result.summary
+    api.send_group_msg.assert_not_awaited()
+    api.send_private_msg.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_private_message_missing_text_does_not_leak_admin_command() -> None:
+    """send_private_message 缺少正文时不应泄露管理员原始控制指令"""
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.text = "给456发：这是测试私聊"
+    result = await admin_exec.handle_send_private_message(exec_ctx, {"user_id": 123456789})
+    assert not result.ok
+    assert "text 不能为空" in result.detail or "text 不能为空" in result.summary
+    api.send_private_msg.assert_not_awaited()
+    api.send_group_msg.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_explicit_text_still_works() -> None:
+    """send_message 正常有正文时仍能发送"""
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.text = "在群123发：今晚交作业"  # 管理员指令，但不应被发送
+    result = await admin_exec.handle_send_message(
+        exec_ctx,
+        {"chat_type": "group", "chat_id": 123456, "text": "这是正常的消息正文"},
+    )
+    assert result.ok
+    api.send_group_msg.assert_awaited_once_with(123456, "这是正常的消息正文")
+    api.send_private_msg.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_message_missing_text_fails() -> None:
+    """send_message 缺少正文时应失败，不泄露管理员指令"""
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.text = "在群123发：今晚交作业"
+    result = await admin_exec.handle_send_message(
+        exec_ctx,
+        {"chat_type": "group", "chat_id": 123456},
+    )
+    assert not result.ok
+    assert "text 不能为空" in result.detail or "text 不能为空" in result.summary
+    api.send_group_msg.assert_not_awaited()
+    api.send_private_msg.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_reply_group_missing_message_does_not_leak_admin_command() -> None:
+    """generate_ai_reply group 场景缺少 message 时不应泄露管理员原始控制指令"""
+    aisvc = SimpleNamespace(chat_ready=True, chat_with_context=AsyncMock(return_value="AI回复"))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.aisvc = aisvc
+    exec_ctx.text = "给群123生成AI回复"
+    result = await admin_exec.handle_generate_ai_reply(
+        exec_ctx,
+        {"chat_type": "group", "group_id": 123456},
+    )
+    assert not result.ok
+    assert "text 不能为空" in result.detail or "text 不能为空" in result.summary
+    aisvc.chat_with_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_reply_private_missing_message_does_not_leak_admin_command() -> None:
+    """generate_ai_reply private 场景缺少 message 时不应泄露管理员原始控制指令"""
+    aisvc = SimpleNamespace(chat_ready=True, chat_with_context=AsyncMock(return_value="AI回复"))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.aisvc = aisvc
+    exec_ctx.text = "给用户456生成AI回复"
+    result = await admin_exec.handle_generate_ai_reply(
+        exec_ctx,
+        {"chat_type": "private", "user_id": 123456789},
+    )
+    assert not result.ok
+    assert "text 不能为空" in result.detail or "text 不能为空" in result.summary
+    aisvc.chat_with_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_reply_with_explicit_message_still_works() -> None:
+    """generate_ai_reply 有明确 message 时仍能正常工作"""
+    aisvc = SimpleNamespace(chat_ready=True, chat_with_context=AsyncMock(return_value="AI生成的回复内容"))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.aisvc = aisvc
+    exec_ctx.text = "给群123生成AI回复"  # 管理员指令，但不应被发送给 AI
+    result = await admin_exec.handle_generate_ai_reply(
+        exec_ctx,
+        {"chat_type": "group", "group_id": 123456, "message": "用户问：作业什么时候交？"},
+    )
+    assert result.ok
+    assert result.data["ai_reply"] == "AI生成的回复内容"
+    aisvc.chat_with_context.assert_awaited_once()
+    # 验证 AI 收到的不是管理员指令
+    call_args = aisvc.chat_with_context.await_args
+    assert call_args is not None
+    user_input = call_args.args[1]
+    assert "用户问：作业什么时候交？" in user_input
+    assert "给群123生成AI回复" not in user_input  # 管理员指令不应出现在输入中
+
+
+@pytest.mark.asyncio
+async def test_generate_ai_reply_accepts_various_message_aliases() -> None:
+    """generate_ai_reply 应接受各种消息参数别名"""
+    aisvc = SimpleNamespace(chat_ready=True, chat_with_context=AsyncMock(return_value="AI回复"))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+    exec_ctx = _make_exec_ctx(api)
+    exec_ctx.aisvc = aisvc
+
+    # 测试不同的参数别名都应能正常工作
+    aliases = ["message", "text", "msg", "content", "question", "input", "prompt", "query", "user_input"]
+    for alias in aliases:
+        aisvc.chat_with_context.reset_mock()
+        args = {"chat_type": "group", "group_id": 123456, alias: f"测试消息使用{alias}"}
+        result = await admin_exec.handle_generate_ai_reply(exec_ctx, args)
+        assert result.ok, f"应接受 {alias} 参数"
+        assert result.data["ai_reply"] == "AI回复"
+        aisvc.chat_with_context.assert_awaited_once()

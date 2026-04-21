@@ -116,16 +116,17 @@ def _pick_first_value(data: dict, *keys: str):
     return None
 
 
-def _extract_message_arg(data: dict, fallback_text: str = "") -> Optional[str]:
+def _extract_message_arg(
+    data: dict,
+    fallback_text: str = "",
+    *,
+    allow_fallback: bool = False,
+) -> Optional[str]:
     keys = ["text", "message", "msg", "content", "question", "input", "prompt", "query", "user_input"]
     for k in keys:
         if k in data and data[k] is not None:
             return str(data[k])
-    skip_keys = {"chat_type", "chat_id", "group_id", "user_id", "target_id", "as_user_id"}
-    for k, v in data.items():
-        if k not in skip_keys and isinstance(v, str) and str(v).strip():
-            return str(v)
-    if str(fallback_text or "").strip():
+    if allow_fallback and str(fallback_text or "").strip():
         return str(fallback_text).strip()
     return None
 
@@ -211,7 +212,7 @@ def _render_find_result_text(*, keyword: str, in_dir: Optional[str], hits: list[
 async def handle_send_message(exec_ctx: AdminExecutionContext, args: dict) -> ToolResult:
     data = _resolve_chat_context(exec_ctx, args)
     chat_type = str(data.get("chat_type") or "").strip().lower()
-    text_val = _extract_message_arg(data, exec_ctx.text)
+    text_val = _extract_message_arg(data, "", allow_fallback=False)
     text, err_text = _validate_message_text(text_val)
     if err_text:
         return ToolResult(ok=False, summary="", detail=err_text)
@@ -253,7 +254,7 @@ async def handle_send_group_message(exec_ctx: AdminExecutionContext, args: dict)
         {
             "chat_type": "group",
             "group_id": _pick_first_value(data, "group_id", "chat_id", "target_id"),
-            "text": _extract_message_arg(data, exec_ctx.text),
+            "text": _extract_message_arg(data, "", allow_fallback=False),
         },
     )
 
@@ -265,7 +266,7 @@ async def handle_send_private_message(exec_ctx: AdminExecutionContext, args: dic
         {
             "chat_type": "private",
             "user_id": _pick_first_value(data, "user_id", "chat_id", "target_id"),
-            "text": _extract_message_arg(data, exec_ctx.text),
+            "text": _extract_message_arg(data, "", allow_fallback=False),
         },
     )
 
@@ -566,7 +567,7 @@ async def handle_generate_ai_reply(exec_ctx: AdminExecutionContext, args: dict) 
         return ToolResult(ok=False, summary="", detail="AI 服务缺少 chat_with_context 能力。")
 
     chat_type = str(data.get("chat_type") or "").strip().lower()
-    text_val = _extract_message_arg(data, exec_ctx.text)
+    text_val = _extract_message_arg(data, "", allow_fallback=False)
     message, err_text = _validate_message_text(text_val)
     if err_text:
         return ToolResult(ok=False, summary="", detail=err_text)
@@ -671,6 +672,47 @@ async def handle_create_handin_task(exec_ctx: AdminExecutionContext, args: dict)
         return ToolResult(ok=False, summary="", detail=f"创建任务异常：{e}")
     if not ok:
         return ToolResult(ok=False, summary="", detail=str(msg or "创建任务失败。"))
+
+    deadline_pretty = pretty_ts(float(deadline_ts))
+    reminder_pretty_list = [pretty_ts(float(ts)) for ts in (remind_ts_list or [])]
+    ann_lines = [
+        f"【提交任务】{task_name}",
+        f"截止时间：{deadline_pretty}",
+    ]
+    if reminder_pretty_list:
+        ann_lines.append(f"提醒时间：{'、'.join(reminder_pretty_list)}")
+    announcement_text = "\n".join(ann_lines)
+
+    try:
+        announce_resp = await exec_ctx.api.send_group_msg(int(group_id), announcement_text)
+    except Exception as e:
+        return ToolResult(
+            ok=False,
+            summary=f"在群 {group_id} 创建 handin 任务「{task_name}」",
+            detail=f"任务已创建，但群公告发送失败：{e}",
+            data={
+                "group_id": int(group_id),
+                "task_name": task_name,
+                "deadline_ts": float(deadline_ts),
+                "deadline_pretty": deadline_pretty,
+                "reminder_pretty_list": reminder_pretty_list,
+                "announcement_text": announcement_text,
+            },
+        )
+    if not _is_ok_response(announce_resp):
+        return ToolResult(
+            ok=False,
+            summary=f"在群 {group_id} 创建 handin 任务「{task_name}」",
+            detail=f"任务已创建，但群公告发送失败：{_format_response_detail(announce_resp)}",
+            data={
+                "group_id": int(group_id),
+                "task_name": task_name,
+                "deadline_ts": float(deadline_ts),
+                "deadline_pretty": deadline_pretty,
+                "reminder_pretty_list": reminder_pretty_list,
+                "announcement_text": announcement_text,
+            },
+        )
     return ToolResult(
         ok=True,
         summary=f"在群 {group_id} 创建 handin 任务「{task_name}」",
@@ -679,7 +721,9 @@ async def handle_create_handin_task(exec_ctx: AdminExecutionContext, args: dict)
             "group_id": int(group_id),
             "task_name": task_name,
             "deadline_ts": float(deadline_ts),
-            "deadline_pretty": pretty_ts(float(deadline_ts)),
+            "deadline_pretty": deadline_pretty,
+            "reminder_pretty_list": reminder_pretty_list,
+            "announcement_text": announcement_text,
         },
     )
 
@@ -697,13 +741,23 @@ TOOLS: dict[str, ToolHandler] = {
 }
 
 
-def _success_message(done_summaries: list[str]) -> str:
-    if not done_summaries:
+def _success_message(done_items: list[tuple[str, str]]) -> str:
+    if not done_items:
         return "已完成。"
-    if len(done_summaries) == 1:
-        return f"已完成：{done_summaries[0]}"
+    send_like_tools = {"send_message", "send_group_message", "send_private_message"}
+    prep_tools = {"find_files", "list_directory", "list_handin_tasks", "generate_ai_reply"}
+    has_send = any(tool in send_like_tools for tool, _ in done_items)
+    view_items = done_items
+    if has_send and len(done_items) > 1:
+        filtered = [(tool, summary) for tool, summary in done_items if tool not in prep_tools]
+        if filtered:
+            view_items = filtered
+
+    summaries = [str(summary or "").strip() for _, summary in view_items]
+    if len(summaries) == 1:
+        return f"已完成：{summaries[0]}"
     lines = ["已完成："]
-    for i, one in enumerate(done_summaries, 1):
+    for i, one in enumerate(summaries, 1):
         lines.append(f"{i}. {one}")
     return "\n".join(lines)
 
@@ -773,7 +827,7 @@ async def execute_plan(exec_ctx: AdminExecutionContext, plan: AdminPlan) -> Exec
             failed_tool="plan",
         )
 
-    done_summaries: list[str] = []
+    done_items: list[tuple[str, str]] = []
     runtime_vars: dict[str, Any] = {}
     total = len(steps)
     for idx, step in enumerate(steps, 1):
@@ -826,7 +880,7 @@ async def execute_plan(exec_ctx: AdminExecutionContext, plan: AdminPlan) -> Exec
                 total_steps=total,
                 completed_steps=idx - 1,
             )
-        done_summaries.append(str(result.summary or tool))
+        done_items.append((tool, str(result.summary or tool)))
         step_text: Optional[str] = None
         if isinstance(result.data, dict):
             for k, v in result.data.items():
@@ -845,7 +899,7 @@ async def execute_plan(exec_ctx: AdminExecutionContext, plan: AdminPlan) -> Exec
 
     return ExecutionSummary(
         ok=True,
-        message=_success_message(done_summaries),
+        message=_success_message(done_items),
         total_steps=total,
         completed_steps=total,
         failed_tool=None,

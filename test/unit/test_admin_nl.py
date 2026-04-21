@@ -243,3 +243,25 @@ def test_is_high_risk_plan_when_has_multiple_send_actions() -> None:
     )
 
     assert admin_nl._is_high_risk_plan(plan) is True
+
+def test_is_high_risk_plan_when_has_cancel_handin_task() -> None:
+    plan = AdminPlan(
+        source="model",
+        summary="cancel handin",
+        steps=[AdminStep(tool="cancel_handin_task", args={"group_id": 123456, "task_name": "作业1"})],
+    )
+    assert admin_nl._is_high_risk_plan(plan) is True
+
+
+@pytest.mark.parametrize("tool_name", ["set_level", "cancel_handin"])
+def test_is_high_risk_plan_does_not_use_unregistered_legacy_tools(tool_name: str) -> None:
+    plan = AdminPlan(
+        source="model",
+        summary="legacy tool",
+        steps=[AdminStep(tool=tool_name, args={"x": 1})],
+    )
+    assert admin_nl._is_high_risk_plan(plan) is False
+
+
+def test_high_risk_tool_names_are_subset_of_registered_tools() -> None:
+    assert set(admin_nl._HIGH_RISK_TOOL_NAMES).issubset(set(admin_nl.TOOLS.keys()))

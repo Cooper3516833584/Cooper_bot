@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest test/unit/test_admin_nl_flags_logging.py -xvs)",
+      "Bash(py:*)",
+      "Bash(python:*)"
+    ]
+  }
+}

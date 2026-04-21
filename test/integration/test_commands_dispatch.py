@@ -880,6 +880,10 @@ async def test_admin_nl_create_handin_task_success(dispatch_harness) -> None:
     assert isinstance(args[3], list)
     assert len(args[3]) == 1
     assert isinstance(args[4], float)
+    api.send_group_msg.assert_awaited_once()
+    ann = str(api.send_group_msg.await_args.args[1])
+    assert "实验一" in ann
+    assert "截止时间" in ann
     assert any("已完成：在群 123456 创建 handin 任务「实验一」" in one["text"] for one in dispatch_harness.messages)
 
 
@@ -909,6 +913,38 @@ async def test_admin_nl_create_handin_task_bad_deadline_reports_error(dispatch_h
     handin.create_task.assert_not_called()
     assert any(
         ("执行失败：create_handin_task" in one["text"]) and ("时间格式不对：abc" in one["text"])
+        for one in dispatch_harness.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_nl_create_handin_task_announce_failed_reports_stage(dispatch_harness) -> None:
+    filesvc = _make_filesvc_stub()
+    handin = Mock()
+    handin.create_task.return_value = (True, "创建提交任务成功：实验一")
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=3, user_id=900001)
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "failed", "retcode": 100, "message": "blocked"}),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+
+    await commands.dispatch(
+        api=api,
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="在群123456创建提交任务，任务名实验一，4.12 23:59截止，18:00提醒",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=handin,
+        perm=Mock(),
+        aisvc=None,
+    )
+
+    handin.create_task.assert_called_once()
+    api.send_group_msg.assert_awaited_once()
+    assert any(
+        ("执行失败：create_handin_task" in one["text"]) and ("任务已创建，但群公告发送失败" in one["text"])
         for one in dispatch_harness.messages
     )
 

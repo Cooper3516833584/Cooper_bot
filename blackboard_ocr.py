@@ -2221,11 +2221,15 @@ def recognize_homework_from_path(
 def format_assignment_lines(assignments: list[dict]) -> list[str]:
     lines = []
     for item in assignments:
-        page = str(item.get("page") or "P?")
         question = str(item.get("question") or "").strip()
         if not question:
             continue
-        lines.append(f"{page}  {question}")
+        page_raw = item.get("page")
+        page = repair_page_token(str(page_raw or ""))
+        m = PAGE_RE.fullmatch(page)
+        if not m:
+            continue
+        lines.append(f"P{m.group(1)}  {question}")
     return lines
 
 

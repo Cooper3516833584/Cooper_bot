@@ -82,6 +82,7 @@ _CONFIRM_WORDS = {"确认", "confirm", "yes", "y"}
 _CANCEL_WORDS = {"取消", "cancel", "no", "n"}
 _PENDING_CONFIRM_TTL_SECONDS = 30.0 * 60.0
 _ADMIN_NL_LOG_TEXT_LIMIT = 120
+_HIGH_RISK_TOOL_NAMES = {"cancel_handin_task"}
 
 
 def _config_bool(name: str, default: bool) -> bool:
@@ -571,7 +572,7 @@ def _normalize_control_text(text: str) -> str:
 
 
 def _is_high_risk_plan(plan: AdminPlan) -> bool:
-    risky_tools = {"set_level", "cancel_handin_task", "cancel_handin"}
+    risky_tools = _HIGH_RISK_TOOL_NAMES
     send_like_tools = {"send_message", "send_group_message", "send_private_message"}
     for step in plan.steps or []:
         if str(step.tool or "").strip() in risky_tools:
