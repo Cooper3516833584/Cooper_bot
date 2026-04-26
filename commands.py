@@ -514,6 +514,47 @@ def _claim_group_notice_key(state: BotState, key: str, ttl_seconds: float = _GRO
     return True
 
 
+def _onebot_resp_ok(resp) -> bool:
+    if not isinstance(resp, dict):
+        return False
+    try:
+        return resp.get("status") == "ok" and int(resp.get("retcode", 0) or 0) == 0
+    except Exception:
+        return False
+
+
+def _onebot_resp_detail(resp) -> str:
+    if not isinstance(resp, dict):
+        return "no response"
+    rc = resp.get("retcode", "")
+    msg = (resp.get("wording") or resp.get("message") or "").strip()
+    if msg:
+        return f"retcode={rc} {msg}"
+    return f"retcode={rc}" if rc != "" else "send failed"
+
+
+def _extract_group_member_user_ids(resp) -> List[int]:
+    if not isinstance(resp, dict):
+        return []
+    data = resp.get("data")
+    if not isinstance(data, list):
+        return []
+    out: List[int] = []
+    seen = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            uid = int(item.get("user_id") or 0)
+        except Exception:
+            continue
+        if uid <= 0 or uid in seen:
+            continue
+        seen.add(uid)
+        out.append(uid)
+    return out
+
+
 async def reply(
     api,
     ctx,
@@ -529,23 +570,6 @@ async def reply(
         if send_scene == "group" and send_group_id is not None:
             return await api.send_group_msg(send_group_id, text)
         return await api.send_private_msg(send_user_id, text)
-
-    def _ok(resp) -> bool:
-        if not isinstance(resp, dict):
-            return False
-        try:
-            return resp.get("status") == "ok" and int(resp.get("retcode", 0) or 0) == 0
-        except Exception:
-            return False
-
-    def _detail(resp) -> str:
-        if not isinstance(resp, dict):
-            return "no response"
-        rc = resp.get("retcode", "")
-        msg = (resp.get("wording") or resp.get("message") or "").strip()
-        if msg:
-            return f"retcode={rc} {msg}"
-        return f"retcode={rc}" if rc != "" else "send failed"
 
     skip_context_once = False
     try:
@@ -566,18 +590,18 @@ async def reply(
             f"消息发送未确认：scene={send_scene}, group={send_group_id}, user={send_user_id}，为避免重复发送不再重试"
         )
         return
-    if not _ok(resp):
+    if not _onebot_resp_ok(resp):
         # transient network / bridge timeout retry once
         await asyncio.sleep(0.35)
         resp = await _send_once()
 
-    if _ok(resp):
+    if _onebot_resp_ok(resp):
         logsvc.log_out(ctx, text)
         if not skip_context_once:
             _remember_bot_reply_message(ctx, text, logsvc, send_scene, send_group_id, send_user_id)
     else:
         logsvc.log.warning(
-            f"reply send failed: scene={send_scene}, group={send_group_id}, user={send_user_id}, detail={_detail(resp)}"
+            f"reply send failed: scene={send_scene}, group={send_group_id}, user={send_user_id}, detail={_onebot_resp_detail(resp)}"
         )
 
 
@@ -3124,6 +3148,7 @@ async def _handle_explicit_command(
             lines.extend([
                 "",
                 "提交功能：",
+                "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）",
                 "/handin 任务名 [提醒时间...] 截止时间（仅群聊）",
                 "/handinstatus  查看任务并查询未交",
                 "/handincheck  查看你创建任务的已交文件（可配合 /get）",
@@ -3133,6 +3158,38 @@ async def _handle_explicit_command(
             ])
         msg = "\n".join(lines)
         await reply(api, ctx, msg, logsvc)
+        return
+    if cmd == "autoat":
+        if ctx.level < 2:
+            await reply(api, ctx, "权限不足：/autoat 仅对 2 级及以上开放。", logsvc)
+            return
+        if ctx.scene != "group" or ctx.group_id is None:
+            await reply(api, ctx, "/autoat 只能在群聊中使用。", logsvc)
+            return
+        try:
+            list_resp = await api.get_group_member_list(ctx.group_id)
+        except Exception as e:
+            logsvc.log.warning(f"/autoat get_group_member_list failed: group={ctx.group_id}, err={e}")
+            await reply(api, ctx, "获取群成员失败，请稍后重试。", logsvc)
+            return
+        user_ids = _extract_group_member_user_ids(list_resp)
+        if not user_ids:
+            detail = _onebot_resp_detail(list_resp)
+            logsvc.log.warning(f"/autoat empty member list: group={ctx.group_id}, detail={detail}")
+            await reply(api, ctx, "获取群成员失败：没有拿到可用的群成员列表。", logsvc)
+            return
+        at_message = " ".join(f"[CQ:at,qq={uid}]" for uid in user_ids)
+        send_resp = await api.send_group_msg(ctx.group_id, at_message)
+        if send_resp is None:
+            logsvc.log.info(f"/autoat send unconfirmed: group={ctx.group_id}, count={len(user_ids)}")
+            logsvc.log_out(ctx, at_message)
+            return
+        if _onebot_resp_ok(send_resp):
+            logsvc.log_out(ctx, at_message)
+            return
+        detail = _onebot_resp_detail(send_resp)
+        logsvc.log.warning(f"/autoat send failed: group={ctx.group_id}, detail={detail}")
+        await reply(api, ctx, "发送失败：请确认 QQ/NapCat 是否限制长消息或频繁 @。", logsvc)
         return
     # Handin commands
     if cmd == "handin":

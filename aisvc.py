@@ -96,6 +96,10 @@ class AIService:
     _NEW_FILE_EMBED_MAX_CONCURRENCY = 4
     _MISPLACED_REVIEW_MAX_CANDIDATES = 24
     _ORGANIZE_PROGRESS_EVERY = 5
+    _DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash"
+    _THINKING_DISABLED = {"type": "disabled"}
+    _THINKING_ENABLED = {"type": "enabled"}
+    _REASONING_EFFORT_HIGH = "high"
     _NOTICE_SILENT_TOKEN = "[静默]"
 
     def __init__(self, log):
@@ -113,7 +117,7 @@ class AIService:
         self.incremental_store_path = Path(BASE_DIR) / self._INCREMENTAL_STORE_FILENAME
 
         self.bot_nick = str(AI_BOT_NICK or "Cooepr_bot")
-        self.chat_model = str(AI_CHAT_MODEL or "deepseek-chat")
+        self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_FLASH_MODEL)
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
         self.search_limit = max(1, int(AI_SEARCH_LIMIT))
         self.search_min_similarity = float(AI_SEARCH_MIN_SIMILARITY)
@@ -144,6 +148,51 @@ class AIService:
         self._private_chat_prompt_cache: Dict[str, object] = {"default": {}, "users": {}}
         self._group_chat_prompt_cache_mtime: Optional[float] = None
         self._group_chat_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
+
+    def _build_chat_payload(
+        self,
+        messages: List[dict],
+        temperature: float,
+        response_format: Optional[dict] = None,
+    ) -> dict:
+        payload = {
+            "model": str(self.chat_model or self._DEEPSEEK_V4_FLASH_MODEL),
+            "messages": list(messages),
+            "temperature": float(temperature),
+            "thinking": dict(self._THINKING_DISABLED),
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        return payload
+
+    def _get_deepseek_sdk_base_url(self) -> str:
+        return (self.deepseek_base_url or "https://api.deepseek.com").rstrip("/")
+
+    def _create_deepseek_client(self):
+        if OpenAI is None:
+            raise RuntimeError("openai sdk is not installed")
+        return OpenAI(api_key=self.deepseek_api_key, base_url=self._get_deepseek_sdk_base_url())
+
+    def _create_reasoner_completion(self, client, messages: List[dict], temperature: float):
+        return client.chat.completions.create(
+            model=self._DEEPSEEK_V4_FLASH_MODEL,
+            messages=list(messages),
+            temperature=float(temperature),
+            reasoning_effort=self._REASONING_EFFORT_HIGH,
+            extra_body={"thinking": dict(self._THINKING_ENABLED)},
+        )
+
+    def _extract_sdk_chat_text(self, resp: object) -> str:
+        try:
+            return str(resp.choices[0].message.content or "").strip()
+        except Exception:
+            pass
+        if hasattr(resp, "model_dump"):
+            try:
+                return self._extract_chat_text(resp.model_dump())
+            except Exception:
+                return ""
+        return ""
 
     @property
     def chat_ready(self) -> bool:
@@ -1777,12 +1826,11 @@ class AIService:
         return target
 
     def _ask_subject_decision(self, prompt: str, timeout: float = 90.0) -> dict:
-        payload = {
-            "model": self.chat_model,
-            "messages": [{"role": "user", "content": str(prompt or "")}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.0,
-        }
+        payload = self._build_chat_payload(
+            [{"role": "user", "content": str(prompt or "")}],
+            0.0,
+            response_format={"type": "json_object"},
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=float(timeout))
         text = self._extract_chat_text(data)
@@ -2368,14 +2416,13 @@ class AIService:
         if not content:
             return "想聊点啥？发我一句话就行。"
 
-        payload = {
-            "model": self.chat_model,
-            "messages": [
+        payload = self._build_chat_payload(
+            [
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": content},
             ],
-            "temperature": float(self._CHAT_TEMPERATURE),
-        }
+            self._CHAT_TEMPERATURE,
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
         text = self._extract_chat_text(data)
@@ -2419,12 +2466,11 @@ class AIService:
             f"管理员输入:{task_text}"
         )
 
-        payload = {
-            "model": self.chat_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.0,
-        }
+        payload = self._build_chat_payload(
+            [{"role": "user", "content": prompt}],
+            0.0,
+            response_format={"type": "json_object"},
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         try:
             data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
@@ -2457,11 +2503,10 @@ class AIService:
             history = []
 
         system_prompt = self._select_chat_system_prompt(key) or self.system_prompt
-        payload = {
-            "model": self.chat_model,
-            "messages": [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
-            "temperature": float(self._CHAT_TEMPERATURE),
-        }
+        payload = self._build_chat_payload(
+            [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
+            self._CHAT_TEMPERATURE,
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
         text = self._extract_chat_text(data)
@@ -2716,8 +2761,7 @@ class AIService:
         if len(content) > 6000:
             content = content[:6000]
 
-        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
-        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+        client = self._create_deepseek_client()
         prompt = (
             "你是电气2410班群消息过滤器。\n"
             "请判断下面内容是否属于“需要同学执行动作/流程/截止日期”的通知。\n"
@@ -2728,16 +2772,8 @@ class AIService:
             f"内容片段：\n{content}"
         )
         try:
-            resp = client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-            )
-            raw = ""
-            try:
-                raw = str(resp.choices[0].message.content or "").strip()
-            except Exception:
-                raw = ""
+            resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.0)
+            raw = self._extract_sdk_chat_text(resp)
             out = self.sanitize_reasoner_output(raw)
             if out == "[通知]":
                 self.log.info(f"群通知解析：分类结果=通知 source={source[:120]}")
@@ -2766,8 +2802,7 @@ class AIService:
         if len(content) > 120000:
             content = content[:120000]
 
-        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
-        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+        client = self._create_deepseek_client()
 
         prompt = (
             "【角色设定】\n"
@@ -2797,19 +2832,8 @@ class AIService:
             f"{content}"
         )
 
-        resp = client.chat.completions.create(
-            model="deepseek-reasoner",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-
-        raw = ""
-        try:
-            raw = str(resp.choices[0].message.content or "").strip()
-        except Exception:
-            raw = ""
-        if (not raw) and hasattr(resp, "model_dump"):
-            raw = self._extract_chat_text(resp.model_dump())
+        resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.2)
+        raw = self._extract_sdk_chat_text(resp)
         out = self.sanitize_reasoner_output(raw)
         return out or self._NOTICE_SILENT_TOKEN
 
@@ -2834,19 +2858,10 @@ class AIService:
         lines = self._select_notice_prompt_lines(group_id, kind, "classify")
         prompt = self._render_notice_prompt(lines, source, content)
 
-        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
-        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+        client = self._create_deepseek_client()
         try:
-            resp = client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-            )
-            raw = ""
-            try:
-                raw = str(resp.choices[0].message.content or "").strip()
-            except Exception:
-                raw = ""
+            resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.0)
+            raw = self._extract_sdk_chat_text(resp)
             out = self.sanitize_reasoner_output(raw)
             if out == "[通知]":
                 self.log.info(f"群通知解析：分类结果=通知 source={source[:120]}")
@@ -2883,21 +2898,9 @@ class AIService:
         lines = self._select_notice_prompt_lines(group_id, kind, "reason")
         prompt = self._render_notice_prompt(lines, source, content)
 
-        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
-        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
-        resp = client.chat.completions.create(
-            model="deepseek-reasoner",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-
-        raw = ""
-        try:
-            raw = str(resp.choices[0].message.content or "").strip()
-        except Exception:
-            raw = ""
-        if (not raw) and hasattr(resp, "model_dump"):
-            raw = self._extract_chat_text(resp.model_dump())
+        client = self._create_deepseek_client()
+        resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.2)
+        raw = self._extract_sdk_chat_text(resp)
         out = self.sanitize_reasoner_output(raw)
         return out or self._NOTICE_SILENT_TOKEN
 
@@ -3050,12 +3053,11 @@ class AIService:
                 '{"keywords":["词1","词2"],"summary":"一句精简说明"}'
             )
 
-        payload = {
-            "model": self.chat_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-        }
+        payload = self._build_chat_payload(
+            [{"role": "user", "content": prompt}],
+            0.1,
+            response_format={"type": "json_object"},
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         try:
             data = self._post_json(url, payload, self.deepseek_api_key, timeout=120.0)

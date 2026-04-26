@@ -1657,3 +1657,72 @@ async def test_command_handin_dispatch(monkeypatch, dispatch_harness) -> None:
     assert args[3] == []
     assert args[4] == 1700000000.0
     assert any("task-created" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_command_autoat_dispatch_sends_single_group_message(dispatch_harness) -> None:
+    filesvc = _make_filesvc_stub()
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        get_group_member_list=AsyncMock(
+            return_value={
+                "status": "ok",
+                "retcode": 0,
+                "data": [
+                    {"user_id": 10001},
+                    {"user_id": 10002},
+                    {"user_id": 10003},
+                ],
+            }
+        ),
+    )
+
+    ctx = _make_ctx(scene="group", level=2, group_id=20001, user_id=10001)
+    logsvc = _DummyLogService()
+    await commands.dispatch(
+        api=api,
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="/autoat",
+        filesvc=filesvc,
+        logsvc=logsvc,
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=None,
+    )
+
+    api.get_group_member_list.assert_awaited_once_with(20001)
+    api.send_group_msg.assert_awaited_once_with(
+        20001,
+        "[CQ:at,qq=10001] [CQ:at,qq=10002] [CQ:at,qq=10003]",
+    )
+    assert dispatch_harness.messages == []
+    assert logsvc.out_logs == ["[CQ:at,qq=10001] [CQ:at,qq=10002] [CQ:at,qq=10003]"]
+
+
+@pytest.mark.asyncio
+async def test_command_autoat_requires_level_two(dispatch_harness) -> None:
+    filesvc = _make_filesvc_stub()
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+        get_group_member_list=AsyncMock(),
+    )
+
+    ctx = _make_ctx(scene="group", level=1, group_id=20001, user_id=10001)
+    await commands.dispatch(
+        api=api,
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="/autoat",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=None,
+    )
+
+    api.get_group_member_list.assert_not_awaited()
+    api.send_group_msg.assert_not_awaited()
+    assert any("/autoat" in one["text"] for one in dispatch_harness.messages)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
+import aisvc
 from aisvc import AIService
 
 
@@ -48,6 +50,8 @@ def test_chat_context_keeps_history_within_30_minutes(monkeypatch, controlled_ti
     assert second == "reply-2"
 
     assert len(payloads) == 2
+    assert payloads[0]["model"] == "deepseek-v4-flash"
+    assert payloads[0]["thinking"] == {"type": "disabled"}
     second_messages = payloads[1]["messages"]
     assert [m["role"] for m in second_messages] == ["system", "user", "assistant", "user"]
     assert second_messages[1]["content"] == "hello"
@@ -134,3 +138,32 @@ def test_chat_context_invalid_history_resets_but_session_still_works(monkeypatch
         {"role": "user", "content": "fresh question"},
         {"role": "assistant", "content": "reply-1"},
     ]
+
+
+def test_reason_notice_uses_v4_flash_thinking_mode(monkeypatch) -> None:
+    svc = _new_service()
+    client_init: list[dict[str, str]] = []
+    completion_calls: list[dict[str, Any]] = []
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            completion_calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="final answer"))]
+            )
+
+    class _FakeOpenAI:
+        def __init__(self, api_key: str, base_url: str):
+            client_init.append({"api_key": api_key, "base_url": base_url})
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+    monkeypatch.setattr(aisvc, "OpenAI", _FakeOpenAI)
+
+    out = svc._reason_notice_sync_v2("source", "snippet")
+
+    assert out == "final answer"
+    assert client_init == [{"api_key": "fake-chat-key", "base_url": "https://example.local/v1"}]
+    assert len(completion_calls) == 1
+    assert completion_calls[0]["model"] == "deepseek-v4-flash"
+    assert completion_calls[0]["reasoning_effort"] == "high"
+    assert completion_calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}

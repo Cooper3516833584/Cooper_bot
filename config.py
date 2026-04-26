@@ -80,10 +80,10 @@ LOG_DIR = BASE_DIR / "logs"
 
 # NapCat / OneBot v11
 TOKEN = _get_env("TOKEN", "CHANGE_ME_TOKEN")
-WS_URI = f"ws://127.0.0.1:3001/?access_token={TOKEN}"
+WS_URI = f"ws://127.0.0.1:13001/?access_token={TOKEN}"
 
 # 你已经配好的 HTTP Server（可选；目前阶段不依赖它）
-HTTP_PORT = 3010
+HTTP_PORT = 13010
 HTTP_BASE = f"http://127.0.0.1:{HTTP_PORT}"
 
 # 如果 NapCat 的 HTTP Server 也配置了 access_token，这里会自动带上（同时放在 query + Authorization）
@@ -206,7 +206,7 @@ AI_INDEX_PATH = AI_MATERIAL_DIR / "all_files_index.json"
 AI_METADATA_PATH = AI_MATERIAL_DIR / "file_metadata.json"
 AI_VECTORS_PATH = AI_MATERIAL_DIR / "file_vectors.npy"
 
-AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-chat")
+AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-flash")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooepr_bot")
 AI_SEARCH_LIMIT = int(_get_env("AI_SEARCH_LIMIT", "10") or "10")

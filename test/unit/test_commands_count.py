@@ -173,6 +173,35 @@ async def test_help_includes_count_commands(monkeypatch) -> None:
     assert "/count  开始临时收集名单" in replies[-1]
     assert "/countlist  查看已提交名单和未交名单" in replies[-1]
     assert "/countremove 序号" in replies[-1]
+    assert "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）" not in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_help_includes_autoat_for_level_two(monkeypatch) -> None:
+    replies: list[str] = []
+
+    async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
+        _ = force_private_user_id
+        replies.append(str(text))
+
+    monkeypatch.setattr(commands, "reply", _fake_reply)
+
+    ctx = _make_ctx()
+    ctx.level = 2
+    await commands._handle_explicit_command(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        t="/help",
+        filesvc=_make_filesvc(),
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=SimpleNamespace(_tasks={}),
+        perm=None,
+        aisvc=None,
+    )
+
+    assert replies
+    assert "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）" in replies[-1]
 
 
 @pytest.mark.asyncio
