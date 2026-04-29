@@ -52,6 +52,25 @@ def test_create_task_success(controlled_time) -> None:
     assert service._task_files_dir(20001, "hw_unit_create").exists()
 
 
+def test_create_task_with_required_suffix_casefold(controlled_time) -> None:
+    service = _new_service()
+    now_ts = controlled_time.time()
+
+    ok, msg = service.create_task(
+        group_id=20001,
+        creator_id=900001,
+        name="hw_pdf_only",
+        remind_ts_list=[],
+        deadline_ts=now_ts + 1800,
+        required_suffix="PDF",
+    )
+
+    assert ok is True
+    assert "限定格式：.pdf" in msg
+    task = _first_task(service)
+    assert task.required_suffix == "pdf"
+
+
 def test_deadline_judgement_and_recreate_after_expire(controlled_time) -> None:
     service = _new_service()
     now_ts = controlled_time.time()

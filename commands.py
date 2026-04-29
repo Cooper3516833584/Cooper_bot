@@ -17,7 +17,17 @@ import urllib.parse
 import urllib.request
 from filesvc import FileService
 from logsvc import LogService
-from handinsvc import HandinService, parse_mmdd_hhmm, pretty_ts, extract_name_from_filename, extract_student_id
+from handinsvc import (
+    HANDIN_ALLOWED_REQUIRED_SUFFIXES,
+    HandinService,
+    extract_name_from_filename,
+    extract_student_id,
+    file_matches_required_suffix,
+    normalize_required_suffix,
+    parse_mmdd_hhmm,
+    pretty_ts,
+    required_suffix_display,
+)
 from admin_nl import handle_admin_nl
 from command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query, run_list_dir_query
 from router import get_files
@@ -339,6 +349,10 @@ def _is_keyword_text_message(evt: dict, text: str) -> bool:
     return _is_text_with_allowed_cq(text)
 
 
+def _is_ai_chat_text_message(evt: dict, text: str) -> bool:
+    return _is_keyword_text_message(evt, text)
+
+
 def _fmt_mb(n_bytes: int) -> str:
     try:
         return f"{(float(n_bytes) / (1024 * 1024)):.2f}MB"
@@ -415,6 +429,21 @@ def _files_entry_latest_ts(items: object) -> float:
 
 def _clear_pending_handin_user(state: BotState, user_id: int) -> None:
     state.pending_handin_files.pop(user_id, None)
+    state.pending_handin_wait_done.pop(user_id, None)
+    state.pending_handin_zip_name.pop(user_id, None)
+    state.pending_handin_name_input.pop(user_id, None)
+    state.pending_handin_choose.pop(user_id, None)
+    state.pending_handin_overwrite.pop(user_id, None)
+
+
+def _delete_pending_handin_files(state: BotState, user_id: int, logsvc: Optional[LogService] = None) -> None:
+    for it in (state.pending_handin_files.get(user_id) or []):
+        try:
+            Path(str(it.get("path") or "")).unlink(missing_ok=True)
+        except Exception as e:
+            if logsvc is not None:
+                logsvc.log.warning(f"cleanup pending handin file failed: user={user_id} item={it} err={e}")
+    state.pending_handin_files[user_id] = []
     state.pending_handin_wait_done.pop(user_id, None)
     state.pending_handin_zip_name.pop(user_id, None)
     state.pending_handin_name_input.pop(user_id, None)
@@ -927,6 +956,8 @@ def _evt_mentions_me(evt: dict) -> bool:
 def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional[str]:
     msg = str(text or "").strip()
     scene = str(getattr(ctx, "scene", "") or "")
+    if not _is_ai_chat_text_message(evt, msg):
+        return None
     if scene == "group":
         nick_aliases = [x for x in {str(bot_nick or "").strip(), "Cooper_bot", "Cooepr_bot"} if x]
         has_nick_mention = False
@@ -941,9 +972,11 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
             return None
         return msg
     if scene.startswith("private"):
-        if not msg or (msg[0] not in ("c", "C")):
+        if not msg or msg.startswith(("/", "／")):
             return None
-        return msg[1:].strip()
+        if msg[0] in ("c", "C"):
+            return msg[1:].strip()
+        return msg
     return None
 
 
@@ -2163,9 +2196,82 @@ async def _send_file(api, ctx, container_path: str, name: str):
 def _handin_tasks_list_text(tasks) -> str:
     lines = ["请选择提交任务："]
     for i, t in enumerate(tasks, 1):
-        lines.append(f"{i}. {t.name}（群 {t.group_id}，截止 {pretty_ts(t.deadline_ts)}）")
+        suffix = required_suffix_display(getattr(t, "required_suffix", ""))
+        suffix_note = f"，格式 {suffix}" if suffix else ""
+        lines.append(f"{i}. {t.name}（群 {t.group_id}，截止 {pretty_ts(t.deadline_ts)}{suffix_note}）")
     lines.append("回复数字选择；回复 0 取消（删除临时文件）。")
     return "\n".join(lines)
+
+
+def _looks_like_handin_suffix_token(token: str) -> bool:
+    raw = str(token or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("."):
+        return bool(re.fullmatch(r"\.[A-Za-z0-9]{1,8}", raw))
+    return bool(re.fullmatch(r"[A-Za-z0-9]{1,8}", raw))
+
+
+def _handin_suffix_examples() -> str:
+    preferred = ["pdf", "docx", "doc", "pptx", "xlsx", "zip", "jpg", "png", "txt"]
+    return "、".join(x for x in preferred if x in HANDIN_ALLOWED_REQUIRED_SUFFIXES)
+
+
+def _parse_handin_create_parts(rest: str) -> Tuple[Optional[str], str, List[str], str]:
+    parts = str(rest or "").split()
+    usage = (
+        "用法：/handin 任务名 [文件后缀] [月.日 时:分 ...] 月.日 时:分\n"
+        "示例：/handin 作业1 pdf 1.22 18:30 1.23 20:00 1.24 23:59\n"
+        "示例：/handin 作业1 1.22 18:30 1.23 20:00 1.24 23:59\n"
+        f"（文件后缀可选，支持 {_handin_suffix_examples()} 等，不区分大小写；提醒时间可不填或填多个；最后一组时间为截止时间；任务名不能有空格）"
+    )
+    if len(parts) < 3:
+        return None, "", [], usage
+
+    time_start = 1
+    required_suffix = ""
+    if len(parts) >= 4 and ((len(parts) - 2) % 2 == 0):
+        suffix = normalize_required_suffix(parts[1])
+        if suffix:
+            required_suffix = suffix
+            time_start = 2
+        elif _looks_like_handin_suffix_token(parts[1]):
+            return None, "", [], f"文件后缀不支持：{parts[1]}\n目前支持：{_handin_suffix_examples()} 等。"
+
+    if ((len(parts) - time_start) < 2) or ((len(parts) - time_start) % 2 != 0):
+        return None, "", [], usage
+
+    time_texts = [f"{parts[i]} {parts[i+1]}" for i in range(time_start, len(parts), 2)]
+    return parts[0], required_suffix, time_texts, ""
+
+
+def _pending_handin_source_names(item: dict) -> List[str]:
+    names: List[str] = []
+    raw_sources = item.get("source_names") if isinstance(item, dict) else None
+    if isinstance(raw_sources, list):
+        for name in raw_sources:
+            s = str(name or "").strip()
+            if s:
+                names.append(s)
+    if names:
+        return names
+    if isinstance(item, dict):
+        name = str(item.get("name") or "").strip()
+        if name:
+            names.append(name)
+        path_name = Path(str(item.get("path") or "")).name
+        if path_name and path_name not in names:
+            names.append(path_name)
+    return names
+
+
+def _pending_handin_matches_required_suffix(item: dict, required_suffix: str) -> bool:
+    suffix = normalize_required_suffix(required_suffix)
+    if not suffix:
+        return True
+    return any(file_matches_required_suffix(name, suffix) for name in _pending_handin_source_names(item))
+
+
 async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
     """处理私聊发文件：下载到 inbox 并提示选择任务。返回是否已处理（True=已回复）。"""
     files = get_files(evt)
@@ -2534,6 +2640,17 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
             return True
         # 不先 pop，避免同名覆盖确认时丢失队列
         item = q[0]
+        required_suffix = normalize_required_suffix(getattr(task, "required_suffix", ""))
+        if required_suffix and not _pending_handin_matches_required_suffix(item, required_suffix):
+            suffix_text = required_suffix_display(required_suffix)
+            is_batch = bool(item.get("source_names"))
+            _delete_pending_handin_files(state, ctx.user_id, logsvc)
+            if is_batch:
+                msg = f"任务「{task.name}」仅接收 {suffix_text} 文件；本次多文件提交中未找到 {suffix_text} 文件，已取消本轮提交。"
+            else:
+                msg = f"任务「{task.name}」仅接收 {suffix_text} 文件；本次提交的文件格式不符，已取消本轮提交。"
+            await reply(api, ctx, msg + "\n请重新发送符合要求的文件。", logsvc)
+            return True
         ok, msg2, dst, code = handin.move_inbox_to_task(Path(item["path"]), task, overwrite=False)
         if (not ok) and code == "EXISTS":
             # 等待 Y/N
@@ -2901,7 +3018,7 @@ async def _handle_ai_chat_trigger(
         backend, raw_ai_input = _split_ai_chat_backend(ai_input)
         ai_input = _augment_ai_input_with_sender(ctx, raw_ai_input)
         if not ai_input:
-            await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊消息前加 C。", logsvc)
+            await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊直接发送文本就行。", logsvc)
             return True
         if aisvc is None:
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
@@ -3174,20 +3291,20 @@ async def _handle_explicit_command(
             "AI聊天：",
             "群聊：@Cooepr_bot + 内容",
             "群聊（Gemini联网）：@Cooepr_bot g内容（g/G 后面可不加空格）",
-            "私聊：C + 内容（大小写都可）",
-            "私聊（Gemini联网）：Cg内容（也支持 Cg 内容；g/G 后面可不加空格）",
+            "私聊：直接发送文本内容（仍兼容开头加 C）",
+            "私聊（Gemini联网）：g内容（仍兼容 Cg 内容；g/G 后面可不加空格）",
         ])
         if ctx.level >= 2:
             lines.extend([
                 "",
                 "提交功能：",
                 "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）",
-                "/handin 任务名 [提醒时间...] 截止时间（仅群聊）",
-                "/handinstatus  查看任务并查询未交",
+                "/handin 任务名 [文件后缀] [提醒时间...] 截止时间（仅群聊，如 pdf/docx）",
+                "/handinstat  查看任务并查询未交",
                 "/handincheck  查看你创建任务的已交文件（可配合 /get）",
                 "/handinget  打包你创建任务的已交文件并发送",
                 "/chandin  取消提交任务（按提示回复序号）",
-                "私聊发送文件后按提示操作；多文件发完后回复 done。",
+                "私聊发送文件后按提示操作；多文件发完后回复 done；限定后缀时多文件至少包含一个匹配文件。",
             ])
         msg = "\n".join(lines)
         await reply(api, ctx, msg, logsvc)
@@ -3232,25 +3349,15 @@ async def _handle_explicit_command(
         if ctx.scene != "group" or ctx.group_id is None:
             await reply(api, ctx, "/handin 只能在群聊中使用。", logsvc)
             return
-        # 格式：/handin 任务名 [提醒时间...] 截止时间
+        # 格式：/handin 任务名 [文件后缀] [提醒时间...] 截止时间
         # 时间用两段：月.日 时:分（冒号中英文都兼容）。提醒时间可不填或填多个；最后一组时间为截止时间。
-        # 示例：/handin 作业1 1.22 18:30 1.23 20:00 1.24 23:59
-        parts = rest.split()
-        if len(parts) < 3 or ((len(parts) - 1) % 2 != 0):
-            await reply(
-                api,
-                ctx,
-                "用法：/handin 任务名 [月.日 时:分 ...] 月.日 时:分\n"
-                "示例：/handin 作业1 1.22 18:30 1.23 20:00 1.24 23:59\n"
-                "（提醒时间可不填或填多个；最后一组时间为截止时间；任务名不能有空格；冒号中英文都兼容）",
-                logsvc,
-            )
+        task_name, required_suffix, time_texts, err = _parse_handin_create_parts(rest)
+        if err:
+            await reply(api, ctx, err, logsvc)
             return
-        task_name = parts[0]
         now = time.time()
         ts_list = []
-        for i in range(1, len(parts), 2):
-            s = f"{parts[i]} {parts[i+1]}"
+        for s in time_texts:
             ts = parse_mmdd_hhmm(s, now)
             if ts is None:
                 await reply(api, ctx, f"时间格式不对：{s}\n请用 月.日 时:分，例如 1.22 18:30（冒号中英文都行）。", logsvc)
@@ -3258,12 +3365,12 @@ async def _handle_explicit_command(
             ts_list.append(ts)
         deadline_ts = ts_list[-1]
         remind_list = ts_list[:-1]  # 可为空或多个
-        ok, msg2 = handin.create_task(ctx.group_id, ctx.user_id, task_name, remind_list, deadline_ts)
+        ok, msg2 = handin.create_task(ctx.group_id, ctx.user_id, task_name, remind_list, deadline_ts, required_suffix)
         await reply(api, ctx, msg2, logsvc)
         return
-    if cmd == "handinstatus":
+    if cmd == "handinstat":
         if ctx.level < 2:
-            await reply(api, ctx, "权限不足：/handinstatus 仅对 2 级及以上开放。", logsvc)
+            await reply(api, ctx, "权限不足：/handinstat 仅对 2 级及以上开放。", logsvc)
             return
         # 允许查询已截止任务：用于统计未交/导出等（提交仍只允许进行中）
         if ctx.scene == "group" and ctx.group_id is not None:
@@ -3856,9 +3963,11 @@ async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService
             Path(str(it.get("path") or "")).unlink(missing_ok=True)
         except Exception as e:
             logsvc.log.warning(f"remove source after zip failed: user={ctx.user_id} item={it} err={e}")
+    source_names = [str(it.get("name") or Path(str(it.get("path") or "")).name) for it in q]
     state.pending_handin_files[ctx.user_id] = [{
         "path": str(out_zip),
         "name": out_zip.name,
+        "source_names": source_names,
         "ts": time.time(),
     }]
     state.pending_handin_wait_done.pop(ctx.user_id, None)
