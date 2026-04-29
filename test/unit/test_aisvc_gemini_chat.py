@@ -77,6 +77,7 @@ def test_run_gemini_cli_sync_parses_json_response(monkeypatch, tmp_project_root)
     cmd = [str(x) for x in captured["cmd"]]
     assert Path(cmd[0]).as_posix() == "C:/tools/gemini.cmd"
     assert cmd[1:5] == ["-p", "Reply exactly OK", "-o", "json"]
+    assert cmd[5:7] == ["--approval-mode", "default"]
     assert "--policy" in cmd
     assert captured["cwd"] == str(svc.gemini_workdir)
     assert captured["encoding"] == "utf-8"

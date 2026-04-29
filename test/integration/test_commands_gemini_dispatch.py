@@ -65,7 +65,6 @@ class _FakeAIService:
         self.extract_notice_url_head = AsyncMock(return_value="")
         self.classify_notice = AsyncMock(return_value=False)
         self.reason_notice = AsyncMock(return_value="")
-        self.parse_admin_plan = AsyncMock(return_value=None)
         self.sanitize_reasoner_output = lambda text: str(text)
         self.is_notice_silent = lambda _text: False
         self.semantic_find_paths = AsyncMock(return_value=[])

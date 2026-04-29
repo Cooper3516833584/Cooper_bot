@@ -28,7 +28,6 @@ from handinsvc import (
     pretty_ts,
     required_suffix_display,
 )
-from admin_nl import handle_admin_nl
 from command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query, run_list_dir_query
 from router import get_files
 from ziputil import open_fast_zip, write_path as zip_write_path
@@ -391,8 +390,6 @@ class BotState:
     pending_handin_choose: Dict[int, dict] = field(default_factory=dict)
     # Handin: user_id -> {"task_id": str, "path": str, "name": str, "ts": float}
     pending_handin_overwrite: Dict[int, dict] = field(default_factory=dict)
-    # Admin NL confirm: user_id -> {"plan": {...}, "ts": float, "source": str}
-    pending_admin_nl_confirm: Dict[int, dict] = field(default_factory=dict)
     # Count: conv_key -> {"names": [str, ...], "ts": float}
     pending_count_session: Dict[str, dict] = field(default_factory=dict)
     # Group notice digest dedup cache: notice_key -> ts
@@ -3828,20 +3825,6 @@ async def dispatch(
         return
     # 记录 IN（只有最终 log_out 才会落盘）
     logsvc.log_in(ctx, t)
-    if await handle_admin_nl(
-        api,
-        ctx,
-        t,
-        logsvc,
-        evt=evt,
-        filesvc=filesvc,
-        state=state,
-        handin=handin,
-        perm=perm,
-        aisvc=aisvc,
-        reply_func=reply,
-    ):
-        return
     if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc):
         return
     _remember_non_ai_chat_message(ctx, t, logsvc, aisvc)

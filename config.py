@@ -100,9 +100,6 @@ IDLE_SPLIT_SECONDS = 1800
 # 权限等级：0游客 1临时 2好友 3管理员
 # 管理员 QQ 号（/whoami 里显示的 user_id）
 ADMIN_USERS = _parse_int_set(_get_env("ADMIN_USERS", ""))
-ENABLE_ADMIN_NL_CONTROL = _get_env_bool("ENABLE_ADMIN_NL_CONTROL", True)
-ENABLE_ADMIN_NL_MULTI_STEP = _get_env_bool("ENABLE_ADMIN_NL_MULTI_STEP", True)
-ENABLE_ADMIN_TARGET_ALIASES = _get_env_bool("ENABLE_ADMIN_TARGET_ALIASES", True)
 ENABLE_OCR = _get_env_bool("ENABLE_OCR", False)
 
 # 群权限：可选的群级别“下限”（通常不需要；你也可以留空）
@@ -210,8 +207,8 @@ AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-flash")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooepr_bot")
 AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "gemini")
-AI_GEMINI_MODEL = _get_env("AI_GEMINI_MODEL", "")
-AI_GEMINI_TIMEOUT_SECONDS = float(_get_env("AI_GEMINI_TIMEOUT_SECONDS", "120") or "120")
+AI_GEMINI_MODEL = _get_env("AI_GEMINI_MODEL", "gemini-3.1-pro-preview")
+AI_GEMINI_TIMEOUT_SECONDS = float(_get_env("AI_GEMINI_TIMEOUT_SECONDS", "180") or "180")
 AI_GEMINI_WORKDIR = _get_env_path("AI_GEMINI_WORKDIR", DATA_DIR / "_gemini_cli_workspace")
 AI_GEMINI_POLICY_PATH = _get_env_path("AI_GEMINI_POLICY_PATH", BASE_DIR / "gemini_cli_chat_only.toml")
 AI_SEARCH_LIMIT = int(_get_env("AI_SEARCH_LIMIT", "10") or "10")
