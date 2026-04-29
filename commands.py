@@ -947,6 +947,18 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
     return None
 
 
+def _split_ai_chat_backend(ai_input: str) -> Tuple[str, str]:
+    text = str(ai_input or "").strip()
+    if not text:
+        return "default", ""
+    low = text.lower()
+    if low.startswith("gemini"):
+        return "gemini", text[6:].strip()
+    if text[:1] in {"g", "G"}:
+        return "gemini", text[1:].strip()
+    return "default", text
+
+
 def _ai_chat_session_key(ctx) -> Optional[str]:
     scene = str(getattr(ctx, "scene", "") or "")
     if scene == "group":
@@ -2886,35 +2898,54 @@ async def _handle_ai_chat_trigger(
 ):
     ai_input = _extract_ai_chat_input(ctx, evt, t, bot_nick=(aisvc.bot_nick if aisvc else AI_BOT_NICK))
     if ai_input is not None:
-        ai_input = _augment_ai_input_with_sender(ctx, ai_input)
+        backend, raw_ai_input = _split_ai_chat_backend(ai_input)
+        ai_input = _augment_ai_input_with_sender(ctx, raw_ai_input)
         if not ai_input:
             await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊消息前加 C。", logsvc)
             return True
-        if (aisvc is None) or (not aisvc.chat_ready):
+        if aisvc is None:
+            await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
+            return True
+        use_gemini = backend == "gemini"
+        ready = bool(getattr(aisvc, "gemini_chat_ready", False)) if use_gemini else bool(getattr(aisvc, "chat_ready", False))
+        if not ready:
+            msg = "Gemini 联网聊天暂时不可用（Gemini CLI 未就绪）。" if use_gemini else "AI 聊天暂时不可用（配置未就绪）。"
+            await reply(api, ctx, msg, logsvc)
+            return True
+        chat_with_context_fn = getattr(aisvc, "gemini_chat_with_context", None) if use_gemini else getattr(aisvc, "chat_with_context", None)
+        chat_fn = getattr(aisvc, "gemini_chat", None) if use_gemini else getattr(aisvc, "chat", None)
+        if not callable(chat_fn):
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
         try:
             session_key = _ai_chat_session_key(ctx)
-            if session_key:
-                out = (await aisvc.chat_with_context(session_key, ai_input)).strip()
+            if session_key and callable(chat_with_context_fn):
+                out = (await chat_with_context_fn(session_key, ai_input)).strip()
                 try:
                     setattr(ctx, "_skip_reply_context_once", True)
                 except Exception:
                     pass
             else:
-                out = (await aisvc.chat(ai_input)).strip()
+                out = (await chat_fn(ai_input)).strip()
             if out and _is_likely_ai_stuck_repeat(session_key, ai_input, out):
                 retry_prompt = (
                     "你刚才出现了机械复读。请只根据这条新消息给出新的、准确的回复，不要复述上一条答案。\n"
                     + ai_input
                 )
-                retry_out = (await aisvc.chat(retry_prompt)).strip()
+                retry_out = (await chat_fn(retry_prompt)).strip()
                 if retry_out:
                     out = retry_out
             if not out:
                 out = "我这边没收到有效回复，稍后再试一次。"
             await reply(api, ctx, out, logsvc)
-        except Exception:
+        except Exception as e:
+            try:
+                logsvc.log.warning(
+                    f"AI chat failed: backend={'gemini' if use_gemini else 'default'} "
+                    f"session={(session_key or '')[:80]} err={e}"
+                )
+            except Exception:
+                pass
             await reply(api, ctx, aisvc.fallback_error_reply, logsvc)
         return True
     return False
@@ -3142,7 +3173,9 @@ async def _handle_explicit_command(
             "",
             "AI聊天：",
             "群聊：@Cooepr_bot + 内容",
+            "群聊（Gemini联网）：@Cooepr_bot g内容（g/G 后面可不加空格）",
             "私聊：C + 内容（大小写都可）",
+            "私聊（Gemini联网）：Cg内容（也支持 Cg 内容；g/G 后面可不加空格）",
         ])
         if ctx.level >= 2:
             lines.extend([

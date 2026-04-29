@@ -24,6 +24,11 @@ from config import (
     AI_CHAT_MODEL,
     AI_EMBED_MODEL,
     AI_FALLBACK_ERROR_REPLY,
+    AI_GEMINI_CLI_PATH,
+    AI_GEMINI_MODEL,
+    AI_GEMINI_POLICY_PATH,
+    AI_GEMINI_TIMEOUT_SECONDS,
+    AI_GEMINI_WORKDIR,
     AI_INDEX_PATH,
     AI_MATERIAL_DIR,
     AI_METADATA_PATH,
@@ -83,6 +88,7 @@ class AIService:
     _EBOOK_SUFFIXES = {".epub", ".mobi"}
     _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
     _CHAT_CONTEXT_MAX_MESSAGES = 100
+    _GEMINI_CHAT_CONTEXT_MAX_MESSAGES = 20
     _CHAT_TEMPERATURE = 0.65
     _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
     _AUTO_ORGANIZE_EBOOK_SUBJECT = "课外书"
@@ -119,6 +125,11 @@ class AIService:
         self.bot_nick = str(AI_BOT_NICK or "Cooepr_bot")
         self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_FLASH_MODEL)
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
+        self.gemini_cli_path = str(AI_GEMINI_CLI_PATH or "").strip()
+        self.gemini_model = str(AI_GEMINI_MODEL or "").strip()
+        self.gemini_policy_path = Path(AI_GEMINI_POLICY_PATH)
+        self.gemini_workdir = Path(AI_GEMINI_WORKDIR)
+        self.gemini_timeout_seconds = max(10.0, float(AI_GEMINI_TIMEOUT_SECONDS or 120.0))
         self.search_limit = max(1, int(AI_SEARCH_LIMIT))
         self.search_min_similarity = float(AI_SEARCH_MIN_SIMILARITY)
         self.system_prompt = str(AI_SYSTEM_PROMPT or "").strip()
@@ -199,6 +210,10 @@ class AIService:
         return bool(self.deepseek_base_url and self.deepseek_api_key and self.system_prompt)
 
     @property
+    def gemini_chat_ready(self) -> bool:
+        return bool(self._resolve_gemini_cli_executable() and self.gemini_policy_path.is_file())
+
+    @property
     def semantic_ready(self) -> bool:
         with self._lock:
             active_count = int(self._semantic_active_count)
@@ -242,6 +257,12 @@ class AIService:
     async def chat_with_context(self, session_key: str, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
 
+    async def gemini_chat(self, user_input: str) -> str:
+        return await asyncio.to_thread(self._gemini_chat_sync, user_input)
+
+    async def gemini_chat_with_context(self, session_key: str, user_input: str) -> str:
+        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input)
+
     async def parse_admin_plan(
         self,
         text: str,
@@ -262,6 +283,143 @@ class AIService:
 
     def remember_assistant_message(self, session_key: str, message_text: str) -> None:
         self._remember_chat_message(session_key, "assistant", message_text)
+
+    def _resolve_gemini_cli_executable(self) -> str:
+        raw = str(self.gemini_cli_path or "").strip()
+        if not raw:
+            return ""
+        try:
+            direct = Path(raw).expanduser()
+        except Exception:
+            direct = None
+        if direct is not None and direct.is_file():
+            return str(direct)
+        resolved = shutil.which(raw)
+        if resolved:
+            return str(resolved)
+        if direct is not None and (not direct.is_absolute()):
+            try:
+                candidate = (Path(BASE_DIR) / direct).resolve()
+            except Exception:
+                candidate = None
+            if candidate is not None and candidate.is_file():
+                return str(candidate)
+        return ""
+
+    def _build_gemini_cli_base_command(self) -> List[str]:
+        cli_exe = self._resolve_gemini_cli_executable()
+        if not cli_exe:
+            return []
+
+        cli_path = Path(cli_exe)
+        suffix = cli_path.suffix.lower()
+        if suffix in {".cmd", ".bat", ".ps1"}:
+            node_path = cli_path.with_name("node.exe")
+            js_path = cli_path.parent / "node_modules" / "@google" / "gemini-cli" / "bundle" / "gemini.js"
+            if node_path.is_file() and js_path.is_file():
+                return [str(node_path), str(js_path)]
+        return [str(cli_path)]
+
+    def _trim_gemini_history(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        out = list(messages or [])
+        max_messages = max(1, int(self._GEMINI_CHAT_CONTEXT_MAX_MESSAGES))
+        if len(out) > max_messages:
+            out = out[-max_messages:]
+        return out
+
+    def _build_gemini_cli_prompt(
+        self,
+        system_prompt: str,
+        history: List[Dict[str, str]],
+        user_input: str,
+    ) -> str:
+        lines = [
+            "You are the Gemini web chat backend for a QQ bot conversation.",
+            "You may use Google web search when current information is needed.",
+            "Do not attempt to read, list, modify, or execute any local files, directories, or commands.",
+            "Answer the latest user request directly.",
+            "Default to concise Chinese unless the user clearly asks for another language.",
+            "",
+        ]
+        sys_text = str(system_prompt or "").strip()
+        if sys_text:
+            lines.extend(["System:", sys_text, ""])
+        for item in self._trim_gemini_history(history):
+            role = str((item or {}).get("role") or "").strip().lower()
+            content = str((item or {}).get("content") or "").strip()
+            if (not content) or role not in {"user", "assistant"}:
+                continue
+            label = "User" if role == "user" else "Assistant"
+            lines.extend([f"{label}:", content, ""])
+        lines.extend(["User:", str(user_input or "").strip(), "", "Assistant:"])
+        return "\n".join(lines).strip()
+
+    def _run_gemini_cli_sync(self, prompt: str) -> str:
+        base_cmd = self._build_gemini_cli_base_command()
+        if not base_cmd:
+            raise RuntimeError("gemini cli not found")
+        policy_path = Path(self.gemini_policy_path)
+        if not policy_path.is_file():
+            raise RuntimeError("gemini policy file not found")
+        workdir = Path(self.gemini_workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            *base_cmd,
+            "-p",
+            str(prompt or ""),
+            "-o",
+            "json",
+            "--approval-mode",
+            "plan",
+            "--policy",
+            str(policy_path),
+        ]
+        if self.gemini_model:
+            cmd.extend(["-m", str(self.gemini_model)])
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(workdir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=float(self.gemini_timeout_seconds),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"gemini cli timeout after {int(self.gemini_timeout_seconds)}s") from e
+        except Exception as e:
+            raise RuntimeError(f"gemini cli launch failed: {e}") from e
+
+        raw = str(proc.stdout or "").strip()
+        if proc.returncode != 0:
+            detail = str(proc.stderr or raw or "").strip()
+            raise RuntimeError(f"gemini cli failed: {detail[:300]}")
+        if not raw:
+            detail = str(proc.stderr or "").strip()
+            raise RuntimeError(f"gemini cli empty response: {detail[:300]}")
+
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if (start < 0) or (end < start):
+                raise RuntimeError("gemini cli json decode failed")
+            try:
+                obj = json.loads(raw[start : end + 1])
+            except Exception as e:
+                raise RuntimeError(f"gemini cli json decode failed: {e}") from e
+        if not isinstance(obj, dict):
+            raise RuntimeError("gemini cli invalid response type")
+        text = str(obj.get("response") or "").strip()
+        if not text:
+            raise RuntimeError("empty gemini chat response")
+        return text
 
     async def extract_notice_file_head(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         return await asyncio.to_thread(
@@ -2430,6 +2588,17 @@ class AIService:
             raise RuntimeError("empty chat response")
         return text
 
+    def _gemini_chat_sync(self, user_input: str) -> str:
+        if not self.gemini_chat_ready:
+            raise RuntimeError("gemini chat not ready")
+
+        content = str(user_input or "").strip()
+        if not content:
+            return "鎯宠亰鐐瑰暐锛熷彂鎴戜竴鍙ヨ瘽灏辫銆?"
+
+        prompt = self._build_gemini_cli_prompt(self.system_prompt, [], content)
+        return self._run_gemini_cli_sync(prompt)
+
     def _parse_admin_plan_sync(
         self,
         text: str,
@@ -2517,6 +2686,37 @@ class AIService:
             self._save_chat_turn(key, content, text)
         except Exception as e:
             self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
+        return text
+
+    def _gemini_chat_with_context_sync(self, session_key: str, user_input: str) -> str:
+        if not self.gemini_chat_ready:
+            raise RuntimeError("gemini chat not ready")
+
+        content = str(user_input or "").strip()
+        if not content:
+            return self._gemini_chat_sync(content)
+
+        key = str(session_key or "").strip()
+        if not key:
+            return self._gemini_chat_sync(content)
+
+        history: List[Dict[str, str]] = []
+        try:
+            history = self._load_active_chat_history(key)
+        except Exception as e:
+            self.log.warning(f"AI gemini chat context read failed, fallback to stateless: session={key[:80]} err={e}")
+            history = []
+
+        system_prompt = self._select_chat_system_prompt(key) or self.system_prompt
+        prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
+        text = self._run_gemini_cli_sync(prompt)
+        if not text:
+            raise RuntimeError("empty gemini chat response")
+
+        try:
+            self._save_chat_turn(key, content, text)
+        except Exception as e:
+            self.log.warning(f"AI gemini chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
         return text
 
     @staticmethod
