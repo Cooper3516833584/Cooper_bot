@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 import commands
 
 
@@ -125,3 +129,32 @@ def test_keyword_text_message_accepts_text_with_at_segment() -> None:
         ]
     }
     assert commands._is_keyword_text_message(evt, "[CQ:at,qq=42] \u4f60\u597d")
+
+
+@pytest.mark.asyncio
+async def test_plain_text_keyword_answers_only_trigger_in_group(monkeypatch) -> None:
+    replies: list[str] = []
+    lookup_calls: list[str] = []
+
+    async def _fake_reply(_api, _ctx, text: str, _logsvc) -> None:
+        replies.append(str(text))
+
+    def _fake_lookup(text: str) -> list[str]:
+        lookup_calls.append(str(text))
+        return ["hit"]
+
+    monkeypatch.setattr(commands, "reply", _fake_reply)
+    monkeypatch.setattr(commands, "_lookup_fixed_answers", lambda _text: [])
+    monkeypatch.setattr(commands, "_lookup_keyword_answers", _fake_lookup)
+
+    evt = {"message": [{"type": "text", "data": {"text": "hello"}}]}
+    private_ctx = SimpleNamespace(scene="private_friend", user_id=1, group_id=None)
+    group_ctx = SimpleNamespace(scene="group", user_id=1, group_id=100)
+
+    assert await commands._handle_plain_text_input(None, private_ctx, evt, "hello", None, commands.BotState())
+    assert replies == []
+    assert lookup_calls == []
+
+    assert await commands._handle_plain_text_input(None, group_ctx, evt, "hello", None, commands.BotState())
+    assert replies == ["hit"]
+    assert lookup_calls == ["hello"]

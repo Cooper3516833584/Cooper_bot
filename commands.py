@@ -3085,6 +3085,8 @@ async def _handle_plain_text_input(
             return True
         if not _is_keyword_text_message(evt, t):
             return True
+        if getattr(ctx, "scene", "") != "group":
+            return True
         keyword_answers = _lookup_keyword_answers(t)
         if keyword_answers:
             for msg in keyword_answers:
