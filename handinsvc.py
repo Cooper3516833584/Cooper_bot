@@ -97,12 +97,12 @@ BLACKLIST_SUBSTRINGS = {
     "电气", "学院", "工程", "班", "专业",
     "报告", "读书", "作业", "论文", "马原",
     "课", "阅读", "历史", "自由", "之间",
-    "政治", "经济", "序言", "导言", "经典", "思想",
+    "政治", "经济", "序言", "导言", "经典", "思想","电测","报告","电路测试","测试",
 }
 STRUCTURAL_WORDS = ["电气", "学院", "工程", "班", "专业"]
 SEPARATORS = ["-", "_", "——", "—", "–", ";", "，", ",", " "]
 
-_RE_STU = re.compile(r"[Uu]\d{8,12}")  # 例如 U202412743
+_RE_STU = re.compile(r"[Uu]\d{8,12}")
 _RE_ENG = re.compile(r"[A-Za-z]")
 _RE_NUM = re.compile(r"[Uu]?\d{4,}")
 SUBMITTED_FILE_SUFFIXES = {".doc", ".docx", ".pdf", ".txt", ".zip", ".rar", ".7z", ".ppt", ".pptx", ".xls", ".xlsx"}
