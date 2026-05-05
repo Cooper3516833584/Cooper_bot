@@ -73,8 +73,11 @@ _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_PENDING_COUNT_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_GROUP_NOTICE_SECONDS = 10.0 * 60.0
-_MEDIA_OR_EMOJI_SEG_TYPES = {"image", "face", "mface", "market_face"}
-_KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES = {"at", "reply"}
+_HANDIN_SUBMIT_REMINDER_SECONDS = 10.0 * 60.0
+_HANDIN_SUBMIT_REMINDER_TEXT = "发完文件需要选择提交任务哇，文件还没提交上去呐（哭唧唧）"
+_TEXT_COMPANION_EMOJI_SEG_TYPES = {"face", "mface", "market_face"}
+_MEDIA_OR_EMOJI_SEG_TYPES = {"image"} | _TEXT_COMPANION_EMOJI_SEG_TYPES
+_KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES = {"at", "reply"} | _TEXT_COMPANION_EMOJI_SEG_TYPES
 _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
     r"^\[\s*(?:\u56fe\u7247|\u8868\u60c5|\u52a8\u753b\u8868\u60c5)\s*\]$",
     flags=re.IGNORECASE,
@@ -87,6 +90,16 @@ _COUNT_END_RE = re.compile(r"^/?end[\s。.!！?？]*$", flags=re.IGNORECASE)
 _COUNT_END_CN_RE = re.compile(r"^结束[\s。.!！?？]*$")
 _FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
 _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
+
+
+def _strip_text_companion_cq_segments(text: str) -> str:
+    def _replace(match: re.Match) -> str:
+        tp = str(match.group(1) or "").lower()
+        if tp in _TEXT_COMPANION_EMOJI_SEG_TYPES:
+            return ""
+        return match.group(0)
+
+    return _CQ_SEG_RE.sub(_replace, str(text or "")).strip()
 
 
 _BLACKBOARD_OCR_TEMP_DIR = (DATA_DIR / "temp" / "blackboard_ocr").resolve()
@@ -390,6 +403,8 @@ class BotState:
     pending_handin_choose: Dict[int, dict] = field(default_factory=dict)
     # Handin: user_id -> {"task_id": str, "path": str, "name": str, "ts": float}
     pending_handin_overwrite: Dict[int, dict] = field(default_factory=dict)
+    # Handin submit reminder: user_id -> {"task": asyncio.Task, "ts": float}
+    pending_handin_submit_reminders: Dict[int, dict] = field(default_factory=dict)
     # Count: conv_key -> {"names": [str, ...], "ts": float}
     pending_count_session: Dict[str, dict] = field(default_factory=dict)
     # Group notice digest dedup cache: notice_key -> ts
@@ -424,7 +439,87 @@ def _files_entry_latest_ts(items: object) -> float:
     return latest
 
 
+def _cancel_pending_handin_submit_reminder(state: BotState, user_id: int) -> None:
+    item = state.pending_handin_submit_reminders.pop(int(user_id), None)
+    task = item.get("task") if isinstance(item, dict) else None
+    if task is not None and hasattr(task, "done") and hasattr(task, "cancel"):
+        try:
+            if not task.done():
+                task.cancel()
+        except Exception:
+            pass
+
+
+def _schedule_pending_handin_submit_reminder(api, ctx, logsvc: LogService, state: BotState, choose_ts: float) -> None:
+    try:
+        uid = int(ctx.user_id)
+    except Exception:
+        return
+
+    _cancel_pending_handin_submit_reminder(state, uid)
+    if (
+        state.pending_handin_wait_done.get(uid)
+        or state.pending_handin_zip_name.get(uid)
+        or state.pending_handin_name_input.get(uid)
+        or state.pending_handin_overwrite.get(uid)
+    ):
+        return
+
+    try:
+        reminder_ts = float(choose_ts)
+    except Exception:
+        reminder_ts = 0.0
+    if reminder_ts <= 0.0:
+        return
+
+    slot: dict = {"ts": reminder_ts}
+
+    async def _runner() -> None:
+        try:
+            await asyncio.sleep(float(_HANDIN_SUBMIT_REMINDER_SECONDS))
+            pend = state.pending_handin_choose.get(uid)
+            if not isinstance(pend, dict) or pend.get("mode") != "submit":
+                return
+            try:
+                current_ts = float(pend.get("ts") or 0.0)
+            except Exception:
+                current_ts = 0.0
+            if abs(current_ts - reminder_ts) > 0.001:
+                return
+            if (
+                state.pending_handin_wait_done.get(uid)
+                or state.pending_handin_zip_name.get(uid)
+                or state.pending_handin_name_input.get(uid)
+                or state.pending_handin_overwrite.get(uid)
+            ):
+                return
+            if not (state.pending_handin_files.get(uid) or []):
+                return
+            await reply(api, ctx, _HANDIN_SUBMIT_REMINDER_TEXT, logsvc)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            try:
+                logsvc.log.warning(f"handin submit reminder failed: user={uid} err={e}")
+            except Exception:
+                pass
+        finally:
+            if state.pending_handin_submit_reminders.get(uid) is slot:
+                state.pending_handin_submit_reminders.pop(uid, None)
+
+    task = asyncio.create_task(_runner())
+    slot["task"] = task
+    state.pending_handin_submit_reminders[uid] = slot
+
+
+def _set_pending_handin_submit_choice(api, ctx, logsvc: LogService, state: BotState, task_ids: List[str]) -> None:
+    now_ts = time.time()
+    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": list(task_ids), "ts": now_ts}
+    _schedule_pending_handin_submit_reminder(api, ctx, logsvc, state, now_ts)
+
+
 def _clear_pending_handin_user(state: BotState, user_id: int) -> None:
+    _cancel_pending_handin_submit_reminder(state, user_id)
     state.pending_handin_files.pop(user_id, None)
     state.pending_handin_wait_done.pop(user_id, None)
     state.pending_handin_zip_name.pop(user_id, None)
@@ -434,6 +529,7 @@ def _clear_pending_handin_user(state: BotState, user_id: int) -> None:
 
 
 def _delete_pending_handin_files(state: BotState, user_id: int, logsvc: Optional[LogService] = None) -> None:
+    _cancel_pending_handin_submit_reminder(state, user_id)
     for it in (state.pending_handin_files.get(user_id) or []):
         try:
             Path(str(it.get("path") or "")).unlink(missing_ok=True)
@@ -955,6 +1051,7 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
     scene = str(getattr(ctx, "scene", "") or "")
     if not _is_ai_chat_text_message(evt, msg):
         return None
+    msg = _strip_text_companion_cq_segments(msg)
     if scene == "group":
         nick_aliases = [x for x in {str(bot_nick or "").strip(), "Cooper_bot", "Cooepr_bot"} if x]
         has_nick_mention = False
@@ -2369,7 +2466,7 @@ async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: B
                 return True
             state.pending_handin_wait_done[ctx.user_id] = {"ts": time.time()}
             state.pending_handin_zip_name.pop(ctx.user_id, None)
-            state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
+            _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
             await reply(
                 api,
                 ctx,
@@ -2418,12 +2515,12 @@ async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: B
             return True
         lines = [msg, f"已识别到姓名：{roster_name}。", _handin_tasks_list_text(tasks)]
         await reply(api, ctx, "\n".join(lines), logsvc)
-        state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
+        _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
         return True
     # 多文件：仍按原有任务选择流程（若继续发送会自动转 done 打包）
     lines = [msg, "检测到你发送了文件提交。", _handin_tasks_list_text(tasks)]
     await reply(api, ctx, "\n".join(lines), logsvc)
-    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
+    _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
     return True
 async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
     """处理提交文件同名覆盖确认（Y/N）。返回是否已处理（True=已回复）。"""
@@ -2496,7 +2593,7 @@ async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogServic
         tasks = handin.list_active_tasks()
         if tasks:
             state.pending_handin_name_input.pop(ctx.user_id, None)
-            state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
+            _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
             await reply(api, ctx, "你还有待分配的提交文件。\n" + _handin_tasks_list_text(tasks), logsvc)
     else:
         state.pending_handin_wait_done.pop(ctx.user_id, None)
@@ -2533,7 +2630,7 @@ async def _handle_private_name_input(api, ctx, text: str, logsvc: LogService, st
             return True
         state.pending_handin_wait_done[ctx.user_id] = {"ts": time.time()}
         state.pending_handin_zip_name.pop(ctx.user_id, None)
-        state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
+        _set_pending_handin_submit_choice(api, ctx, logsvc, state, [tt.task_id for tt in tasks])
         await reply(api, ctx, "检测到你在批量发送文件，请发完后回复 done，我会先让你命名 zip，再让你选择归档任务。", logsvc)
         return True
     skip_name = (t == "0")
@@ -2563,7 +2660,7 @@ async def _handle_private_name_input(api, ctx, text: str, logsvc: LogService, st
         else:
             await reply(api, ctx, "当前没有正在进行的提交任务。", logsvc)
         return True
-    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
+    _set_pending_handin_submit_choice(api, ctx, logsvc, state, [tt.task_id for tt in tasks])
     lines = []
     if rename_note:
         lines.append(rename_note)
@@ -2673,7 +2770,7 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
         if q:
             tasks = handin.list_active_tasks()
             state.pending_handin_name_input.pop(ctx.user_id, None)
-            state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
+            _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
             await reply(api, ctx, f"你还有 {len(q)} 份待分配文件。\n" + _handin_tasks_list_text(tasks), logsvc)
         else:
             state.pending_handin_wait_done.pop(ctx.user_id, None)
@@ -3076,7 +3173,8 @@ async def _handle_plain_text_input(
         handled = await _handle_find_folder_number_choice(api, ctx, t, logsvc, state)
         if handled:
             return True
-        fixed_answers = _lookup_fixed_answers(t)
+        answer_text = _strip_text_companion_cq_segments(t)
+        fixed_answers = _lookup_fixed_answers(answer_text)
         if fixed_answers:
             for msg in fixed_answers:
                 await reply(api, ctx, msg, logsvc)
@@ -3087,7 +3185,7 @@ async def _handle_plain_text_input(
             return True
         if getattr(ctx, "scene", "") != "group":
             return True
-        keyword_answers = _lookup_keyword_answers(t)
+        keyword_answers = _lookup_keyword_answers(answer_text)
         if keyword_answers:
             for msg in keyword_answers:
                 await reply(api, ctx, msg, logsvc)
@@ -3871,7 +3969,7 @@ async def _handle_private_done_batch(api, ctx, text: str, logsvc: LogService, st
             await reply(api, ctx, "当前仅有 1 个文件，无需打包。\n未在文件名中识别到班级名册姓名，请回复提交者姓名（或回复 0 跳过）。", logsvc)
             return True
         state.pending_handin_name_input.pop(ctx.user_id, None)
-        state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
+        _set_pending_handin_submit_choice(api, ctx, logsvc, state, [tt.task_id for tt in tasks])
         await reply(api, ctx, f"当前仅有 1 个文件，无需打包。\n已识别到姓名：{roster_name}。\n" + _handin_tasks_list_text(tasks), logsvc)
         return True
     # 多文件：先询问 zip 名称
@@ -3963,7 +4061,7 @@ async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService
         state.pending_handin_choose.pop(ctx.user_id, None)
         await reply(api, ctx, f"已将 {packed} 个文件打包为：{out_zip.name}\n当前没有正在进行的提交任务。", logsvc)
         return True
-    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
+    _set_pending_handin_submit_choice(api, ctx, logsvc, state, [tt.task_id for tt in tasks])
     lines = [f"已将 {packed} 个文件打包为：{out_zip.name}。"]
     if missing > 0:
         lines.append(f"另有 {missing} 个文件未找到，已跳过。")

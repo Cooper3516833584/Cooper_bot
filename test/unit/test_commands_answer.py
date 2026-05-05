@@ -131,6 +131,17 @@ def test_keyword_text_message_accepts_text_with_at_segment() -> None:
     assert commands._is_keyword_text_message(evt, "[CQ:at,qq=42] \u4f60\u597d")
 
 
+def test_keyword_text_message_accepts_text_with_emoji_segment() -> None:
+    evt = {
+        "message": [
+            {"type": "text", "data": {"text": "\u4f60"}},
+            {"type": "face", "data": {"id": "14"}},
+            {"type": "text", "data": {"text": "\u597d"}},
+        ]
+    }
+    assert commands._is_keyword_text_message(evt, "\u4f60[CQ:face,id=14]\u597d")
+
+
 @pytest.mark.asyncio
 async def test_plain_text_keyword_answers_only_trigger_in_group(monkeypatch) -> None:
     replies: list[str] = []
@@ -158,3 +169,40 @@ async def test_plain_text_keyword_answers_only_trigger_in_group(monkeypatch) -> 
     assert await commands._handle_plain_text_input(None, group_ctx, evt, "hello", None, commands.BotState())
     assert replies == ["hit"]
     assert lookup_calls == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_plain_text_keyword_answers_ignore_inline_emoji_cq(monkeypatch) -> None:
+    replies: list[str] = []
+    lookup_calls: list[str] = []
+
+    async def _fake_reply(_api, _ctx, text: str, _logsvc) -> None:
+        replies.append(str(text))
+
+    def _fake_lookup(text: str) -> list[str]:
+        lookup_calls.append(str(text))
+        return ["hit"] if text == NI_HAO else []
+
+    monkeypatch.setattr(commands, "reply", _fake_reply)
+    monkeypatch.setattr(commands, "_lookup_fixed_answers", lambda _text: [])
+    monkeypatch.setattr(commands, "_lookup_keyword_answers", _fake_lookup)
+
+    evt = {
+        "message": [
+            {"type": "text", "data": {"text": "\u4f60"}},
+            {"type": "face", "data": {"id": "14"}},
+            {"type": "text", "data": {"text": "\u597d"}},
+        ]
+    }
+    group_ctx = SimpleNamespace(scene="group", user_id=1, group_id=100)
+
+    assert await commands._handle_plain_text_input(
+        None,
+        group_ctx,
+        evt,
+        "\u4f60[CQ:face,id=14]\u597d",
+        None,
+        commands.BotState(),
+    )
+    assert replies == ["hit"]
+    assert lookup_calls == [NI_HAO]

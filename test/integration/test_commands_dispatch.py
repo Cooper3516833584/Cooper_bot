@@ -596,6 +596,42 @@ async def test_aichat_reply_does_not_duplicate_assistant_memory(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_handin_submit_choice_sends_delayed_reminder(monkeypatch) -> None:
+    monkeypatch.setattr(commands, "_HANDIN_SUBMIT_REMINDER_SECONDS", 0.01)
+    commands._RECENT_REPLY_KEYS.clear()
+
+    state = commands.BotState()
+    ctx = _make_ctx(scene="private_friend", group_id=None, user_id=10031)
+    logsvc = _DummyLogService()
+    api = SimpleNamespace(send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}))
+    state.pending_handin_files[ctx.user_id] = [{"path": "pending.pdf", "name": "pending.pdf", "ts": time.time()}]
+
+    commands._set_pending_handin_submit_choice(api, ctx, logsvc, state, ["task-1"])
+    await asyncio.sleep(0.05)
+
+    api.send_private_msg.assert_awaited_once_with(ctx.user_id, commands._HANDIN_SUBMIT_REMINDER_TEXT)
+    assert commands._HANDIN_SUBMIT_REMINDER_TEXT in logsvc.out_logs
+
+
+@pytest.mark.asyncio
+async def test_handin_submit_choice_reminder_skips_after_state_clears(monkeypatch) -> None:
+    monkeypatch.setattr(commands, "_HANDIN_SUBMIT_REMINDER_SECONDS", 0.01)
+    commands._RECENT_REPLY_KEYS.clear()
+
+    state = commands.BotState()
+    ctx = _make_ctx(scene="private_friend", group_id=None, user_id=10032)
+    logsvc = _DummyLogService()
+    api = SimpleNamespace(send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}))
+    state.pending_handin_files[ctx.user_id] = [{"path": "pending.pdf", "name": "pending.pdf", "ts": time.time()}]
+
+    commands._set_pending_handin_submit_choice(api, ctx, logsvc, state, ["task-1"])
+    state.pending_handin_choose.pop(ctx.user_id, None)
+    await asyncio.sleep(0.05)
+
+    api.send_private_msg.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_link_digest_reply_is_remembered_in_aichat_context(monkeypatch) -> None:
     async def _noop_pre_state(*_args, **_kwargs):
         return False
