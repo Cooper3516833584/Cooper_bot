@@ -1026,7 +1026,7 @@ def _augment_ai_input_with_sender(ctx, ai_input: str) -> str:
         if gid is not None:
             return f"发言人QQ:{uid}\n群号:{gid}\n{msg}"
     if scene.startswith("private"):
-        return f"发言人QQ:{uid}\n{msg}"
+        return msg
     return msg
 
 
@@ -3264,6 +3264,7 @@ async def _handle_explicit_command(
             "/count  开始临时收集名单（模式内仅收集名单；发送 end 结束并清空）",
             "/countlist  查看已提交名单和未交名单",
             "/countremove 序号  移除已提交名单中的人名",
+            "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）",
         ]
         if ctx.level >= 3:
             lines.extend([
@@ -3289,7 +3290,7 @@ async def _handle_explicit_command(
             "",
             "AI聊天：",
             "群聊：@Cooepr_bot + 内容",
-            "群聊（Gemini联网）：@Cooepr_bot g内容（g/G 后面可不加空格）",
+            "群聊（Gemini联网）：@Cooper_bot g内容（g/G 后面可不加空格）",
             "私聊：直接发送文本内容（仍兼容开头加 C）",
             "私聊（Gemini联网）：g内容（仍兼容 Cg 内容；g/G 后面可不加空格）",
         ])
@@ -3297,7 +3298,6 @@ async def _handle_explicit_command(
             lines.extend([
                 "",
                 "提交功能：",
-                "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）",
                 "/handin 任务名 [文件后缀] [提醒时间...] 截止时间（仅群聊，如 pdf/docx）",
                 "/handinstat  查看任务并查询未交",
                 "/handincheck  查看你创建任务的已交文件（可配合 /get）",

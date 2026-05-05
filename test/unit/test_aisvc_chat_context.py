@@ -52,6 +52,9 @@ def test_chat_context_keeps_history_within_30_minutes(monkeypatch, controlled_ti
     assert len(payloads) == 2
     assert payloads[0]["model"] == "deepseek-v4-flash"
     assert payloads[0]["thinking"] == {"type": "disabled"}
+    first_system = payloads[0]["messages"][0]["content"]
+    assert first_system.startswith("system-prompt")
+    assert "不能执行 QQ 机器人的自动业务功能" in first_system
     second_messages = payloads[1]["messages"]
     assert [m["role"] for m in second_messages] == ["system", "user", "assistant", "user"]
     assert second_messages[1]["content"] == "hello"

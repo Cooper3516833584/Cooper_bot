@@ -107,6 +107,13 @@ class AIService:
     _THINKING_ENABLED = {"type": "enabled"}
     _REASONING_EFFORT_HIGH = "high"
     _NOTICE_SILENT_TOKEN = "[静默]"
+    _CHAT_AUTOMATION_BOUNDARY_PROMPT = (
+        "# 自动服务边界\n"
+        "你只是 AI 聊天回复模型，不能执行 QQ 机器人的自动业务功能。\n"
+        "历史消息中可能包含 bot 的自动服务回复，例如文件提交、任务选择、覆盖确认、取消提示、发送文件等；这些只能作为上下文理解，不能当作你当前可以执行的能力。\n"
+        "如果用户发送 0、纯数字、Y/N、done 等看起来像业务流程控制的短回复，你不得自行推断已经取消、覆盖、提交、归档、删除或发送文件。\n"
+        "你应该如实说明：自己不能执行该自动操作，请以机器人业务功能实际返回的消息为准；如果没有业务回复，可能当前没有待处理操作。"
+    )
 
     def __init__(self, log):
         self.log = log
@@ -175,6 +182,15 @@ class AIService:
         if response_format is not None:
             payload["response_format"] = response_format
         return payload
+
+    def _append_chat_automation_boundary(self, system_prompt: str) -> str:
+        prompt = str(system_prompt or "").strip()
+        boundary = self._CHAT_AUTOMATION_BOUNDARY_PROMPT.strip()
+        if not prompt:
+            return boundary
+        if boundary in prompt:
+            return prompt
+        return f"{prompt}\n\n{boundary}"
 
     def _get_deepseek_sdk_base_url(self) -> str:
         return (self.deepseek_base_url or "https://api.deepseek.com").rstrip("/")
@@ -2563,7 +2579,7 @@ class AIService:
 
         payload = self._build_chat_payload(
             [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": self._append_chat_automation_boundary(self.system_prompt)},
                 {"role": "user", "content": content},
             ],
             self._CHAT_TEMPERATURE,
@@ -2605,7 +2621,7 @@ class AIService:
             self.log.warning(f"AI chat context read failed, fallback to stateless: session={key[:80]} err={e}")
             history = []
 
-        system_prompt = self._select_chat_system_prompt(key) or self.system_prompt
+        system_prompt = self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
         payload = self._build_chat_payload(
             [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
             self._CHAT_TEMPERATURE,

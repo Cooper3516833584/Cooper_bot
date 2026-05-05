@@ -267,7 +267,7 @@ async def test_command_aichat_dispatch(dispatch_harness) -> None:
     aisvc.chat_with_context.assert_awaited_once()
     assert aisvc.chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
     model_input = aisvc.chat_with_context.await_args.args[1]
-    assert f"发言人QQ:{ctx.user_id}" in model_input
+    assert "发言人QQ:" not in model_input
     assert "你好" in model_input
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
 
@@ -294,7 +294,7 @@ async def test_command_aichat_private_prefix_allows_newline_payload(dispatch_har
     aisvc.chat_with_context.assert_awaited_once()
     assert aisvc.chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
     model_input = aisvc.chat_with_context.await_args.args[1]
-    assert f"发言人QQ:{ctx.user_id}" in model_input
+    assert "发言人QQ:" not in model_input
     assert "hello" in model_input
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
 

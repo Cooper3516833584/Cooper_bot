@@ -144,7 +144,7 @@ async def test_command_aichat_gemini_dispatch(dispatch_harness) -> None:
     aisvc.gemini_chat_with_context.assert_awaited_once()
     assert aisvc.gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
     model_input = aisvc.gemini_chat_with_context.await_args.args[1]
-    assert f"发言人QQ:{ctx.user_id}" in model_input
+    assert "发言人QQ:" not in model_input
     assert "帮我联网总结一下" in model_input
     aisvc.chat_with_context.assert_not_awaited()
     assert any("gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
