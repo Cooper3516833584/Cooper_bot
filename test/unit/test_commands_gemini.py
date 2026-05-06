@@ -30,15 +30,26 @@ def test_private_ai_chat_accepts_plain_text() -> None:
     assert commands._extract_ai_chat_input(ctx, evt, "你好", "Cooper_bot") == "你好"
 
 
-def test_private_ai_chat_legacy_cg_prefix() -> None:
+def test_private_ai_chat_gemini_prefix() -> None:
+    ctx = SimpleNamespace(scene="private_friend")
+    evt = {"message": [{"type": "text", "data": {"text": "g查一下"}}], "raw_message": "g查一下"}
+
+    ai_input = commands._extract_ai_chat_input(ctx, evt, "g查一下", "Cooper_bot")
+    backend, text = commands._split_ai_chat_backend(ai_input or "")
+
+    assert backend == "gemini"
+    assert text == "查一下"
+
+
+def test_private_ai_chat_keeps_leading_cg_as_default_text() -> None:
     ctx = SimpleNamespace(scene="private_friend")
     evt = {"message": [{"type": "text", "data": {"text": "Cg查一下"}}], "raw_message": "Cg查一下"}
 
     ai_input = commands._extract_ai_chat_input(ctx, evt, "Cg查一下", "Cooper_bot")
     backend, text = commands._split_ai_chat_backend(ai_input or "")
 
-    assert backend == "gemini"
-    assert text == "查一下"
+    assert backend == "default"
+    assert text == "Cg查一下"
 
 
 def test_private_ai_chat_ignores_image_message() -> None:

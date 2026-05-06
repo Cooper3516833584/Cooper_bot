@@ -132,7 +132,7 @@ async def test_command_aichat_gemini_dispatch(dispatch_harness) -> None:
         api=SimpleNamespace(),
         ctx=ctx,
         evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="Cg帮我联网总结一下",
+        text="g帮我联网总结一下",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=commands.BotState(),
@@ -170,4 +170,4 @@ async def test_command_help_mentions_gemini_usage(dispatch_harness) -> None:
     )
 
     assert any("群聊（Gemini联网）：@Cooepr_bot g内容" in one["text"] for one in dispatch_harness.messages)
-    assert any("私聊（Gemini联网）：Cg内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("私聊（Gemini联网）：g内容" in one["text"] for one in dispatch_harness.messages)

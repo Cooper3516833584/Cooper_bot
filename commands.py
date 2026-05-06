@@ -1068,8 +1068,6 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
     if scene.startswith("private"):
         if not msg or msg.startswith(("/", "／")):
             return None
-        if msg[0] in ("c", "C"):
-            return msg[1:].strip()
         return msg
     return None
 
@@ -3407,8 +3405,8 @@ async def _handle_explicit_command(
             "AI聊天：",
             "群聊：@Cooepr_bot + 内容",
             "群聊（Gemini联网）：@Cooper_bot g内容（g/G 后面可不加空格）",
-            "私聊：直接发送文本内容（仍兼容开头加 C）",
-            "私聊（Gemini联网）：g内容（仍兼容 Cg 内容；g/G 后面可不加空格）",
+            "私聊：直接发送文本内容",
+            "私聊（Gemini联网）：g内容（g/G 后面可不加空格）",
         ])
         if ctx.level >= 2:
             lines.extend([

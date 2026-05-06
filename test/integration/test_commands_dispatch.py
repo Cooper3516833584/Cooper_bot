@@ -255,7 +255,7 @@ async def test_command_aichat_dispatch(dispatch_harness) -> None:
         api=SimpleNamespace(),
         ctx=ctx,
         evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="C你好",
+        text="你好",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=commands.BotState(),
@@ -273,7 +273,7 @@ async def test_command_aichat_dispatch(dispatch_harness) -> None:
 
 
 @pytest.mark.asyncio
-async def test_command_aichat_private_prefix_allows_newline_payload(dispatch_harness) -> None:
+async def test_command_aichat_private_keeps_leading_c(dispatch_harness) -> None:
     ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
     filesvc = _make_filesvc_stub()
     aisvc = _FakeAIService()
@@ -295,7 +295,7 @@ async def test_command_aichat_private_prefix_allows_newline_payload(dispatch_har
     assert aisvc.chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
     model_input = aisvc.chat_with_context.await_args.args[1]
     assert "发言人QQ:" not in model_input
-    assert "hello" in model_input
+    assert model_input == "C\nhello"
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
 
 
@@ -330,7 +330,7 @@ async def test_dispatch_slash_command_still_reaches_explicit_command(dispatch_ha
 
 
 @pytest.mark.asyncio
-async def test_dispatch_private_c_still_reaches_ai_trigger(dispatch_harness, monkeypatch) -> None:
+async def test_dispatch_private_plain_text_reaches_ai_trigger(dispatch_harness, monkeypatch) -> None:
     filesvc = _make_filesvc_stub()
     ctx = _make_ctx(scene="private_friend", group_id=None, level=3, user_id=900001)
     ai_trigger_mock = AsyncMock(return_value=True)
@@ -345,7 +345,7 @@ async def test_dispatch_private_c_still_reaches_ai_trigger(dispatch_harness, mon
         api=SimpleNamespace(),
         ctx=ctx,
         evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="C你好",
+        text="你好",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=commands.BotState(),
@@ -587,7 +587,7 @@ async def test_aichat_reply_does_not_duplicate_assistant_memory(monkeypatch) -> 
         api=SimpleNamespace(send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0})),
         ctx=ctx,
         evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="C你好",
+        text="你好",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=commands.BotState(),

@@ -44,10 +44,10 @@ def test_parse_semantic_find_query_rejects_invalid_tail() -> None:
     assert commands._parse_semantic_find_query("考试安排") is None
 
 
-def test_extract_ai_chat_input_private_prefix() -> None:
+def test_extract_ai_chat_input_private_keeps_leading_c() -> None:
     ctx = SimpleNamespace(scene="private_friend")
     out = commands._extract_ai_chat_input(ctx, evt={}, text="C你好", bot_nick="Cooepr_bot")
-    assert out == "你好"
+    assert out == "C你好"
 
 
 def test_extract_ai_chat_input_group_requires_mention() -> None:
