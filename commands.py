@@ -72,7 +72,7 @@ _STATE_SWEEP_MIN_INTERVAL_SECONDS = 30.0
 _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_PENDING_COUNT_SECONDS = 6.0 * 60.0 * 60.0
-_STATE_TTL_GROUP_NOTICE_SECONDS = 10.0 * 60.0
+_STATE_TTL_GROUP_NOTICE_SECONDS = 5.0 * 60.0
 _HANDIN_SUBMIT_REMINDER_SECONDS = 10.0 * 60.0
 _HANDIN_SUBMIT_REMINDER_TEXT = "发完文件需要选择提交任务哇，文件还没提交上去呐（哭唧唧）"
 _TEXT_COMPANION_EMOJI_SEG_TYPES = {"face", "mface", "market_face"}
@@ -1107,24 +1107,42 @@ def _ai_chat_session_key(ctx) -> Optional[str]:
     return None
 
 
+def _compact_ai_sender_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _format_group_ai_user_message(ctx, message_text: str) -> str:
+    msg = str(message_text or "").strip()
+    if not msg:
+        return msg
+    scene = str(getattr(ctx, "scene", "") or "").strip().lower()
+    if scene != "group":
+        return msg
+    try:
+        uid = int(getattr(ctx, "user_id"))
+    except Exception:
+        return msg
+
+    nickname = _compact_ai_sender_text(getattr(ctx, "nickname", ""))
+    card = _compact_ai_sender_text(getattr(ctx, "card", ""))
+    lines = [
+        f"发言人QQ:{uid}",
+        f"发言人昵称:{nickname or uid}",
+    ]
+    if card and card != nickname:
+        lines.append(f"发言人群名片:{card}")
+    gid = getattr(ctx, "group_id", None)
+    if gid is not None:
+        lines.append(f"群号:{gid}")
+    lines.append(msg)
+    return "\n".join(lines)
+
+
 def _augment_ai_input_with_sender(ctx, ai_input: str) -> str:
     msg = str(ai_input or "").strip()
     if not msg:
         return msg
-    scene = str(getattr(ctx, "scene", "") or "").strip().lower()
-    try:
-        uid = int(getattr(ctx, "user_id"))
-    except Exception:
-        uid = None
-    if uid is None:
-        return msg
-    if scene == "group":
-        gid = getattr(ctx, "group_id", None)
-        if gid is not None:
-            return f"发言人QQ:{uid}\n群号:{gid}\n{msg}"
-    if scene.startswith("private"):
-        return msg
-    return msg
+    return _format_group_ai_user_message(ctx, msg)
 
 
 def _remember_non_ai_chat_message(ctx, text: str, logsvc: LogService, aisvc: Optional["AIService"] = None) -> None:
@@ -1137,7 +1155,7 @@ def _remember_non_ai_chat_message(ctx, text: str, logsvc: LogService, aisvc: Opt
     if not session_key:
         return
     try:
-        remember_fn(session_key, text)
+        remember_fn(session_key, _format_group_ai_user_message(ctx, text))
     except Exception as e:
         logsvc.log.warning(f"AI chat context non-aichat write failed: session={session_key[:80]} err={e}")
 
@@ -1200,7 +1218,7 @@ def _remember_notice_digest_context(
     try:
         remember_user_fn = getattr(aisvc, "remember_user_message", None)
         if callable(remember_user_fn):
-            remember_user_fn(session_key, str(source or ""))
+            remember_user_fn(session_key, _format_group_ai_user_message(ctx, str(source or "")))
     except Exception as e:
         logsvc.log.warning(f"AI chat context notice-source write failed: session={session_key[:80]} err={e}")
 

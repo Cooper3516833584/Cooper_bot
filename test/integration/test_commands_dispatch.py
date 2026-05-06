@@ -465,6 +465,7 @@ async def test_group_aichat_strips_cq_at_and_uses_sender_qq(dispatch_harness) ->
     assert aisvc.chat_with_context.await_args.args[0] == f"group:{group_ctx.group_id}"
     model_input = aisvc.chat_with_context.await_args.args[1]
     assert "发言人QQ:10002" in model_input
+    assert "发言人昵称:tester" in model_input
     assert "你能看到我吗" in model_input
     assert "qq=42" not in model_input
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
@@ -530,7 +531,10 @@ async def test_non_aichat_message_is_remembered_for_context(dispatch_harness) ->
         aisvc=aisvc,
     )
 
-    aisvc.remember_user_message.assert_called_once_with(f"group:{ctx.group_id}", "/find calculus")
+    aisvc.remember_user_message.assert_called_once_with(
+        f"group:{ctx.group_id}",
+        "发言人QQ:10002\n发言人昵称:tester\n群号:20001\n/find calculus",
+    )
 
 
 @pytest.mark.asyncio
@@ -667,6 +671,14 @@ async def test_link_digest_reply_is_remembered_in_aichat_context(monkeypatch) ->
 
     await asyncio.sleep(0.05)
 
+    assert any(
+        call.args
+        == (
+            f"group:{ctx.group_id}",
+            "发言人QQ:10002\n发言人昵称:tester\n群号:20001\n群链接：https://example.com/notice",
+        )
+        for call in aisvc.remember_user_message.call_args_list
+    )
     aisvc.remember_assistant_message.assert_called_once_with(f"group:{ctx.group_id}", "digest-reply")
 
 
