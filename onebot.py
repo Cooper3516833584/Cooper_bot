@@ -240,13 +240,6 @@ class OneBotAPI:
             timeout=6.0,
         )
 
-    async def get_group_member_list(self, group_id: int):
-        return await self.call(
-            "get_group_member_list",
-            {"group_id": int(group_id)},
-            timeout=12.0,
-        )
-
     async def get_stranger_info(self, user_id: int, no_cache: bool = True):
         return await self.call(
             "get_stranger_info",

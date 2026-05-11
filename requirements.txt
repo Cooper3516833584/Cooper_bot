@@ -9,4 +9,3 @@ aiohttp>=3.10.5
 beautifulsoup4>=4.12.3
 openai>=1.51.0
 rapidocr_onnxruntime>=1.4.3
-opencv-python-headless>=4.10.0

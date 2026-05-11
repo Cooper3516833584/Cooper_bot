@@ -11,7 +11,6 @@ napcat_config/
 napcat_qq/
 upload_group_file/
 upload_private_file/
-output_hw_*/
 
 # OS / IDE
 .vscode/
@@ -23,15 +22,3 @@ Thumbs.db
 *.pyc
 *.pyo
 *.pyd
-
-# pytest/temp artifacts
-.pytest_tmp/
-.pytest_cache/
-pytest-cache-files-*/
-ocr_debug_tmp/
-ocr_test_results*.json
-
-# local runtime cache
-ai_semantic_store.sqlite3
-ai_material_state_cache.json
-ai_material_scan_marks.json

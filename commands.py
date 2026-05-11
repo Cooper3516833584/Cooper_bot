@@ -5,30 +5,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
-import html
-import importlib
 import re
 import time
 import shutil
 import uuid
 import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 from filesvc import FileService
 from logsvc import LogService
-from handinsvc import (
-    HANDIN_ALLOWED_REQUIRED_SUFFIXES,
-    HandinService,
-    extract_name_from_filename,
-    extract_student_id,
-    file_matches_required_suffix,
-    normalize_required_suffix,
-    parse_mmdd_hhmm,
-    pretty_ts,
-    required_suffix_display,
-)
-from command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query, run_list_dir_query
+from handinsvc import HandinService, parse_mmdd_hhmm, pretty_ts, extract_name_from_filename, extract_student_id
 from router import get_files
 from ziputil import open_fast_zip, write_path as zip_write_path
 from config import (
@@ -47,9 +31,6 @@ from config import (
     FIND_DIR_LIMIT,
     FIND_FILE_LIMIT,
     AI_BOT_NICK,
-    NAPCAT_TEMP_CONTAINER_DIR,
-    NAPCAT_TEMP_HOST_DIR,
-    ENABLE_OCR,
 )
 if TYPE_CHECKING:
     from aisvc import AIService
@@ -66,46 +47,18 @@ _GROUP_NOTICE_MAX_CANDIDATES = 3
 _GROUP_NOTICE_DEDUP_SECONDS = 60.0
 _RECENT_REPLY_DEDUP_SECONDS = 2.0
 _RECENT_REPLY_KEYS: Dict[str, float] = {}
-_AI_REPEAT_GUARD_SECONDS = 5.0 * 60.0
-_AI_REPEAT_GUARD: Dict[str, dict] = {}
 _STATE_SWEEP_MIN_INTERVAL_SECONDS = 30.0
 _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
-_STATE_TTL_PENDING_COUNT_SECONDS = 6.0 * 60.0 * 60.0
-_STATE_TTL_GROUP_NOTICE_SECONDS = 5.0 * 60.0
-_HANDIN_SUBMIT_REMINDER_SECONDS = 10.0 * 60.0
-_HANDIN_SUBMIT_REMINDER_TEXT = "发完文件需要选择提交任务哇，文件还没提交上去呐（哭唧唧）"
-_TEXT_COMPANION_EMOJI_SEG_TYPES = {"face", "mface", "market_face"}
-_MEDIA_OR_EMOJI_SEG_TYPES = {"image"} | _TEXT_COMPANION_EMOJI_SEG_TYPES
-_KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES = {"at", "reply"} | _TEXT_COMPANION_EMOJI_SEG_TYPES
+_STATE_TTL_GROUP_NOTICE_SECONDS = 10.0 * 60.0
+_MEDIA_OR_EMOJI_SEG_TYPES = {"image", "face", "mface", "market_face"}
 _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
     r"^\[\s*(?:\u56fe\u7247|\u8868\u60c5|\u52a8\u753b\u8868\u60c5)\s*\]$",
     flags=re.IGNORECASE,
 )
 _CQ_SEG_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,[^\]]*)?\]")
-_CQ_IMAGE_RE = re.compile(r"\[CQ:image,([^\]]+)\]", flags=re.IGNORECASE)
-_COUNT_NAME_SPLIT_RE = re.compile(r"[\s,，、;；/|]+")
-_COUNT_NAME_PREFIX_RE = re.compile(r"^[\d\.\)\(、\-_:：]+")
-_COUNT_END_RE = re.compile(r"^/?end[\s。.!！?？]*$", flags=re.IGNORECASE)
-_COUNT_END_CN_RE = re.compile(r"^结束[\s。.!！?？]*$")
 _FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
 _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
-
-
-def _strip_text_companion_cq_segments(text: str) -> str:
-    def _replace(match: re.Match) -> str:
-        tp = str(match.group(1) or "").lower()
-        if tp in _TEXT_COMPANION_EMOJI_SEG_TYPES:
-            return ""
-        return match.group(0)
-
-    return _CQ_SEG_RE.sub(_replace, str(text or "")).strip()
-
-
-_BLACKBOARD_OCR_TEMP_DIR = (DATA_DIR / "temp" / "blackboard_ocr").resolve()
-_BLACKBOARD_OCR_IMPORT_ERROR: Optional[str] = None
-_BLACKBOARD_OCR_IMPORTED = False
-_BLACKBOARD_OCR_MODULE = None
 
 
 def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECONDS) -> bool:
@@ -120,38 +73,6 @@ def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECON
         return False
     _RECENT_REPLY_KEYS[key] = now
     return True
-
-
-def _normalize_ai_guard_text(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s or "").strip())
-
-
-def _is_likely_ai_stuck_repeat(session_key: Optional[str], user_input: str, assistant_output: str) -> bool:
-    key = str(session_key or "").strip() or "__stateless__"
-    now = time.time()
-    stale_before = now - float(_AI_REPEAT_GUARD_SECONDS)
-    for k, item in list(_AI_REPEAT_GUARD.items()):
-        if not isinstance(item, dict):
-            _AI_REPEAT_GUARD.pop(k, None)
-            continue
-        try:
-            ts = float(item.get("ts") or 0.0)
-        except Exception:
-            ts = 0.0
-        if ts < stale_before:
-            _AI_REPEAT_GUARD.pop(k, None)
-
-    user_norm = _normalize_ai_guard_text(user_input)
-    out_norm = _normalize_ai_guard_text(assistant_output)
-    repeated = False
-    prev = _AI_REPEAT_GUARD.get(key)
-    if isinstance(prev, dict):
-        prev_out = _normalize_ai_guard_text(str(prev.get("out") or ""))
-        if prev_out and out_norm and (prev_out == out_norm):
-            repeated = True
-
-    _AI_REPEAT_GUARD[key] = {"user": user_norm, "out": out_norm, "ts": now}
-    return repeated
 def _normalize_answer_q(s: str) -> str:
     # 触发词匹配：忽略首尾空白、大小写，内部连续空白视为一个空格
     return re.sub(r"\s+", " ", (s or "").strip()).casefold()
@@ -324,47 +245,6 @@ def _is_media_or_emoji_only_message(evt: dict, text: str) -> bool:
     return False
 
 
-def _is_keyword_text_message(evt: dict, text: str) -> bool:
-    def _is_text_with_allowed_cq(raw: str) -> bool:
-        s = str(raw or "").strip()
-        if not s:
-            return False
-        if "[CQ:" not in s:
-            return True
-        types = [x.lower() for x in _CQ_SEG_RE.findall(s)]
-        if not types:
-            return True
-        tail = _CQ_SEG_RE.sub("", s).strip()
-        if not tail:
-            return False
-        return all(tp in _KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES for tp in types)
-
-    msg = evt.get("message")
-    if isinstance(msg, list):
-        has_text = False
-        for seg in msg:
-            if not isinstance(seg, dict):
-                continue
-            tp = str(seg.get("type") or "").strip().lower()
-            if tp == "text":
-                data = seg.get("data") or {}
-                if str(data.get("text") or "").strip():
-                    has_text = True
-                continue
-            if tp in _KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES:
-                continue
-            return False
-        return has_text
-
-    if isinstance(msg, str) and _is_text_with_allowed_cq(msg):
-        return True
-    return _is_text_with_allowed_cq(text)
-
-
-def _is_ai_chat_text_message(evt: dict, text: str) -> bool:
-    return _is_keyword_text_message(evt, text)
-
-
 def _fmt_mb(n_bytes: int) -> str:
     try:
         return f"{(float(n_bytes) / (1024 * 1024)):.2f}MB"
@@ -403,10 +283,6 @@ class BotState:
     pending_handin_choose: Dict[int, dict] = field(default_factory=dict)
     # Handin: user_id -> {"task_id": str, "path": str, "name": str, "ts": float}
     pending_handin_overwrite: Dict[int, dict] = field(default_factory=dict)
-    # Handin submit reminder: user_id -> {"task": asyncio.Task, "ts": float}
-    pending_handin_submit_reminders: Dict[int, dict] = field(default_factory=dict)
-    # Count: conv_key -> {"names": [str, ...], "ts": float}
-    pending_count_session: Dict[str, dict] = field(default_factory=dict)
     # Group notice digest dedup cache: notice_key -> ts
     recent_group_notice_keys: Dict[str, float] = field(default_factory=dict)
     # Opportunistic cleanup guard.
@@ -439,104 +315,8 @@ def _files_entry_latest_ts(items: object) -> float:
     return latest
 
 
-def _cancel_pending_handin_submit_reminder(state: BotState, user_id: int) -> None:
-    item = state.pending_handin_submit_reminders.pop(int(user_id), None)
-    task = item.get("task") if isinstance(item, dict) else None
-    if task is not None and hasattr(task, "done") and hasattr(task, "cancel"):
-        try:
-            if not task.done():
-                task.cancel()
-        except Exception:
-            pass
-
-
-def _schedule_pending_handin_submit_reminder(api, ctx, logsvc: LogService, state: BotState, choose_ts: float) -> None:
-    try:
-        uid = int(ctx.user_id)
-    except Exception:
-        return
-
-    _cancel_pending_handin_submit_reminder(state, uid)
-    if (
-        state.pending_handin_wait_done.get(uid)
-        or state.pending_handin_zip_name.get(uid)
-        or state.pending_handin_name_input.get(uid)
-        or state.pending_handin_overwrite.get(uid)
-    ):
-        return
-
-    try:
-        reminder_ts = float(choose_ts)
-    except Exception:
-        reminder_ts = 0.0
-    if reminder_ts <= 0.0:
-        return
-
-    slot: dict = {"ts": reminder_ts}
-
-    async def _runner() -> None:
-        try:
-            await asyncio.sleep(float(_HANDIN_SUBMIT_REMINDER_SECONDS))
-            pend = state.pending_handin_choose.get(uid)
-            if not isinstance(pend, dict) or pend.get("mode") != "submit":
-                return
-            try:
-                current_ts = float(pend.get("ts") or 0.0)
-            except Exception:
-                current_ts = 0.0
-            if abs(current_ts - reminder_ts) > 0.001:
-                return
-            if (
-                state.pending_handin_wait_done.get(uid)
-                or state.pending_handin_zip_name.get(uid)
-                or state.pending_handin_name_input.get(uid)
-                or state.pending_handin_overwrite.get(uid)
-            ):
-                return
-            if not (state.pending_handin_files.get(uid) or []):
-                return
-            await reply(api, ctx, _HANDIN_SUBMIT_REMINDER_TEXT, logsvc)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            try:
-                logsvc.log.warning(f"handin submit reminder failed: user={uid} err={e}")
-            except Exception:
-                pass
-        finally:
-            if state.pending_handin_submit_reminders.get(uid) is slot:
-                state.pending_handin_submit_reminders.pop(uid, None)
-
-    task = asyncio.create_task(_runner())
-    slot["task"] = task
-    state.pending_handin_submit_reminders[uid] = slot
-
-
-def _set_pending_handin_submit_choice(api, ctx, logsvc: LogService, state: BotState, task_ids: List[str]) -> None:
-    now_ts = time.time()
-    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": list(task_ids), "ts": now_ts}
-    _schedule_pending_handin_submit_reminder(api, ctx, logsvc, state, now_ts)
-
-
 def _clear_pending_handin_user(state: BotState, user_id: int) -> None:
-    _cancel_pending_handin_submit_reminder(state, user_id)
     state.pending_handin_files.pop(user_id, None)
-    state.pending_handin_wait_done.pop(user_id, None)
-    state.pending_handin_zip_name.pop(user_id, None)
-    state.pending_handin_name_input.pop(user_id, None)
-    state.pending_handin_choose.pop(user_id, None)
-    state.pending_handin_overwrite.pop(user_id, None)
-
-
-def _delete_pending_handin_files(state: BotState, user_id: int, logsvc: Optional[LogService] = None) -> None:
-    _cancel_pending_handin_submit_reminder(state, user_id)
-    for it in (state.pending_handin_files.get(user_id) or []):
-        try:
-            Path(str(it.get("path") or "")).unlink(missing_ok=True)
-        except Exception as e:
-            if logsvc is not None:
-                logsvc.log.warning(f"cleanup pending handin file failed: user={user_id} item={it} err={e}")
-    state.pending_handin_files[user_id] = []
     state.pending_handin_wait_done.pop(user_id, None)
     state.pending_handin_zip_name.pop(user_id, None)
     state.pending_handin_name_input.pop(user_id, None)
@@ -596,14 +376,6 @@ def _sweep_bot_state_ttl(state: BotState, *, now: Optional[float] = None, force:
         if latest < stale_pending_before:
             _clear_pending_handin_user(state, uid)
 
-    stale_count_before = now_ts - _STATE_TTL_PENDING_COUNT_SECONDS
-    for ck, item in list(state.pending_count_session.items()):
-        ts = _entry_ts(item)
-        if ts <= 0.0:
-            ts = now_ts
-        if ts < stale_count_before:
-            state.pending_count_session.pop(ck, None)
-
     stale_notice_before = now_ts - _STATE_TTL_GROUP_NOTICE_SECONDS
     for k, ts in list(state.recent_group_notice_keys.items()):
         try:
@@ -636,47 +408,6 @@ def _claim_group_notice_key(state: BotState, key: str, ttl_seconds: float = _GRO
     return True
 
 
-def _onebot_resp_ok(resp) -> bool:
-    if not isinstance(resp, dict):
-        return False
-    try:
-        return resp.get("status") == "ok" and int(resp.get("retcode", 0) or 0) == 0
-    except Exception:
-        return False
-
-
-def _onebot_resp_detail(resp) -> str:
-    if not isinstance(resp, dict):
-        return "no response"
-    rc = resp.get("retcode", "")
-    msg = (resp.get("wording") or resp.get("message") or "").strip()
-    if msg:
-        return f"retcode={rc} {msg}"
-    return f"retcode={rc}" if rc != "" else "send failed"
-
-
-def _extract_group_member_user_ids(resp) -> List[int]:
-    if not isinstance(resp, dict):
-        return []
-    data = resp.get("data")
-    if not isinstance(data, list):
-        return []
-    out: List[int] = []
-    seen = set()
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        try:
-            uid = int(item.get("user_id") or 0)
-        except Exception:
-            continue
-        if uid <= 0 or uid in seen:
-            continue
-        seen.add(uid)
-        out.append(uid)
-    return out
-
-
 async def reply(
     api,
     ctx,
@@ -693,37 +424,45 @@ async def reply(
             return await api.send_group_msg(send_group_id, text)
         return await api.send_private_msg(send_user_id, text)
 
-    skip_context_once = False
-    try:
-        skip_context_once = bool(getattr(ctx, "_skip_reply_context_once", False))
-        if skip_context_once:
-            setattr(ctx, "_skip_reply_context_once", False)
-    except Exception:
-        skip_context_once = False
+    def _ok(resp) -> bool:
+        if not isinstance(resp, dict):
+            return False
+        try:
+            return resp.get("status") == "ok" and int(resp.get("retcode", 0) or 0) == 0
+        except Exception:
+            return False
+
+    def _detail(resp) -> str:
+        if not isinstance(resp, dict):
+            return "no response"
+        rc = resp.get("retcode", "")
+        msg = (resp.get("wording") or resp.get("message") or "").strip()
+        if msg:
+            return f"retcode={rc} {msg}"
+        return f"retcode={rc}" if rc != "" else "send failed"
 
     target = f"g:{send_group_id}" if send_scene == "group" and send_group_id is not None else f"u:{send_user_id}"
     reply_key = f"{send_scene}:{target}:{text.strip()}"
     if not _claim_recent_reply(reply_key):
         logsvc.log.info(f"消息发送去重：已拦截重复回复 target={target}")
         return
+
     resp = await _send_once()
     if resp is None:
         logsvc.log.info(
             f"消息发送未确认：scene={send_scene}, group={send_group_id}, user={send_user_id}，为避免重复发送不再重试"
         )
         return
-    if not _onebot_resp_ok(resp):
+    if not _ok(resp):
         # transient network / bridge timeout retry once
         await asyncio.sleep(0.35)
         resp = await _send_once()
 
-    if _onebot_resp_ok(resp):
+    if _ok(resp):
         logsvc.log_out(ctx, text)
-        if not skip_context_once:
-            _remember_bot_reply_message(ctx, text, logsvc, send_scene, send_group_id, send_user_id)
     else:
         logsvc.log.warning(
-            f"reply send failed: scene={send_scene}, group={send_group_id}, user={send_user_id}, detail={_onebot_resp_detail(resp)}"
+            f"reply send failed: scene={send_scene}, group={send_group_id}, user={send_user_id}, detail={_detail(resp)}"
         )
 
 
@@ -732,94 +471,6 @@ def _split_args(text: str):
     cmd = parts[0]
     rest = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
     return cmd, rest
-
-
-def _parse_count_names(text: str) -> List[str]:
-    raw = unicodedata.normalize("NFKC", str(text or "")).strip()
-    if not raw:
-        return []
-    # 兼容常见输入：
-    # - 行首编号：1、张三 / 2.李四 / 3)王五
-    # - 行内连续编号：1. 张三 2. 李四
-    # - CQ @ 段
-    raw = re.sub(r"\d+\s*[、,，.\)）:：\-]\s*", "\n", raw)
-    raw = re.sub(r"(?i)\[CQ:at,[^\]]+\]", " ", raw)
-
-    out: List[str] = []
-    for one in _COUNT_NAME_SPLIT_RE.split(raw):
-        token = _COUNT_NAME_PREFIX_RE.sub("", one.strip())
-        token = token.strip().strip("，、,;；。.!！?？")
-        if token:
-            out.append(token)
-    return out
-
-
-def _is_count_end_input(text: str) -> bool:
-    s = unicodedata.normalize("NFKC", str(text or "")).strip()
-    if not s:
-        return False
-    if _COUNT_END_RE.fullmatch(s):
-        return True
-    return bool(_COUNT_END_CN_RE.fullmatch(s))
-
-
-def _dedup_names_keep_order(names: List[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for one in names:
-        name = str(one or "").strip()
-        if (not name) or (name in seen):
-            continue
-        seen.add(name)
-        out.append(name)
-    return out
-
-
-def _build_count_list_text(submitted_names: List[str], roster: List[Tuple[str, str]]) -> str:
-    submitted = _dedup_names_keep_order(submitted_names or [])
-
-    lines: List[str] = []
-    lines.append(f"已提交名单（{len(submitted)}）：")
-    if submitted:
-        for i, name in enumerate(submitted, 1):
-            lines.append(f"{i}. {name}")
-        lines.append("可用 /countremove 序号 移除已提交名单中的人名。")
-    else:
-        lines.append("（暂无）")
-
-    roster_names: List[str] = []
-    seen_roster = set()
-    for _, nm in roster or []:
-        name = str(nm or "").strip()
-        if (not name) or (name in seen_roster):
-            continue
-        seen_roster.add(name)
-        roster_names.append(name)
-
-    if not roster_names:
-        lines.append("")
-        lines.append("⚠️ 班级名册不可用，暂时无法计算未交名单。")
-        return "\n".join(lines)
-
-    submitted_set = set(submitted)
-    missing = [name for name in roster_names if name not in submitted_set]
-    outside_roster = [name for name in submitted if name not in seen_roster]
-
-    lines.append("")
-    lines.append(f"未交名单（{len(missing)}）：")
-    if missing:
-        for i, name in enumerate(missing, 1):
-            lines.append(f"{i}. {name}")
-    else:
-        lines.append("✅ 无，已全部提交。")
-
-    if outside_roster:
-        lines.append("")
-        lines.append("不在班级名册中的已提交姓名：")
-        for i, name in enumerate(outside_roster, 1):
-            lines.append(f"{i}. {name}")
-        lines.append("（可按其在“已提交名单”中的序号使用 /countremove）")
-    return "\n".join(lines)
 
 
 def _parse_find_args(rest: str, filesvc: FileService) -> Tuple[str, Optional[str]]:
@@ -1049,9 +700,6 @@ def _evt_mentions_me(evt: dict) -> bool:
 def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional[str]:
     msg = str(text or "").strip()
     scene = str(getattr(ctx, "scene", "") or "")
-    if not _is_ai_chat_text_message(evt, msg):
-        return None
-    msg = _strip_text_companion_cq_segments(msg)
     if scene == "group":
         nick_aliases = [x for x in {str(bot_nick or "").strip(), "Cooper_bot", "Cooepr_bot"} if x]
         has_nick_mention = False
@@ -1060,28 +708,15 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
             if re.search(pat, msg, flags=re.IGNORECASE):
                 has_nick_mention = True
                 msg = re.sub(pat, "", msg, flags=re.IGNORECASE).strip()
-        # get_text 优先使用 raw_message，群聊@常带 [CQ:at,qq=...]，这里移除避免把 bot QQ 误当作用户 QQ。
-        msg = re.sub(r"(?i)\[CQ:at,[^\]]+\]", "", msg).strip()
         if not (_evt_mentions_me(evt) or has_nick_mention):
             return None
         return msg
     if scene.startswith("private"):
-        if not msg or msg.startswith(("/", "／")):
+        m = re.match(r"^[cC](.*)$", msg)
+        if not m:
             return None
-        return msg
+        return (m.group(1) or "").strip()
     return None
-
-
-def _split_ai_chat_backend(ai_input: str) -> Tuple[str, str]:
-    text = str(ai_input or "").strip()
-    if not text:
-        return "default", ""
-    low = text.lower()
-    if low.startswith("gemini"):
-        return "gemini", text[6:].strip()
-    if text[:1] in {"g", "G"}:
-        return "gemini", text[1:].strip()
-    return "default", text
 
 
 def _ai_chat_session_key(ctx) -> Optional[str]:
@@ -1103,132 +738,6 @@ def _ai_chat_session_key(ctx) -> Optional[str]:
         except Exception:
             return None
     return None
-
-
-def _compact_ai_sender_text(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip())
-
-
-def _format_group_ai_user_message(ctx, message_text: str) -> str:
-    msg = str(message_text or "").strip()
-    if not msg:
-        return msg
-    scene = str(getattr(ctx, "scene", "") or "").strip().lower()
-    if scene != "group":
-        return msg
-    try:
-        uid = int(getattr(ctx, "user_id"))
-    except Exception:
-        return msg
-
-    nickname = _compact_ai_sender_text(getattr(ctx, "nickname", ""))
-    card = _compact_ai_sender_text(getattr(ctx, "card", ""))
-    lines = [
-        f"发言人QQ:{uid}",
-        f"发言人昵称:{nickname or uid}",
-    ]
-    if card and card != nickname:
-        lines.append(f"发言人群名片:{card}")
-    gid = getattr(ctx, "group_id", None)
-    if gid is not None:
-        lines.append(f"群号:{gid}")
-    lines.append(msg)
-    return "\n".join(lines)
-
-
-def _augment_ai_input_with_sender(ctx, ai_input: str) -> str:
-    msg = str(ai_input or "").strip()
-    if not msg:
-        return msg
-    return _format_group_ai_user_message(ctx, msg)
-
-
-def _remember_non_ai_chat_message(ctx, text: str, logsvc: LogService, aisvc: Optional["AIService"] = None) -> None:
-    if aisvc is None:
-        return
-    remember_fn = getattr(aisvc, "remember_user_message", None)
-    if not callable(remember_fn):
-        return
-    session_key = _ai_chat_session_key(ctx)
-    if not session_key:
-        return
-    try:
-        remember_fn(session_key, _format_group_ai_user_message(ctx, text))
-    except Exception as e:
-        logsvc.log.warning(f"AI chat context non-aichat write failed: session={session_key[:80]} err={e}")
-
-
-def _ai_chat_session_key_for_target(scene: str, group_id: Optional[int], user_id: Optional[int]) -> Optional[str]:
-    s = str(scene or "").strip().lower()
-    if s == "group":
-        if group_id is None:
-            return None
-        try:
-            return f"group:{int(group_id)}"
-        except Exception:
-            return None
-    if s.startswith("private"):
-        if user_id is None:
-            return None
-        try:
-            return f"private:{int(user_id)}"
-        except Exception:
-            return None
-    return None
-
-
-def _remember_bot_reply_message(
-    ctx,
-    text: str,
-    logsvc: LogService,
-    send_scene: str,
-    send_group_id: Optional[int],
-    send_user_id: Optional[int],
-) -> None:
-    aisvc = getattr(ctx, "_ai_chat_context_aisvc", None)
-    if aisvc is None:
-        return
-    remember_fn = getattr(aisvc, "remember_assistant_message", None)
-    if not callable(remember_fn):
-        return
-    session_key = _ai_chat_session_key_for_target(send_scene, send_group_id, send_user_id)
-    if not session_key:
-        return
-    try:
-        remember_fn(session_key, text)
-    except Exception as e:
-        logsvc.log.warning(f"AI chat context bot-reply write failed: session={session_key[:80]} err={e}")
-
-
-def _remember_notice_digest_context(
-    ctx,
-    source: str,
-    out: str,
-    logsvc: LogService,
-    aisvc: Optional["AIService"] = None,
-) -> bool:
-    if aisvc is None:
-        return False
-    session_key = _ai_chat_session_key(ctx)
-    if not session_key:
-        return False
-
-    try:
-        remember_user_fn = getattr(aisvc, "remember_user_message", None)
-        if callable(remember_user_fn):
-            remember_user_fn(session_key, _format_group_ai_user_message(ctx, str(source or "")))
-    except Exception as e:
-        logsvc.log.warning(f"AI chat context notice-source write failed: session={session_key[:80]} err={e}")
-
-    assistant_saved = False
-    try:
-        remember_assistant_fn = getattr(aisvc, "remember_assistant_message", None)
-        if callable(remember_assistant_fn):
-            remember_assistant_fn(session_key, str(out or ""))
-            assistant_saved = True
-    except Exception as e:
-        logsvc.log.warning(f"AI chat context notice-reply write failed: session={session_key[:80]} err={e}")
-    return assistant_saved
 
 
 def _is_notice_file_name(name: str) -> bool:
@@ -1277,396 +786,6 @@ def _extract_urls_from_evt(evt: dict) -> List[str]:
         _push(str(msg or ""))
 
     return urls
-
-
-def _parse_cq_kvs(raw: str) -> Dict[str, str]:
-    data: Dict[str, str] = {}
-    for kv in str(raw or "").split(","):
-        if "=" not in kv:
-            continue
-        k, v = kv.split("=", 1)
-        key = str(k).strip().lower()
-        if not key:
-            continue
-        data[key] = html.unescape(str(v).strip())
-    return data
-
-
-def _normalize_image_src(raw: str) -> str:
-    s = html.unescape(str(raw or "").strip())
-    # 某些客户端会把 query 分隔符编码成 &amp;，这里恢复为 &
-    s = s.replace("&amp;", "&")
-    return s
-
-
-def _extract_images_from_evt(evt: dict) -> List[dict]:
-    out: List[dict] = []
-    seen = set()
-
-    def _push(item: dict) -> None:
-        url = _normalize_image_src(item.get("url") or "")
-        file = _normalize_image_src(item.get("file") or "")
-        fid = str(item.get("file_id") or "").strip()
-        key = (url, file, fid)
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(
-            {
-                "url": url,
-                "file": file,
-                "file_id": fid,
-                "name": str(item.get("name") or "").strip(),
-                "size": str(item.get("size") or "").strip(),
-            }
-        )
-
-    msg = evt.get("message")
-    if isinstance(msg, list):
-        for seg in msg:
-            if not isinstance(seg, dict):
-                continue
-            tp = str(seg.get("type") or "").strip().lower()
-            if tp != "image":
-                continue
-            data = seg.get("data") or {}
-            _push(
-                {
-                    "url": data.get("url") or "",
-                    "file": data.get("file") or "",
-                    "file_id": data.get("file_id") or data.get("id") or "",
-                    "name": data.get("name") or data.get("file") or "",
-                    "size": data.get("file_size") or data.get("size") or "",
-                }
-            )
-
-    raw = str(evt.get("raw_message") or "")
-    for m in _CQ_IMAGE_RE.findall(raw):
-        kvs = _parse_cq_kvs(m)
-        _push(
-            {
-                "url": kvs.get("url") or "",
-                "file": kvs.get("file") or "",
-                "file_id": kvs.get("file_id") or kvs.get("id") or "",
-                "name": kvs.get("name") or kvs.get("file") or "",
-                "size": kvs.get("file_size") or kvs.get("size") or "",
-            }
-        )
-
-    return out
-
-
-def _sanitize_temp_image_name(raw_name: str, fallback_stem: str = "img") -> str:
-    nm = str(raw_name or "").strip()
-    p = Path(nm)
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", (p.stem or fallback_stem)).strip("._-") or fallback_stem
-    ext = (p.suffix or "").lower()
-    if ext not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
-        ext = ".jpg"
-    return f"{stem}{ext}"
-
-
-def _safe_delete_ocr_temp_file(path: Path, logsvc: Optional[LogService] = None) -> None:
-    try:
-        rp = Path(path).resolve()
-        root = _BLACKBOARD_OCR_TEMP_DIR
-        if rp != root and root not in rp.parents:
-            if logsvc is not None:
-                logsvc.log.warning(f"跳过清理非识别临时目录文件：{rp}")
-            return
-        if rp.exists() and rp.is_file():
-            rp.unlink(missing_ok=True)
-    except Exception as e:
-        if logsvc is not None:
-            logsvc.log.warning(f"识别临时文件清理失败：path={path} err={e}")
-
-
-def _cleanup_ocr_temp_files(paths: List[Path], logsvc: Optional[LogService] = None) -> None:
-    for p in paths:
-        _safe_delete_ocr_temp_file(Path(p), logsvc=logsvc)
-
-
-def _resolve_local_source_path(src: str) -> Optional[Path]:
-    raw = str(src or "").strip()
-    if not raw:
-        return None
-
-    if raw.startswith("file:///"):
-        u = urllib.parse.urlsplit(raw)
-        local = urllib.parse.unquote(u.path)
-        if local.startswith("/") and len(local) >= 4 and local[2] == ":":
-            local = local[1:]
-        raw = local
-
-    cdir = str(NAPCAT_TEMP_CONTAINER_DIR).rstrip("/")
-    temp_root = Path(NAPCAT_TEMP_HOST_DIR).resolve()
-
-    if raw.startswith("/"):
-        if raw.startswith(cdir + "/") or raw == cdir:
-            rel = raw[len(cdir):].lstrip("/\\")
-            cand = (temp_root / rel).resolve()
-        else:
-            cand = (temp_root / Path(raw).name).resolve()
-        if cand != temp_root and temp_root not in cand.parents:
-            return None
-        return cand
-
-    win_abs = re.match(r"^[A-Za-z]:[\\/]", raw) is not None
-    if win_abs:
-        cand = Path(raw).resolve()
-        if cand != temp_root and temp_root not in cand.parents:
-            return None
-        return cand
-
-    return None
-
-
-async def _resolve_image_source(api, entry: dict) -> str:
-    src = _normalize_image_src(entry.get("url") or "")
-    if src:
-        return src
-
-    file_id = str(entry.get("file_id") or "").strip()
-    if file_id:
-        resp = await api.get_file(file_id, timeout=60.0, retries=1, retry_delay=1.0)
-        if resp and resp.get("status") == "ok":
-            data = resp.get("data")
-            if isinstance(data, str):
-                src = _normalize_image_src(data)
-            else:
-                data = data or {}
-                src = _normalize_image_src(
-                    data.get("url")
-                    or data.get("download_url")
-                    or data.get("file")
-                    or data.get("file_path")
-                    or data.get("path")
-                    or ""
-                )
-            if src:
-                return src
-
-    file_val = _normalize_image_src(entry.get("file") or "")
-    if file_val.startswith("http://") or file_val.startswith("https://") or file_val.startswith("file:///") or file_val.startswith("/"):
-        return file_val
-
-    if file_val:
-        resp2 = await api.call("get_image", {"file": file_val}, timeout=30.0)
-        if resp2 and resp2.get("status") == "ok":
-            data2 = resp2.get("data")
-            if isinstance(data2, str):
-                src2 = _normalize_image_src(data2)
-            else:
-                data2 = data2 or {}
-                src2 = _normalize_image_src(data2.get("url") or data2.get("file") or "")
-            if src2:
-                return src2
-
-    return ""
-
-
-async def _download_image_for_ocr(api, entry: dict, logsvc: Optional[LogService] = None) -> Optional[Path]:
-    src = await _resolve_image_source(api, entry)
-    if not src:
-        return None
-
-    _BLACKBOARD_OCR_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    name = _sanitize_temp_image_name(entry.get("name") or entry.get("file") or "image")
-    dst = _BLACKBOARD_OCR_TEMP_DIR / f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}_{name}"
-    dst = dst.resolve()
-
-    try:
-        if src.startswith("http://") or src.startswith("https://"):
-            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-
-            def _http_download() -> None:
-                with urllib.request.urlopen(req, timeout=45.0) as resp, open(dst, "wb") as f:
-                    shutil.copyfileobj(resp, f)
-
-            await asyncio.to_thread(_http_download)
-            return dst
-
-        local_src = _resolve_local_source_path(src)
-        if local_src and local_src.exists() and local_src.is_file():
-            await asyncio.to_thread(shutil.copy2, local_src, dst)
-            return dst
-    except (urllib.error.URLError, OSError) as e:
-        # 图片下载链接存在时效/转义差异，属于可预期失败，不刷告警。
-        _safe_delete_ocr_temp_file(dst, logsvc=logsvc)
-        return None
-    except Exception as e:
-        if logsvc is not None:
-            logsvc.log.warning(f"题号识别图片下载出现异常：src={src[:120]} err={e}")
-        _safe_delete_ocr_temp_file(dst, logsvc=logsvc)
-        return None
-
-    return None
-
-
-def _load_blackboard_ocr(logsvc: Optional[LogService] = None):
-    global _BLACKBOARD_OCR_IMPORTED, _BLACKBOARD_OCR_IMPORT_ERROR, _BLACKBOARD_OCR_MODULE
-    if _BLACKBOARD_OCR_IMPORTED:
-        return _BLACKBOARD_OCR_MODULE
-
-    try:
-        import blackboard_ocr as _mod
-
-        _BLACKBOARD_OCR_MODULE = _mod
-        _BLACKBOARD_OCR_IMPORT_ERROR = None
-    except Exception as e:
-        _BLACKBOARD_OCR_MODULE = None
-        _BLACKBOARD_OCR_IMPORT_ERROR = str(e)
-        if logsvc is not None:
-            logsvc.log.warning(f"黑板题号识别模块加载失败：{e}")
-    _BLACKBOARD_OCR_IMPORTED = True
-    return _BLACKBOARD_OCR_MODULE
-
-
-def _retry_low_count_ocr_with_enhancement(ocr_mod, image_path: Path) -> Optional[dict]:
-    """
-    首次题号条数过少时，做轻量图像增强后重试一次识别。
-    仅作为兜底，不影响正常图片主流程。
-    """
-    try:
-        import cv2  # type: ignore
-    except Exception:
-        return None
-
-    if not hasattr(ocr_mod, "recognize_homework_from_array"):
-        return None
-
-    img = cv2.imread(str(image_path))
-    if img is None or getattr(img, "size", 0) == 0:
-        return None
-
-    h, w = img.shape[:2]
-    candidates = []
-
-    # 轻裁切：去掉边缘噪声与畸变，提升分隔符可读性。
-    if h >= 240 and w >= 240:
-        y1 = int(h * 0.06)
-        y2 = int(h * 0.96)
-        x1 = int(w * 0.05)
-        x2 = int(w * 0.98)
-        if (y2 - y1) >= 120 and (x2 - x1) >= 120:
-            cropped = img[y1:y2, x1:x2]
-            candidates.append(cropped)
-
-    # 轻提饱和度：对粉笔/底色对比弱的场景有帮助。
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    sat = hsv.copy()
-    sat[..., 1] = cv2.add(sat[..., 1], 15)
-    sat_img = cv2.cvtColor(sat, cv2.COLOR_HSV2BGR)
-    candidates.append(sat_img)
-
-    # 裁切 + 提饱和度
-    if h >= 240 and w >= 240:
-        y1 = int(h * 0.06)
-        y2 = int(h * 0.96)
-        x1 = int(w * 0.05)
-        x2 = int(w * 0.98)
-        if (y2 - y1) >= 120 and (x2 - x1) >= 120:
-            crop2 = img[y1:y2, x1:x2]
-            hsv2 = cv2.cvtColor(crop2, cv2.COLOR_BGR2HSV)
-            sat2 = hsv2.copy()
-            sat2[..., 1] = cv2.add(sat2[..., 1], 15)
-            sat2_img = cv2.cvtColor(sat2, cv2.COLOR_HSV2BGR)
-            candidates.append(sat2_img)
-            # 轻度提对比：帮助点号/分隔符从粘连字符中分离。
-            candidates.append(cv2.convertScaleAbs(sat2_img, alpha=1.3, beta=8))
-
-    best_result = None
-    best_count = -1
-    for cand in candidates:
-        try:
-            res = ocr_mod.recognize_homework_from_array(cand)
-        except Exception:
-            continue
-        if not bool(res.get("is_green_blackboard")):
-            continue
-        cnt = len(ocr_mod.format_assignment_lines(list(res.get("assignments") or [])))
-        if cnt > best_count:
-            best_count = cnt
-            best_result = res
-
-    return best_result
-
-
-async def _handle_blackboard_ocr_images(api, ctx, evt: dict, logsvc: LogService) -> bool:
-    if not bool(ENABLE_OCR):
-        return False
-    images = _extract_images_from_evt(evt)
-    if not images:
-        return False
-
-    ocr_mod = _load_blackboard_ocr(logsvc=logsvc)
-    if ocr_mod is None:
-        return False
-    try:
-        # 避免长驻进程使用旧版识别逻辑，按需热刷新模块。
-        ocr_mod = importlib.reload(ocr_mod)
-    except Exception as e:
-        if logsvc is not None:
-            logsvc.log.warning(f"黑板题号识别模块热刷新失败：{e}")
-
-    temp_files: List[Path] = []
-    has_green_board = False
-    merged_lines: List[str] = []
-    seen_lines = set()
-
-    try:
-        for img in images:
-            p = await _download_image_for_ocr(api, img, logsvc=logsvc)
-            if p is None:
-                continue
-            temp_files.append(p)
-
-            try:
-                result = await asyncio.to_thread(ocr_mod.recognize_homework_from_path, p)
-            except Exception as e:
-                logsvc.log.warning(f"黑板题号识别执行失败：path={p} err={e}")
-                continue
-
-            if not bool(result.get("is_green_blackboard")):
-                continue
-
-            has_green_board = True
-            lines = ocr_mod.format_assignment_lines(list(result.get("assignments") or []))
-            if len(lines) < 3:
-                # 低条数图片：尝试轻量增强后重扫一次，取更优结果。
-                retry_result = await asyncio.to_thread(_retry_low_count_ocr_with_enhancement, ocr_mod, p)
-                if retry_result is not None:
-                    retry_lines = ocr_mod.format_assignment_lines(list(retry_result.get("assignments") or []))
-                    if len(retry_lines) > len(lines):
-                        lines = retry_lines
-                    if len(lines) < 3 and retry_lines:
-                        # 若单次结果仍偏少，合并两次识别结果补全题号覆盖面。
-                        merged_try = []
-                        seen_try = set()
-                        for x in list(lines) + list(retry_lines):
-                            if x in seen_try:
-                                continue
-                            seen_try.add(x)
-                            merged_try.append(x)
-                        lines = merged_try
-            for line in lines:
-                if line in seen_lines:
-                    continue
-                seen_lines.add(line)
-                merged_lines.append(line)
-    finally:
-        _cleanup_ocr_temp_files(temp_files, logsvc=logsvc)
-
-    if not has_green_board:
-        return False
-
-    # 题号过少时不输出，避免误触发场景下产生干扰回复
-    if len(merged_lines) < 3:
-        return False
-
-    out = "题号识别结果：\n" + "\n".join(merged_lines)
-    await reply(api, ctx, out, logsvc)
-    return True
 
 
 async def _resolve_src_by_get_file_for_notice(
@@ -1954,12 +1073,6 @@ async def _run_group_notice_digest(
                 logsvc.log.info(f"群通知解析：生成结果为静默或空内容 kind={kind} target={debug_target[:160]}")
                 continue
 
-            notice_ctx_saved = _remember_notice_digest_context(ctx, source, out, logsvc, aisvc)
-            if notice_ctx_saved:
-                try:
-                    setattr(ctx, "_skip_reply_context_once", True)
-                except Exception:
-                    pass
             await reply(api, ctx, out, logsvc)
             logsvc.log.info(f"群通知解析：已发送回复 kind={kind} target={debug_target[:160]}")
             return
@@ -1982,10 +1095,6 @@ def _schedule_group_notice_digest(
         return
     if not getattr(aisvc, "notice_ready", False):
         return
-    try:
-        setattr(ctx, "_ai_chat_context_aisvc", aisvc)
-    except Exception:
-        pass
     task = asyncio.create_task(_run_group_notice_digest(api, ctx, evt, text, logsvc, state, handin, aisvc))
 
     def _done(t: asyncio.Task) -> None:
@@ -2306,82 +1415,9 @@ async def _send_file(api, ctx, container_path: str, name: str):
 def _handin_tasks_list_text(tasks) -> str:
     lines = ["请选择提交任务："]
     for i, t in enumerate(tasks, 1):
-        suffix = required_suffix_display(getattr(t, "required_suffix", ""))
-        suffix_note = f"，格式 {suffix}" if suffix else ""
-        lines.append(f"{i}. {t.name}（群 {t.group_id}，截止 {pretty_ts(t.deadline_ts)}{suffix_note}）")
+        lines.append(f"{i}. {t.name}（群 {t.group_id}，截止 {pretty_ts(t.deadline_ts)}）")
     lines.append("回复数字选择；回复 0 取消（删除临时文件）。")
     return "\n".join(lines)
-
-
-def _looks_like_handin_suffix_token(token: str) -> bool:
-    raw = str(token or "").strip()
-    if not raw:
-        return False
-    if raw.startswith("."):
-        return bool(re.fullmatch(r"\.[A-Za-z0-9]{1,8}", raw))
-    return bool(re.fullmatch(r"[A-Za-z0-9]{1,8}", raw))
-
-
-def _handin_suffix_examples() -> str:
-    preferred = ["pdf", "docx", "doc", "pptx", "xlsx", "zip", "jpg", "png", "txt"]
-    return "、".join(x for x in preferred if x in HANDIN_ALLOWED_REQUIRED_SUFFIXES)
-
-
-def _parse_handin_create_parts(rest: str) -> Tuple[Optional[str], str, List[str], str]:
-    parts = str(rest or "").split()
-    usage = (
-        "用法：/handin 任务名 [文件后缀] [月.日 时:分 ...] 月.日 时:分\n"
-        "示例：/handin 作业1 pdf 1.22 18:30 1.23 20:00 1.24 23:59\n"
-        "示例：/handin 作业1 1.22 18:30 1.23 20:00 1.24 23:59\n"
-        f"（文件后缀可选，支持 {_handin_suffix_examples()} 等，不区分大小写；提醒时间可不填或填多个；最后一组时间为截止时间；任务名不能有空格）"
-    )
-    if len(parts) < 3:
-        return None, "", [], usage
-
-    time_start = 1
-    required_suffix = ""
-    if len(parts) >= 4 and ((len(parts) - 2) % 2 == 0):
-        suffix = normalize_required_suffix(parts[1])
-        if suffix:
-            required_suffix = suffix
-            time_start = 2
-        elif _looks_like_handin_suffix_token(parts[1]):
-            return None, "", [], f"文件后缀不支持：{parts[1]}\n目前支持：{_handin_suffix_examples()} 等。"
-
-    if ((len(parts) - time_start) < 2) or ((len(parts) - time_start) % 2 != 0):
-        return None, "", [], usage
-
-    time_texts = [f"{parts[i]} {parts[i+1]}" for i in range(time_start, len(parts), 2)]
-    return parts[0], required_suffix, time_texts, ""
-
-
-def _pending_handin_source_names(item: dict) -> List[str]:
-    names: List[str] = []
-    raw_sources = item.get("source_names") if isinstance(item, dict) else None
-    if isinstance(raw_sources, list):
-        for name in raw_sources:
-            s = str(name or "").strip()
-            if s:
-                names.append(s)
-    if names:
-        return names
-    if isinstance(item, dict):
-        name = str(item.get("name") or "").strip()
-        if name:
-            names.append(name)
-        path_name = Path(str(item.get("path") or "")).name
-        if path_name and path_name not in names:
-            names.append(path_name)
-    return names
-
-
-def _pending_handin_matches_required_suffix(item: dict, required_suffix: str) -> bool:
-    suffix = normalize_required_suffix(required_suffix)
-    if not suffix:
-        return True
-    return any(file_matches_required_suffix(name, suffix) for name in _pending_handin_source_names(item))
-
-
 async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
     """处理私聊发文件：下载到 inbox 并提示选择任务。返回是否已处理（True=已回复）。"""
     files = get_files(evt)
@@ -2482,7 +1518,7 @@ async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: B
                 return True
             state.pending_handin_wait_done[ctx.user_id] = {"ts": time.time()}
             state.pending_handin_zip_name.pop(ctx.user_id, None)
-            _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
+            state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
             await reply(
                 api,
                 ctx,
@@ -2531,12 +1567,12 @@ async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: B
             return True
         lines = [msg, f"已识别到姓名：{roster_name}。", _handin_tasks_list_text(tasks)]
         await reply(api, ctx, "\n".join(lines), logsvc)
-        _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
+        state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
         return True
     # 多文件：仍按原有任务选择流程（若继续发送会自动转 done 打包）
     lines = [msg, "检测到你发送了文件提交。", _handin_tasks_list_text(tasks)]
     await reply(api, ctx, "\n".join(lines), logsvc)
-    _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
+    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
     return True
 async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
     """处理提交文件同名覆盖确认（Y/N）。返回是否已处理（True=已回复）。"""
@@ -2609,7 +1645,7 @@ async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogServic
         tasks = handin.list_active_tasks()
         if tasks:
             state.pending_handin_name_input.pop(ctx.user_id, None)
-            _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
+            state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
             await reply(api, ctx, "你还有待分配的提交文件。\n" + _handin_tasks_list_text(tasks), logsvc)
     else:
         state.pending_handin_wait_done.pop(ctx.user_id, None)
@@ -2646,7 +1682,7 @@ async def _handle_private_name_input(api, ctx, text: str, logsvc: LogService, st
             return True
         state.pending_handin_wait_done[ctx.user_id] = {"ts": time.time()}
         state.pending_handin_zip_name.pop(ctx.user_id, None)
-        _set_pending_handin_submit_choice(api, ctx, logsvc, state, [tt.task_id for tt in tasks])
+        state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
         await reply(api, ctx, "检测到你在批量发送文件，请发完后回复 done，我会先让你命名 zip，再让你选择归档任务。", logsvc)
         return True
     skip_name = (t == "0")
@@ -2676,7 +1712,7 @@ async def _handle_private_name_input(api, ctx, text: str, logsvc: LogService, st
         else:
             await reply(api, ctx, "当前没有正在进行的提交任务。", logsvc)
         return True
-    _set_pending_handin_submit_choice(api, ctx, logsvc, state, [tt.task_id for tt in tasks])
+    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
     lines = []
     if rename_note:
         lines.append(rename_note)
@@ -2750,17 +1786,6 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
             return True
         # 不先 pop，避免同名覆盖确认时丢失队列
         item = q[0]
-        required_suffix = normalize_required_suffix(getattr(task, "required_suffix", ""))
-        if required_suffix and not _pending_handin_matches_required_suffix(item, required_suffix):
-            suffix_text = required_suffix_display(required_suffix)
-            is_batch = bool(item.get("source_names"))
-            _delete_pending_handin_files(state, ctx.user_id, logsvc)
-            if is_batch:
-                msg = f"任务「{task.name}」仅接收 {suffix_text} 文件；本次多文件提交中未找到 {suffix_text} 文件，已取消本轮提交。"
-            else:
-                msg = f"任务「{task.name}」仅接收 {suffix_text} 文件；本次提交的文件格式不符，已取消本轮提交。"
-            await reply(api, ctx, msg + "\n请重新发送符合要求的文件。", logsvc)
-            return True
         ok, msg2, dst, code = handin.move_inbox_to_task(Path(item["path"]), task, overwrite=False)
         if (not ok) and code == "EXISTS":
             # 等待 Y/N
@@ -2786,7 +1811,7 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
         if q:
             tasks = handin.list_active_tasks()
             state.pending_handin_name_input.pop(ctx.user_id, None)
-            _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
+            state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [t.task_id for t in tasks], "ts": time.time()}
             await reply(api, ctx, f"你还有 {len(q)} 份待分配文件。\n" + _handin_tasks_list_text(tasks), logsvc)
         else:
             state.pending_handin_wait_done.pop(ctx.user_id, None)
@@ -2987,70 +2012,6 @@ async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogServ
     lines.append("也可用 /get 序号（如/get 1 2 3 4）获取当前列表中的文件/文件夹。")
     await reply(api, ctx, "\n".join(lines), logsvc)
     return True
-
-
-async def _handle_count_name_input(
-    api,
-    ctx,
-    evt: dict,
-    text: str,
-    logsvc: LogService,
-    state: BotState,
-    aisvc: Optional["AIService"] = None,
-) -> bool:
-    _ = evt
-    _ = aisvc
-    session_key = conv_key(ctx)
-    session = state.pending_count_session.get(session_key)
-    if not isinstance(session, dict):
-        return False
-
-    t = str(text or "").strip()
-    if not t:
-        return True
-    if _is_count_end_input(t):
-        logsvc.log_in(ctx, t)
-        state.pending_count_session.pop(session_key, None)
-        await reply(api, ctx, "本次 /count 统计已结束，临时名单已清空。", logsvc)
-        return True
-    if t.startswith("/") or t.startswith("／"):
-        plain = t[1:].strip()
-        if not plain:
-            return True
-        cmdx, _rest = _split_args(plain)
-        cmdx = str(cmdx or "").lower()
-        if cmdx in ("count", "countlist", "countremove"):
-            return False
-        logsvc.log_in(ctx, t)
-        await reply(api, ctx, "当前处于 /count 统计模式，请先发送 end 结束后再使用其他功能。", logsvc)
-        return True
-
-    logsvc.log_in(ctx, t)
-    raw_names = _parse_count_names(t)
-    if not raw_names:
-        session["ts"] = time.time()
-        await reply(api, ctx, "未识别到有效姓名，请继续输入；发送 /countlist 查看，发送 end 结束。", logsvc)
-        return True
-
-    current = _dedup_names_keep_order(list(session.get("names") or []))
-    current_set = set(current)
-    added = 0
-    for name in raw_names:
-        if name in current_set:
-            continue
-        current_set.add(name)
-        current.append(name)
-        added += 1
-    session["names"] = current
-    session["ts"] = time.time()
-
-    if added <= 0:
-        await reply(api, ctx, f"这条消息中的姓名已存在，当前共 {len(current)} 人。发送 /countlist 查看，发送 end 结束。", logsvc)
-        return True
-    await reply(api, ctx, f"已记录 {added} 人，当前共 {len(current)} 人。发送 /countlist 查看，发送 end 结束。", logsvc)
-    return True
-
-
 async def _ensure_group_context_and_schedule_digest(
     api,
     ctx,
@@ -3085,7 +2046,6 @@ async def _handle_pre_dispatch_state(
     state: BotState,
     handin: HandinService,
     filesvc: FileService,
-    aisvc: Optional["AIService"] = None,
 ):
     if ctx.scene.startswith("private"):
         handled = await _handle_private_file(api, ctx, evt, logsvc, state, handin)
@@ -3106,9 +2066,6 @@ async def _handle_pre_dispatch_state(
         handled = await _handle_private_number_choice(api, ctx, text, logsvc, state, handin, filesvc)
         if handled:
             return True
-    handled = await _handle_count_name_input(api, ctx, evt, text, logsvc, state, aisvc)
-    if handled:
-        return True
     handled = await _handle_cancel_number_choice(api, ctx, text, logsvc, state, handin)
     if handled:
         return True
@@ -3125,54 +2082,22 @@ async def _handle_ai_chat_trigger(
 ):
     ai_input = _extract_ai_chat_input(ctx, evt, t, bot_nick=(aisvc.bot_nick if aisvc else AI_BOT_NICK))
     if ai_input is not None:
-        backend, raw_ai_input = _split_ai_chat_backend(ai_input)
-        ai_input = _augment_ai_input_with_sender(ctx, raw_ai_input)
         if not ai_input:
-            await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊直接发送文本就行。", logsvc)
+            await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊消息前加 C。", logsvc)
             return True
-        if aisvc is None:
-            await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
-            return True
-        use_gemini = backend == "gemini"
-        ready = bool(getattr(aisvc, "gemini_chat_ready", False)) if use_gemini else bool(getattr(aisvc, "chat_ready", False))
-        if not ready:
-            msg = "Gemini 联网聊天暂时不可用（Gemini CLI 未就绪）。" if use_gemini else "AI 聊天暂时不可用（配置未就绪）。"
-            await reply(api, ctx, msg, logsvc)
-            return True
-        chat_with_context_fn = getattr(aisvc, "gemini_chat_with_context", None) if use_gemini else getattr(aisvc, "chat_with_context", None)
-        chat_fn = getattr(aisvc, "gemini_chat", None) if use_gemini else getattr(aisvc, "chat", None)
-        if not callable(chat_fn):
+        if (aisvc is None) or (not aisvc.chat_ready):
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
         try:
             session_key = _ai_chat_session_key(ctx)
-            if session_key and callable(chat_with_context_fn):
-                out = (await chat_with_context_fn(session_key, ai_input)).strip()
-                try:
-                    setattr(ctx, "_skip_reply_context_once", True)
-                except Exception:
-                    pass
+            if session_key:
+                out = (await aisvc.chat_with_context(session_key, ai_input)).strip()
             else:
-                out = (await chat_fn(ai_input)).strip()
-            if out and _is_likely_ai_stuck_repeat(session_key, ai_input, out):
-                retry_prompt = (
-                    "你刚才出现了机械复读。请只根据这条新消息给出新的、准确的回复，不要复述上一条答案。\n"
-                    + ai_input
-                )
-                retry_out = (await chat_fn(retry_prompt)).strip()
-                if retry_out:
-                    out = retry_out
+                out = (await aisvc.chat(ai_input)).strip()
             if not out:
                 out = "我这边没收到有效回复，稍后再试一次。"
             await reply(api, ctx, out, logsvc)
-        except Exception as e:
-            try:
-                logsvc.log.warning(
-                    f"AI chat failed: backend={'gemini' if use_gemini else 'default'} "
-                    f"session={(session_key or '')[:80]} err={e}"
-                )
-            except Exception:
-                pass
+        except Exception:
             await reply(api, ctx, aisvc.fallback_error_reply, logsvc)
         return True
     return False
@@ -3189,19 +2114,14 @@ async def _handle_plain_text_input(
         handled = await _handle_find_folder_number_choice(api, ctx, t, logsvc, state)
         if handled:
             return True
-        answer_text = _strip_text_companion_cq_segments(t)
-        fixed_answers = _lookup_fixed_answers(answer_text)
+        fixed_answers = _lookup_fixed_answers(t)
         if fixed_answers:
             for msg in fixed_answers:
                 await reply(api, ctx, msg, logsvc)
             return True
         if _is_media_or_emoji_only_message(evt, t):
             return True
-        if not _is_keyword_text_message(evt, t):
-            return True
-        if getattr(ctx, "scene", "") != "group":
-            return True
-        keyword_answers = _lookup_keyword_answers(answer_text)
+        keyword_answers = _lookup_keyword_answers(t)
         if keyword_answers:
             for msg in keyword_answers:
                 await reply(api, ctx, msg, logsvc)
@@ -3310,64 +2230,6 @@ async def _handle_explicit_command(
             return
         await reply(api, ctx, f"已设置 {target_uid} 的等级为 {stored}（生效等级 {effective}）。", logsvc)
         return
-    if cmd == "count":
-        key = conv_key(ctx)
-        old = state.pending_count_session.get(key)
-        old_names = _dedup_names_keep_order(list((old or {}).get("names") or []))
-        state.pending_count_session[key] = {"names": [], "ts": time.time()}
-        if old_names:
-            await reply(
-                api,
-                ctx,
-                "已重新开始 /count 统计，并清空上一次临时名单。\n请分多次发送姓名；发送 /countlist 查看，发送 end 结束并清空。",
-                logsvc,
-            )
-        else:
-            await reply(
-                api,
-                ctx,
-                "已进入 /count 统计模式。\n请分多次发送姓名；发送 /countlist 查看，发送 end 结束并清空。",
-                logsvc,
-            )
-        return
-    if cmd == "countlist":
-        key = conv_key(ctx)
-        session = state.pending_count_session.get(key)
-        if not isinstance(session, dict):
-            await reply(api, ctx, "当前会话没有进行中的 /count 统计，请先在本会话发送 /count。", logsvc)
-            return
-        session["ts"] = time.time()
-        names = _dedup_names_keep_order(list(session.get("names") or []))
-        roster: List[Tuple[str, str]] = []
-        get_roster = getattr(handin, "_get_roster", None)
-        if callable(get_roster):
-            try:
-                roster = list(get_roster() or [])
-            except Exception as e:
-                logsvc.log.warning(f"/countlist get roster failed: err={e}")
-                roster = []
-        await reply(api, ctx, _build_count_list_text(names, roster), logsvc)
-        return
-    if cmd == "countremove":
-        key = conv_key(ctx)
-        session = state.pending_count_session.get(key)
-        if not isinstance(session, dict):
-            await reply(api, ctx, "当前会话没有进行中的 /count 统计，请先在本会话发送 /count。", logsvc)
-            return
-        arg = (rest or "").strip()
-        if not re.fullmatch(r"\d{1,4}", arg):
-            await reply(api, ctx, "用法：/countremove 序号（序号来自 /countlist 的“已提交名单”）", logsvc)
-            return
-        idx = int(arg)
-        names = _dedup_names_keep_order(list(session.get("names") or []))
-        if idx < 1 or idx > len(names):
-            await reply(api, ctx, f"序号无效：{idx}（当前已提交名单共 {len(names)} 人）", logsvc)
-            return
-        removed = names.pop(idx - 1)
-        session["names"] = names
-        session["ts"] = time.time()
-        await reply(api, ctx, f"已移除：{removed}\n当前已提交 {len(names)} 人。可发送 /countlist 查看。", logsvc)
-        return
     if cmd in ("help", "h"):
         lines = [
             "命令速览：",
@@ -3375,10 +2237,6 @@ async def _handle_explicit_command(
             "/help 或 /h",
             "/ping",
             "/whoami",
-            "/count  开始临时收集名单（模式内仅收集名单；发送 end 结束并清空）",
-            "/countlist  查看已提交名单和未交名单",
-            "/countremove 序号  移除已提交名单中的人名",
-            "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）",
         ]
         if ctx.level >= 3:
             lines.extend([
@@ -3404,55 +2262,21 @@ async def _handle_explicit_command(
             "",
             "AI聊天：",
             "群聊：@Cooepr_bot + 内容",
-            "群聊（Gemini联网）：@Cooper_bot g内容（g/G 后面可不加空格）",
-            "私聊：直接发送文本内容",
-            "私聊（Gemini联网）：g内容（g/G 后面可不加空格）",
+            "私聊：C + 内容（大小写都可）",
         ])
         if ctx.level >= 2:
             lines.extend([
                 "",
                 "提交功能：",
-                "/handin 任务名 [文件后缀] [提醒时间...] 截止时间（仅群聊，如 pdf/docx）",
-                "/handinstat  查看任务并查询未交",
+                "/handin 任务名 [提醒时间...] 截止时间（仅群聊）",
+                "/handinstatus  查看任务并查询未交",
                 "/handincheck  查看你创建任务的已交文件（可配合 /get）",
                 "/handinget  打包你创建任务的已交文件并发送",
                 "/chandin  取消提交任务（按提示回复序号）",
-                "私聊发送文件后按提示操作；多文件发完后回复 done；限定后缀时多文件至少包含一个匹配文件。",
+                "私聊发送文件后按提示操作；多文件发完后回复 done。",
             ])
         msg = "\n".join(lines)
         await reply(api, ctx, msg, logsvc)
-        return
-    if cmd == "autoat":
-        if ctx.level < 2:
-            await reply(api, ctx, "权限不足：/autoat 仅对 2 级及以上开放。", logsvc)
-            return
-        if ctx.scene != "group" or ctx.group_id is None:
-            await reply(api, ctx, "/autoat 只能在群聊中使用。", logsvc)
-            return
-        try:
-            list_resp = await api.get_group_member_list(ctx.group_id)
-        except Exception as e:
-            logsvc.log.warning(f"/autoat get_group_member_list failed: group={ctx.group_id}, err={e}")
-            await reply(api, ctx, "获取群成员失败，请稍后重试。", logsvc)
-            return
-        user_ids = _extract_group_member_user_ids(list_resp)
-        if not user_ids:
-            detail = _onebot_resp_detail(list_resp)
-            logsvc.log.warning(f"/autoat empty member list: group={ctx.group_id}, detail={detail}")
-            await reply(api, ctx, "获取群成员失败：没有拿到可用的群成员列表。", logsvc)
-            return
-        at_message = " ".join(f"[CQ:at,qq={uid}]" for uid in user_ids)
-        send_resp = await api.send_group_msg(ctx.group_id, at_message)
-        if send_resp is None:
-            logsvc.log.info(f"/autoat send unconfirmed: group={ctx.group_id}, count={len(user_ids)}")
-            logsvc.log_out(ctx, at_message)
-            return
-        if _onebot_resp_ok(send_resp):
-            logsvc.log_out(ctx, at_message)
-            return
-        detail = _onebot_resp_detail(send_resp)
-        logsvc.log.warning(f"/autoat send failed: group={ctx.group_id}, detail={detail}")
-        await reply(api, ctx, "发送失败：请确认 QQ/NapCat 是否限制长消息或频繁 @。", logsvc)
         return
     # Handin commands
     if cmd == "handin":
@@ -3462,15 +2286,25 @@ async def _handle_explicit_command(
         if ctx.scene != "group" or ctx.group_id is None:
             await reply(api, ctx, "/handin 只能在群聊中使用。", logsvc)
             return
-        # 格式：/handin 任务名 [文件后缀] [提醒时间...] 截止时间
+        # 格式：/handin 任务名 [提醒时间...] 截止时间
         # 时间用两段：月.日 时:分（冒号中英文都兼容）。提醒时间可不填或填多个；最后一组时间为截止时间。
-        task_name, required_suffix, time_texts, err = _parse_handin_create_parts(rest)
-        if err:
-            await reply(api, ctx, err, logsvc)
+        # 示例：/handin 作业1 1.22 18:30 1.23 20:00 1.24 23:59
+        parts = rest.split()
+        if len(parts) < 3 or ((len(parts) - 1) % 2 != 0):
+            await reply(
+                api,
+                ctx,
+                "用法：/handin 任务名 [月.日 时:分 ...] 月.日 时:分\n"
+                "示例：/handin 作业1 1.22 18:30 1.23 20:00 1.24 23:59\n"
+                "（提醒时间可不填或填多个；最后一组时间为截止时间；任务名不能有空格；冒号中英文都兼容）",
+                logsvc,
+            )
             return
+        task_name = parts[0]
         now = time.time()
         ts_list = []
-        for s in time_texts:
+        for i in range(1, len(parts), 2):
+            s = f"{parts[i]} {parts[i+1]}"
             ts = parse_mmdd_hhmm(s, now)
             if ts is None:
                 await reply(api, ctx, f"时间格式不对：{s}\n请用 月.日 时:分，例如 1.22 18:30（冒号中英文都行）。", logsvc)
@@ -3478,28 +2312,20 @@ async def _handle_explicit_command(
             ts_list.append(ts)
         deadline_ts = ts_list[-1]
         remind_list = ts_list[:-1]  # 可为空或多个
-        ok, msg2 = handin.create_task(ctx.group_id, ctx.user_id, task_name, remind_list, deadline_ts, required_suffix)
+        ok, msg2 = handin.create_task(ctx.group_id, ctx.user_id, task_name, remind_list, deadline_ts)
         await reply(api, ctx, msg2, logsvc)
         return
-    if cmd == "handinstat":
+    if cmd == "handinstatus":
         if ctx.level < 2:
-            await reply(api, ctx, "权限不足：/handinstat 仅对 2 级及以上开放。", logsvc)
+            await reply(api, ctx, "权限不足：/handinstatus 仅对 2 级及以上开放。", logsvc)
             return
         # 允许查询已截止任务：用于统计未交/导出等（提交仍只允许进行中）
         if ctx.scene == "group" and ctx.group_id is not None:
-            list_res = list_handin_tasks_for_group(
-                handin=handin,
-                group_id=ctx.group_id,
-                include_closed=True,
-                active_only=False,
-                only_gettable=True,
-                sort_mode="active_then_deadline_desc",
-            )
-            tasks = list_res.data.get("tasks") if (list_res.ok and isinstance(list_res.data, dict)) else []
+            tasks = handin.list_tasks_by_group(ctx.group_id, include_closed=True)
         else:
             tasks = handin.list_tasks(include_closed=True)
-            # 仅保留仍可 /handinget 的任务（归档未被清理）
-            tasks = [t for t in tasks if handin.is_task_gettable(t)]
+        # 仅保留仍可 /handinget 的任务（归档未被清理）
+        tasks = [t for t in tasks if handin.is_task_gettable(t)]
         if not tasks:
             await reply(api, ctx, "当前没有提交任务记录。", logsvc)
             return
@@ -3513,15 +2339,10 @@ async def _handle_explicit_command(
                 return "已结束"
             return "进行中"
         # 进行中优先，其次按截止时间倒序
-        if not (ctx.scene == "group" and ctx.group_id is not None):
-            tasks.sort(key=lambda t: (0 if t.is_active(now) else 1, -float(t.deadline_ts)))
+        tasks.sort(key=lambda t: (0 if t.is_active(now) else 1, -float(t.deadline_ts)))
         text_list = ["提交任务列表："]
         for i, tsk in enumerate(tasks, 1):
-            row = get_handin_task_summary(tsk, now_ts=now, pretty_ts_func=pretty_ts, with_status=True, with_group=True)
-            if row.ok:
-                text_list.append(f"{i}. {row.message}")
-            else:
-                text_list.append(f"{i}. [{_status_tag(tsk)}] {tsk.name}（群 {tsk.group_id}，截止 {pretty_ts(tsk.deadline_ts)}）")
+            text_list.append(f"{i}. [{_status_tag(tsk)}] {tsk.name}（群 {tsk.group_id}，截止 {pretty_ts(tsk.deadline_ts)}）")
         text_list.append("回复数字选择任务，我会发送未提交名单（若姓名识别率过低会改发已提交文件列表；已截止任务也可查询）。")
         # 若在群里发，群里提示，列表私聊
         if ctx.scene == "group":
@@ -3599,15 +2420,7 @@ async def _handle_explicit_command(
             return
         # 群里默认只列本群任务；私聊则列“你创建的任务”（管理员可列全部）
         if ctx.scene == "group" and ctx.group_id is not None:
-            list_res = list_handin_tasks_for_group(
-                handin=handin,
-                group_id=ctx.group_id,
-                include_closed=False,
-                active_only=True,
-                only_gettable=False,
-                sort_mode="deadline_asc",
-            )
-            tasks = list_res.data.get("tasks") if (list_res.ok and isinstance(list_res.data, dict)) else []
+            tasks = handin.list_active_tasks_by_group(ctx.group_id)
             pend_gid = int(ctx.group_id)
         else:
             all_tasks = handin.list_active_tasks()
@@ -3633,8 +2446,8 @@ async def _handle_explicit_command(
         await reply(api, ctx, "权限不足：你当前是 0 级（游客），不能访问资料库。", logsvc)
         return
     if cmd == "ls":
-        ls_result = run_list_dir_query(filesvc=filesvc, ctx=ctx, path_arg=(rest if rest else None))
-        await reply(api, ctx, str(ls_result.message or ""), logsvc)
+        ok, out = filesvc.list_dir(ctx, rest if rest else None)
+        await reply(api, ctx, out, logsvc)
         return
     if cmd == "find":
         # 支持：
@@ -3649,15 +2462,7 @@ async def _handle_explicit_command(
         else:
             kw, in_dir = _parse_find_args(rest, filesvc)
         try:
-            find_result = await asyncio.to_thread(
-                run_find_query,
-                filesvc=filesvc,
-                ctx=ctx,
-                keyword=kw,
-                in_dir=in_dir,
-            )
-            find_data = find_result.data if isinstance(find_result.data, dict) else {}
-            primary_hits = list(find_data.get("hits") or [])
+            primary_hits = await asyncio.to_thread(filesvc.find, ctx, kw, in_dir=in_dir)
         except Exception as e:
             logsvc.log.exception(f"/find failed: kw={kw!r} in_dir={in_dir!r} err={e}")
             await reply(api, ctx, "搜索失败，请稍后再试。", logsvc)
@@ -3926,15 +2731,9 @@ async def dispatch(
     perm=None,
     aisvc: Optional["AIService"] = None,
 ):
-    try:
-        setattr(ctx, "_ai_chat_context_aisvc", aisvc)
-    except Exception:
-        pass
     _sweep_bot_state_ttl(state)
     await _ensure_group_context_and_schedule_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
-    if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc, aisvc):
-        return
-    if await _handle_blackboard_ocr_images(api, ctx, evt, logsvc):
+    if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc):
         return
     t = (text or "").strip()
     if not t:
@@ -3943,7 +2742,6 @@ async def dispatch(
     logsvc.log_in(ctx, t)
     if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc):
         return
-    _remember_non_ai_chat_message(ctx, t, logsvc, aisvc)
     if await _handle_plain_text_input(api, ctx, evt, t, logsvc, state):
         return
     await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc)
@@ -3985,7 +2783,7 @@ async def _handle_private_done_batch(api, ctx, text: str, logsvc: LogService, st
             await reply(api, ctx, "当前仅有 1 个文件，无需打包。\n未在文件名中识别到班级名册姓名，请回复提交者姓名（或回复 0 跳过）。", logsvc)
             return True
         state.pending_handin_name_input.pop(ctx.user_id, None)
-        _set_pending_handin_submit_choice(api, ctx, logsvc, state, [tt.task_id for tt in tasks])
+        state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
         await reply(api, ctx, f"当前仅有 1 个文件，无需打包。\n已识别到姓名：{roster_name}。\n" + _handin_tasks_list_text(tasks), logsvc)
         return True
     # 多文件：先询问 zip 名称
@@ -4062,11 +2860,9 @@ async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService
             Path(str(it.get("path") or "")).unlink(missing_ok=True)
         except Exception as e:
             logsvc.log.warning(f"remove source after zip failed: user={ctx.user_id} item={it} err={e}")
-    source_names = [str(it.get("name") or Path(str(it.get("path") or "")).name) for it in q]
     state.pending_handin_files[ctx.user_id] = [{
         "path": str(out_zip),
         "name": out_zip.name,
-        "source_names": source_names,
         "ts": time.time(),
     }]
     state.pending_handin_wait_done.pop(ctx.user_id, None)
@@ -4077,7 +2873,7 @@ async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService
         state.pending_handin_choose.pop(ctx.user_id, None)
         await reply(api, ctx, f"已将 {packed} 个文件打包为：{out_zip.name}\n当前没有正在进行的提交任务。", logsvc)
         return True
-    _set_pending_handin_submit_choice(api, ctx, logsvc, state, [tt.task_id for tt in tasks])
+    state.pending_handin_choose[ctx.user_id] = {"mode": "submit", "task_ids": [tt.task_id for tt in tasks], "ts": time.time()}
     lines = [f"已将 {packed} 个文件打包为：{out_zip.name}。"]
     if missing > 0:
         lines.append(f"另有 {missing} 个文件未找到，已跳过。")
