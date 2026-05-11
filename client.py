@@ -37,7 +37,7 @@ CONV_LOCK_SWEEP_INTERVAL_SECONDS = 60.0
 # - Set True for one startup after you manually adjust subject folders.
 # - It writes current classified file hashes into ai_material_scan_marks.json.
 # - Then set it back to False.
-REBUILD_MATERIAL_SCAN_MARKS_ON_STARTUP = False
+REBUILD_MATERIAL_SCAN_MARKS_ON_STARTUP = True
 _INSTANCE_LOCK_HANDLE = None
 
 
