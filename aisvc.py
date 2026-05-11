@@ -24,6 +24,11 @@ from config import (
     AI_CHAT_MODEL,
     AI_EMBED_MODEL,
     AI_FALLBACK_ERROR_REPLY,
+    AI_GEMINI_CLI_PATH,
+    AI_GEMINI_MODEL,
+    AI_GEMINI_POLICY_PATH,
+    AI_GEMINI_TIMEOUT_SECONDS,
+    AI_GEMINI_WORKDIR,
     AI_INDEX_PATH,
     AI_MATERIAL_DIR,
     AI_METADATA_PATH,
@@ -32,6 +37,7 @@ from config import (
     AI_SYSTEM_PROMPT,
     AI_VECTORS_PATH,
     BASE_DIR,
+    ENABLE_OCR,
 )
 
 try:
@@ -81,7 +87,9 @@ class AIService:
     _ALLOWED_SUFFIXES = {".pdf", ".doc", ".docx", ".ppt", ".pptx"}
     _EBOOK_SUFFIXES = {".epub", ".mobi"}
     _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
-    _CHAT_CONTEXT_MAX_TURNS = 15
+    _CHAT_CONTEXT_MAX_MESSAGES = 100
+    _GEMINI_CHAT_CONTEXT_MAX_MESSAGES = 20
+    _CHAT_TEMPERATURE = 0.65
     _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
     _AUTO_ORGANIZE_EBOOK_SUBJECT = "课外书"
     _AUTO_ORGANIZE_MARKS_FILENAME = "ai_material_scan_marks.json"
@@ -94,7 +102,18 @@ class AIService:
     _NEW_FILE_EMBED_MAX_CONCURRENCY = 4
     _MISPLACED_REVIEW_MAX_CANDIDATES = 24
     _ORGANIZE_PROGRESS_EVERY = 5
+    _DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash"
+    _THINKING_DISABLED = {"type": "disabled"}
+    _THINKING_ENABLED = {"type": "enabled"}
+    _REASONING_EFFORT_HIGH = "high"
     _NOTICE_SILENT_TOKEN = "[静默]"
+    _CHAT_AUTOMATION_BOUNDARY_PROMPT = (
+        "# 自动服务边界\n"
+        "你只是 AI 聊天回复模型，不能执行 QQ 机器人的自动业务功能。\n"
+        "历史消息中可能包含 bot 的自动服务回复，例如文件提交、任务选择、覆盖确认、取消提示、发送文件等；这些只能作为上下文理解，不能当作你当前可以执行的能力。\n"
+        "如果用户发送 0、纯数字、Y/N、done 等看起来像业务流程控制的短回复，你不得自行推断已经取消、覆盖、提交、归档、删除或发送文件。\n"
+        "你应该如实说明：自己不能执行该自动操作，请以机器人业务功能实际返回的消息为准；如果没有业务回复，可能当前没有待处理操作。"
+    )
 
     def __init__(self, log):
         self.log = log
@@ -110,9 +129,14 @@ class AIService:
         self.material_state_cache_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_STATE_CACHE_FILENAME
         self.incremental_store_path = Path(BASE_DIR) / self._INCREMENTAL_STORE_FILENAME
 
-        self.bot_nick = str(AI_BOT_NICK or "Cooepr_bot")
-        self.chat_model = str(AI_CHAT_MODEL or "deepseek-chat")
+        self.bot_nick = str(AI_BOT_NICK or "Cooper_bot")
+        self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_FLASH_MODEL)
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
+        self.gemini_cli_path = str(AI_GEMINI_CLI_PATH or "").strip()
+        self.gemini_model = str(AI_GEMINI_MODEL or "").strip()
+        self.gemini_policy_path = Path(AI_GEMINI_POLICY_PATH)
+        self.gemini_workdir = Path(AI_GEMINI_WORKDIR)
+        self.gemini_timeout_seconds = max(10.0, float(AI_GEMINI_TIMEOUT_SECONDS or 120.0))
         self.search_limit = max(1, int(AI_SEARCH_LIMIT))
         self.search_min_similarity = float(AI_SEARCH_MIN_SIMILARITY)
         self.system_prompt = str(AI_SYSTEM_PROMPT or "").strip()
@@ -143,9 +167,67 @@ class AIService:
         self._group_chat_prompt_cache_mtime: Optional[float] = None
         self._group_chat_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
 
+    def _build_chat_payload(
+        self,
+        messages: List[dict],
+        temperature: float,
+        response_format: Optional[dict] = None,
+    ) -> dict:
+        payload = {
+            "model": str(self.chat_model or self._DEEPSEEK_V4_FLASH_MODEL),
+            "messages": list(messages),
+            "temperature": float(temperature),
+            "thinking": dict(self._THINKING_DISABLED),
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
+        return payload
+
+    def _append_chat_automation_boundary(self, system_prompt: str) -> str:
+        prompt = str(system_prompt or "").strip()
+        boundary = self._CHAT_AUTOMATION_BOUNDARY_PROMPT.strip()
+        if not prompt:
+            return boundary
+        if boundary in prompt:
+            return prompt
+        return f"{prompt}\n\n{boundary}"
+
+    def _get_deepseek_sdk_base_url(self) -> str:
+        return (self.deepseek_base_url or "https://api.deepseek.com").rstrip("/")
+
+    def _create_deepseek_client(self):
+        if OpenAI is None:
+            raise RuntimeError("openai sdk is not installed")
+        return OpenAI(api_key=self.deepseek_api_key, base_url=self._get_deepseek_sdk_base_url())
+
+    def _create_reasoner_completion(self, client, messages: List[dict], temperature: float):
+        return client.chat.completions.create(
+            model=self._DEEPSEEK_V4_FLASH_MODEL,
+            messages=list(messages),
+            temperature=float(temperature),
+            reasoning_effort=self._REASONING_EFFORT_HIGH,
+            extra_body={"thinking": dict(self._THINKING_ENABLED)},
+        )
+
+    def _extract_sdk_chat_text(self, resp: object) -> str:
+        try:
+            return str(resp.choices[0].message.content or "").strip()
+        except Exception:
+            pass
+        if hasattr(resp, "model_dump"):
+            try:
+                return self._extract_chat_text(resp.model_dump())
+            except Exception:
+                return ""
+        return ""
+
     @property
     def chat_ready(self) -> bool:
         return bool(self.deepseek_base_url and self.deepseek_api_key and self.system_prompt)
+
+    @property
+    def gemini_chat_ready(self) -> bool:
+        return bool(self._resolve_gemini_cli_executable() and self.gemini_policy_path.is_file())
 
     @property
     def semantic_ready(self) -> bool:
@@ -190,6 +272,157 @@ class AIService:
 
     async def chat_with_context(self, session_key: str, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
+
+    async def gemini_chat(self, user_input: str) -> str:
+        return await asyncio.to_thread(self._gemini_chat_sync, user_input)
+
+    async def gemini_chat_with_context(self, session_key: str, user_input: str) -> str:
+        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input)
+
+    def remember_user_message(self, session_key: str, message_text: str) -> None:
+        self._remember_chat_message(session_key, "user", message_text)
+
+    def remember_assistant_message(self, session_key: str, message_text: str) -> None:
+        self._remember_chat_message(session_key, "assistant", message_text)
+
+    def _resolve_gemini_cli_executable(self) -> str:
+        raw = str(self.gemini_cli_path or "").strip()
+        if not raw:
+            return ""
+        try:
+            direct = Path(raw).expanduser()
+        except Exception:
+            direct = None
+        if direct is not None and direct.is_file():
+            return str(direct)
+        resolved = shutil.which(raw)
+        if resolved:
+            return str(resolved)
+        if direct is not None and (not direct.is_absolute()):
+            try:
+                candidate = (Path(BASE_DIR) / direct).resolve()
+            except Exception:
+                candidate = None
+            if candidate is not None and candidate.is_file():
+                return str(candidate)
+        return ""
+
+    def _build_gemini_cli_base_command(self) -> List[str]:
+        cli_exe = self._resolve_gemini_cli_executable()
+        if not cli_exe:
+            return []
+
+        cli_path = Path(cli_exe)
+        suffix = cli_path.suffix.lower()
+        if suffix in {".cmd", ".bat", ".ps1"}:
+            node_path = cli_path.with_name("node.exe")
+            js_path = cli_path.parent / "node_modules" / "@google" / "gemini-cli" / "bundle" / "gemini.js"
+            if node_path.is_file() and js_path.is_file():
+                return [str(node_path), str(js_path)]
+        return [str(cli_path)]
+
+    def _trim_gemini_history(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        out = list(messages or [])
+        max_messages = max(1, int(self._GEMINI_CHAT_CONTEXT_MAX_MESSAGES))
+        if len(out) > max_messages:
+            out = out[-max_messages:]
+        return out
+
+    def _build_gemini_cli_prompt(
+        self,
+        system_prompt: str,
+        history: List[Dict[str, str]],
+        user_input: str,
+    ) -> str:
+        lines = [
+            "You are the Gemini web chat backend for a QQ bot conversation.",
+            "This Gemini mode is intended for online search and current-information answers.",
+            "Use google_web_search by default before answering factual, current, news, version, price, schedule, or lookup requests.",
+            "Do not attempt to read, list, modify, or execute any local files, directories, or commands.",
+            "Do not use local workspace search tools; if information is needed, search the web instead.",
+            "Answer the latest user request directly.",
+            "Default to concise Chinese unless the user clearly asks for another language.",
+            "",
+        ]
+        sys_text = str(system_prompt or "").strip()
+        if sys_text:
+            lines.extend(["System:", sys_text, ""])
+        for item in self._trim_gemini_history(history):
+            role = str((item or {}).get("role") or "").strip().lower()
+            content = str((item or {}).get("content") or "").strip()
+            if (not content) or role not in {"user", "assistant"}:
+                continue
+            label = "User" if role == "user" else "Assistant"
+            lines.extend([f"{label}:", content, ""])
+        lines.extend(["User:", str(user_input or "").strip(), "", "Assistant:"])
+        return "\n".join(lines).strip()
+
+    def _run_gemini_cli_sync(self, prompt: str) -> str:
+        base_cmd = self._build_gemini_cli_base_command()
+        if not base_cmd:
+            raise RuntimeError("gemini cli not found")
+        policy_path = Path(self.gemini_policy_path)
+        if not policy_path.is_file():
+            raise RuntimeError("gemini policy file not found")
+        workdir = Path(self.gemini_workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            *base_cmd,
+            "-p",
+            str(prompt or ""),
+            "-o",
+            "json",
+            "--approval-mode",
+            "default",
+            "--policy",
+            str(policy_path),
+        ]
+        if self.gemini_model:
+            cmd.extend(["-m", str(self.gemini_model)])
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(workdir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=float(self.gemini_timeout_seconds),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"gemini cli timeout after {int(self.gemini_timeout_seconds)}s") from e
+        except Exception as e:
+            raise RuntimeError(f"gemini cli launch failed: {e}") from e
+
+        raw = str(proc.stdout or "").strip()
+        if proc.returncode != 0:
+            detail = str(proc.stderr or raw or "").strip()
+            raise RuntimeError(f"gemini cli failed: {detail[:300]}")
+        if not raw:
+            detail = str(proc.stderr or "").strip()
+            raise RuntimeError(f"gemini cli empty response: {detail[:300]}")
+
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if (start < 0) or (end < start):
+                raise RuntimeError("gemini cli json decode failed")
+            try:
+                obj = json.loads(raw[start : end + 1])
+            except Exception as e:
+                raise RuntimeError(f"gemini cli json decode failed: {e}") from e
+        if not isinstance(obj, dict):
+            raise RuntimeError("gemini cli invalid response type")
+        text = str(obj.get("response") or "").strip()
+        if not text:
+            raise RuntimeError("empty gemini chat response")
+        return text
 
     async def extract_notice_file_head(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         return await asyncio.to_thread(
@@ -1754,12 +1987,11 @@ class AIService:
         return target
 
     def _ask_subject_decision(self, prompt: str, timeout: float = 90.0) -> dict:
-        payload = {
-            "model": self.chat_model,
-            "messages": [{"role": "user", "content": str(prompt or "")}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.0,
-        }
+        payload = self._build_chat_payload(
+            [{"role": "user", "content": str(prompt or "")}],
+            0.0,
+            response_format={"type": "json_object"},
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=float(timeout))
         text = self._extract_chat_text(data)
@@ -2345,20 +2577,30 @@ class AIService:
         if not content:
             return "想聊点啥？发我一句话就行。"
 
-        payload = {
-            "model": self.chat_model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
+        payload = self._build_chat_payload(
+            [
+                {"role": "system", "content": self._append_chat_automation_boundary(self.system_prompt)},
                 {"role": "user", "content": content},
             ],
-            "temperature": 0.4,
-        }
+            self._CHAT_TEMPERATURE,
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
         text = self._extract_chat_text(data)
         if not text:
             raise RuntimeError("empty chat response")
         return text
+
+    def _gemini_chat_sync(self, user_input: str) -> str:
+        if not self.gemini_chat_ready:
+            raise RuntimeError("gemini chat not ready")
+
+        content = str(user_input or "").strip()
+        if not content:
+            return "鎯宠亰鐐瑰暐锛熷彂鎴戜竴鍙ヨ瘽灏辫銆?"
+
+        prompt = self._build_gemini_cli_prompt(self.system_prompt, [], content)
+        return self._run_gemini_cli_sync(prompt)
 
     def _chat_with_context_sync(self, session_key: str, user_input: str) -> str:
         if not self.chat_ready:
@@ -2379,12 +2621,11 @@ class AIService:
             self.log.warning(f"AI chat context read failed, fallback to stateless: session={key[:80]} err={e}")
             history = []
 
-        system_prompt = self._select_chat_system_prompt(key) or self.system_prompt
-        payload = {
-            "model": self.chat_model,
-            "messages": [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
-            "temperature": 0.4,
-        }
+        system_prompt = self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
+        payload = self._build_chat_payload(
+            [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
+            self._CHAT_TEMPERATURE,
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
         text = self._extract_chat_text(data)
@@ -2395,6 +2636,37 @@ class AIService:
             self._save_chat_turn(key, content, text)
         except Exception as e:
             self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
+        return text
+
+    def _gemini_chat_with_context_sync(self, session_key: str, user_input: str) -> str:
+        if not self.gemini_chat_ready:
+            raise RuntimeError("gemini chat not ready")
+
+        content = str(user_input or "").strip()
+        if not content:
+            return self._gemini_chat_sync(content)
+
+        key = str(session_key or "").strip()
+        if not key:
+            return self._gemini_chat_sync(content)
+
+        history: List[Dict[str, str]] = []
+        try:
+            history = self._load_active_chat_history(key)
+        except Exception as e:
+            self.log.warning(f"AI gemini chat context read failed, fallback to stateless: session={key[:80]} err={e}")
+            history = []
+
+        system_prompt = self._select_chat_system_prompt(key) or self.system_prompt
+        prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
+        text = self._run_gemini_cli_sync(prompt)
+        if not text:
+            raise RuntimeError("empty gemini chat response")
+
+        try:
+            self._save_chat_turn(key, content, text)
+        except Exception as e:
+            self.log.warning(f"AI gemini chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
         return text
 
     @staticmethod
@@ -2416,19 +2688,9 @@ class AIService:
             if normalized is None:
                 return None
             out.append(normalized)
-
-        if (len(out) % 2) != 0:
-            return None
-        for i in range(0, len(out), 2):
-            if out[i].get("role") != "user":
-                return None
-            if out[i + 1].get("role") != "assistant":
-                return None
-
-        max_turns = max(1, int(self._CHAT_CONTEXT_MAX_TURNS))
-        max_items = max_turns * 2
-        if len(out) > max_items:
-            out = out[-max_items:]
+        max_messages = max(1, int(self._CHAT_CONTEXT_MAX_MESSAGES))
+        if len(out) > max_messages:
+            out = out[-max_messages:]
         return out
 
     def _load_active_chat_history(self, session_key: str, now_ts: Optional[float] = None) -> List[Dict[str, str]]:
@@ -2476,11 +2738,28 @@ class AIService:
         checked = self._validate_and_trim_chat_history(out)
         if checked is None:
             self._chat_sessions.pop(session_key, None)
-            self.log.warning(f"AI chat context invalid turn structure, reset: session={session_key[:80]}")
+            self.log.warning(f"AI chat context invalid message structure, reset: session={session_key[:80]}")
             return []
         if len(checked) != len(out):
             self._chat_sessions[session_key] = {"messages": checked, "last_active_ts": last_active_ts}
         return checked
+
+    def _remember_chat_message(self, session_key: str, role: str, content: str) -> None:
+        key = str(session_key or "").strip()
+        if not key:
+            return
+        msg = self._normalize_chat_history_item({"role": role, "content": content})
+        if msg is None:
+            return
+        now_ts = float(time.time())
+        with self._chat_sessions_lock:
+            history = self._load_active_chat_history_locked(key, now_ts)
+            history.append(msg)
+            checked = self._validate_and_trim_chat_history(history)
+            if checked is None:
+                checked = [msg]
+                self.log.warning(f"AI chat context invalid after append, reset to current message: session={key[:80]}")
+            self._chat_sessions[key] = {"messages": checked, "last_active_ts": now_ts}
 
     def _save_chat_turn(self, session_key: str, user_input: str, assistant_output: str) -> None:
         key = str(session_key or "").strip()
@@ -2632,8 +2911,7 @@ class AIService:
         if len(content) > 6000:
             content = content[:6000]
 
-        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
-        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+        client = self._create_deepseek_client()
         prompt = (
             "你是电气2410班群消息过滤器。\n"
             "请判断下面内容是否属于“需要同学执行动作/流程/截止日期”的通知。\n"
@@ -2644,16 +2922,8 @@ class AIService:
             f"内容片段：\n{content}"
         )
         try:
-            resp = client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-            )
-            raw = ""
-            try:
-                raw = str(resp.choices[0].message.content or "").strip()
-            except Exception:
-                raw = ""
+            resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.0)
+            raw = self._extract_sdk_chat_text(resp)
             out = self.sanitize_reasoner_output(raw)
             if out == "[通知]":
                 self.log.info(f"群通知解析：分类结果=通知 source={source[:120]}")
@@ -2682,8 +2952,7 @@ class AIService:
         if len(content) > 120000:
             content = content[:120000]
 
-        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
-        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+        client = self._create_deepseek_client()
 
         prompt = (
             "【角色设定】\n"
@@ -2713,19 +2982,8 @@ class AIService:
             f"{content}"
         )
 
-        resp = client.chat.completions.create(
-            model="deepseek-reasoner",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-
-        raw = ""
-        try:
-            raw = str(resp.choices[0].message.content or "").strip()
-        except Exception:
-            raw = ""
-        if (not raw) and hasattr(resp, "model_dump"):
-            raw = self._extract_chat_text(resp.model_dump())
+        resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.2)
+        raw = self._extract_sdk_chat_text(resp)
         out = self.sanitize_reasoner_output(raw)
         return out or self._NOTICE_SILENT_TOKEN
 
@@ -2750,19 +3008,10 @@ class AIService:
         lines = self._select_notice_prompt_lines(group_id, kind, "classify")
         prompt = self._render_notice_prompt(lines, source, content)
 
-        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
-        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
+        client = self._create_deepseek_client()
         try:
-            resp = client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-            )
-            raw = ""
-            try:
-                raw = str(resp.choices[0].message.content or "").strip()
-            except Exception:
-                raw = ""
+            resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.0)
+            raw = self._extract_sdk_chat_text(resp)
             out = self.sanitize_reasoner_output(raw)
             if out == "[通知]":
                 self.log.info(f"群通知解析：分类结果=通知 source={source[:120]}")
@@ -2799,21 +3048,9 @@ class AIService:
         lines = self._select_notice_prompt_lines(group_id, kind, "reason")
         prompt = self._render_notice_prompt(lines, source, content)
 
-        base_url = (self.deepseek_base_url or "https://api.deepseek.com/v1").rstrip("/")
-        client = OpenAI(api_key=self.deepseek_api_key, base_url=base_url)
-        resp = client.chat.completions.create(
-            model="deepseek-reasoner",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-
-        raw = ""
-        try:
-            raw = str(resp.choices[0].message.content or "").strip()
-        except Exception:
-            raw = ""
-        if (not raw) and hasattr(resp, "model_dump"):
-            raw = self._extract_chat_text(resp.model_dump())
+        client = self._create_deepseek_client()
+        resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.2)
+        raw = self._extract_sdk_chat_text(resp)
         out = self.sanitize_reasoner_output(raw)
         return out or self._NOTICE_SILENT_TOKEN
 
@@ -2966,12 +3203,11 @@ class AIService:
                 '{"keywords":["词1","词2"],"summary":"一句精简说明"}'
             )
 
-        payload = {
-            "model": self.chat_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-        }
+        payload = self._build_chat_payload(
+            [{"role": "user", "content": prompt}],
+            0.1,
+            response_format={"type": "json_object"},
+        )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         try:
             data = self._post_json(url, payload, self.deepseek_api_key, timeout=120.0)
@@ -3660,6 +3896,8 @@ class AIService:
         return "\n".join(chunks)[:max_chars]
 
     def _get_rapid_ocr(self):
+        if not bool(ENABLE_OCR):
+            return None
         if RapidOCR is None:
             return None
         if self._rapid_ocr is False:

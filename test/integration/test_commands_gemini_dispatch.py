@@ -50,7 +50,7 @@ class _ReplyRecorder:
 
 class _FakeAIService:
     def __init__(self) -> None:
-        self.bot_nick = "Cooepr_bot"
+        self.bot_nick = "Cooper_bot"
         self.chat_ready = True
         self.gemini_chat_ready = True
         self.notice_ready = True
@@ -169,5 +169,5 @@ async def test_command_help_mentions_gemini_usage(dispatch_harness) -> None:
         aisvc=aisvc,
     )
 
-    assert any("群聊（Gemini联网）：@Cooepr_bot g内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("群聊（Gemini联网）：@Cooper_bot g内容" in one["text"] for one in dispatch_harness.messages)
     assert any("私聊（Gemini联网）：g内容" in one["text"] for one in dispatch_harness.messages)

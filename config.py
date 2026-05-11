@@ -80,10 +80,10 @@ LOG_DIR = BASE_DIR / "logs"
 
 # NapCat / OneBot v11
 TOKEN = _get_env("TOKEN", "CHANGE_ME_TOKEN")
-WS_URI = f"ws://127.0.0.1:3001/?access_token={TOKEN}"
+WS_URI = f"ws://127.0.0.1:13001/?access_token={TOKEN}"
 
 # 你已经配好的 HTTP Server（可选；目前阶段不依赖它）
-HTTP_PORT = 3010
+HTTP_PORT = 13010
 HTTP_BASE = f"http://127.0.0.1:{HTTP_PORT}"
 
 # 如果 NapCat 的 HTTP Server 也配置了 access_token，这里会自动带上（同时放在 query + Authorization）
@@ -100,6 +100,7 @@ IDLE_SPLIT_SECONDS = 1800
 # 权限等级：0游客 1临时 2好友 3管理员
 # 管理员 QQ 号（/whoami 里显示的 user_id）
 ADMIN_USERS = _parse_int_set(_get_env("ADMIN_USERS", ""))
+ENABLE_OCR = _get_env_bool("ENABLE_OCR", False)
 
 # 群权限：可选的群级别“下限”（通常不需要；你也可以留空）
 GROUP_LEVEL = {
@@ -202,9 +203,14 @@ AI_INDEX_PATH = AI_MATERIAL_DIR / "all_files_index.json"
 AI_METADATA_PATH = AI_MATERIAL_DIR / "file_metadata.json"
 AI_VECTORS_PATH = AI_MATERIAL_DIR / "file_vectors.npy"
 
-AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-chat")
+AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-flash")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
-AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooepr_bot")
+AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
+AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "gemini")
+AI_GEMINI_MODEL = _get_env("AI_GEMINI_MODEL", "gemini-3.1-pro-preview")
+AI_GEMINI_TIMEOUT_SECONDS = float(_get_env("AI_GEMINI_TIMEOUT_SECONDS", "180") or "180")
+AI_GEMINI_WORKDIR = _get_env_path("AI_GEMINI_WORKDIR", DATA_DIR / "_gemini_cli_workspace")
+AI_GEMINI_POLICY_PATH = _get_env_path("AI_GEMINI_POLICY_PATH", BASE_DIR / "gemini_cli_chat_only.toml")
 AI_SEARCH_LIMIT = int(_get_env("AI_SEARCH_LIMIT", "10") or "10")
 AI_SEARCH_MIN_SIMILARITY = float(_get_env("AI_SEARCH_MIN_SIMILARITY", "0.35") or "0.35")
 AI_FALLBACK_ERROR_REPLY = (
@@ -229,7 +235,6 @@ AI_SYSTEM_PROMPT = """# 核心角色与身份设定
 
 3. 坦诚你的 AI 身份：如果遇到不懂的情感问题或纯人类的线下体验，大方承认自己是 Cooper 写的 AI 机器人，不要伪装成人类去共情，但可以提供符合逻辑的建议或安慰。
 
-4. 适应 QQ 聊天环境：QQ 消息需要快速阅读。你的回答必须**极度精简、直击痛点**。多用换行、列表（1. 2. 3.）和 Emoji 来增加可读性，绝对避免几百字的长篇大论。
 # 兜底与边界条件
 
 - 遇到敏感、涉政、引战或违反 QQ 社区规则的话题，巧妙且生硬地转移话题，或幽默地表示“这个话题超纲啦，我只是个专注学习的机器人”。

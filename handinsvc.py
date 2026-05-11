@@ -41,17 +41,68 @@ except Exception:  # Py<3.9
 import openpyxl
 
 
+HANDIN_ALLOWED_REQUIRED_SUFFIXES = {
+    "7z",
+    "bmp",
+    "c",
+    "cpp",
+    "csv",
+    "css",
+    "doc",
+    "docx",
+    "gif",
+    "heic",
+    "html",
+    "ipynb",
+    "java",
+    "jpeg",
+    "jpg",
+    "js",
+    "json",
+    "md",
+    "pdf",
+    "png",
+    "ppt",
+    "pptx",
+    "py",
+    "rar",
+    "txt",
+    "webp",
+    "xls",
+    "xlsx",
+    "xml",
+    "zip",
+}
+
+
+def normalize_required_suffix(suffix: str) -> str:
+    s = str(suffix or "").strip().lstrip(".").casefold()
+    return s if s in HANDIN_ALLOWED_REQUIRED_SUFFIXES else ""
+
+
+def required_suffix_display(suffix: str) -> str:
+    s = normalize_required_suffix(suffix)
+    return f".{s}" if s else ""
+
+
+def file_matches_required_suffix(filename: str, suffix: str) -> bool:
+    s = normalize_required_suffix(suffix)
+    if not s:
+        return True
+    return Path(str(filename or "")).suffix.casefold() == f".{s}"
+
+
 # ========= 文件名提取（参考 who_has_handed_in.py 的逻辑） =========
 BLACKLIST_SUBSTRINGS = {
     "电气", "学院", "工程", "班", "专业",
     "报告", "读书", "作业", "论文", "马原",
     "课", "阅读", "历史", "自由", "之间",
-    "政治", "经济", "序言", "导言", "经典", "思想",
+    "政治", "经济", "序言", "导言", "经典", "思想","电测","报告","电路测试","测试",
 }
 STRUCTURAL_WORDS = ["电气", "学院", "工程", "班", "专业"]
 SEPARATORS = ["-", "_", "——", "—", "–", ";", "，", ",", " "]
 
-_RE_STU = re.compile(r"[Uu]\d{8,12}")  # 例如 U202412743
+_RE_STU = re.compile(r"[Uu]\d{8,12}")
 _RE_ENG = re.compile(r"[A-Za-z]")
 _RE_NUM = re.compile(r"[Uu]?\d{4,}")
 SUBMITTED_FILE_SUFFIXES = {".doc", ".docx", ".pdf", ".txt", ".zip", ".rar", ".7z", ".ppt", ".pptx", ".xls", ".xlsx"}
@@ -213,6 +264,7 @@ class HandinTask:
     creator_id: int
     name: str
     created_ts: float
+    required_suffix: str = ""
     # 可选的多个提醒时间（时间戳列表）。最后一个时间一定是截止时间，提醒时间可为空。
     remind_ts_list: List[float] = field(default_factory=list)
     # 已发送到第几个提醒（下一个将发送的提醒索引）
@@ -366,6 +418,7 @@ class HandinService:
                         td.setdefault("last_handinget_ts", 0.0)
                         td.setdefault("purged", False)
                         td.setdefault("purged_ts", 0.0)
+                        td["required_suffix"] = normalize_required_suffix(td.get("required_suffix", ""))
                         self._tasks[str(tid)] = HandinTask(**td)
         except Exception as e:
             self.log.warning(f"Handin DB load failed: {e}")
@@ -593,13 +646,26 @@ class HandinService:
         except Exception as e:
             return False, f"打包失败：{e}", None
 
-    def create_task(self, group_id: int, creator_id: int, name: str, remind_ts_list: Optional[List[float]], deadline_ts: float) -> Tuple[bool, str]:
+    def create_task(
+        self,
+        group_id: int,
+        creator_id: int,
+        name: str,
+        remind_ts_list: Optional[List[float]],
+        deadline_ts: float,
+        required_suffix: str = "",
+    ) -> Tuple[bool, str]:
         """创建任务：提醒时间可为空或多个；最后一个时间一定是截止时间（由命令解析保证）。"""
         name = (name or "").strip()
         if not name or " " in name:
             return False, "任务名不合法：不能为空且不能包含空格。"
         if deadline_ts is None:
             return False, "时间格式不对：请用 月.日 时:分，例如 1.22 18:30（冒号中英文都行）。"
+        suffix = ""
+        if str(required_suffix or "").strip():
+            suffix = normalize_required_suffix(required_suffix)
+            if not suffix:
+                return False, "文件后缀不支持。"
 
         rlist = []
         for x in (remind_ts_list or []):
@@ -629,6 +695,7 @@ class HandinService:
             creator_id=int(creator_id),
             name=name,
             created_ts=time.time(),
+            required_suffix=suffix,
             remind_ts_list=rlist,
             remind_sent_idx=0,
             deadline_ts=dts,
@@ -645,6 +712,8 @@ class HandinService:
         else:
             msg_lines.append("提醒：无")
         msg_lines.append(f"截止：{pretty_ts(task.deadline_ts)}")
+        if task.required_suffix:
+            msg_lines.append(f"限定格式：{required_suffix_display(task.required_suffix)}")
         return True, "\n".join(msg_lines)
     
     def cancel_task(self, task_id: str, by_user_id: int) -> Tuple[bool, str]:

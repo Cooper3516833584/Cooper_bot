@@ -46,7 +46,7 @@ def test_parse_semantic_find_query_rejects_invalid_tail() -> None:
 
 def test_extract_ai_chat_input_private_keeps_leading_c() -> None:
     ctx = SimpleNamespace(scene="private_friend")
-    out = commands._extract_ai_chat_input(ctx, evt={}, text="C你好", bot_nick="Cooepr_bot")
+    out = commands._extract_ai_chat_input(ctx, evt={}, text="C你好", bot_nick="Cooper_bot")
     assert out == "C你好"
 
 
@@ -59,5 +59,5 @@ def test_extract_ai_chat_input_group_requires_mention() -> None:
             {"type": "text", "data": {"text": " 你好"}},
         ],
     }
-    out = commands._extract_ai_chat_input(ctx, evt=evt, text="你好", bot_nick="Cooepr_bot")
+    out = commands._extract_ai_chat_input(ctx, evt=evt, text="你好", bot_nick="Cooper_bot")
     assert out == "你好"

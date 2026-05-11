@@ -56,7 +56,7 @@ class _ReplyRecorder:
 
 class _FakeAIService:
     def __init__(self) -> None:
-        self.bot_nick = "Cooepr_bot"
+        self.bot_nick = "Cooper_bot"
         self.chat_ready = True
         self.semantic_ready = False
         self.fallback_error_reply = "fallback"

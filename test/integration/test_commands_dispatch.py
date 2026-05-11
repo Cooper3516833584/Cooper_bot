@@ -110,7 +110,7 @@ def dispatch_harness(monkeypatch):
 
 class _FakeAIService:
     def __init__(self) -> None:
-        self.bot_nick = "Cooepr_bot"
+        self.bot_nick = "Cooper_bot"
         self.chat_ready = True
         self.notice_ready = True
         self.semantic_ready = False
@@ -820,4 +820,3 @@ async def test_command_autoat_requires_level_two(dispatch_harness) -> None:
     api.get_group_member_list.assert_not_awaited()
     api.send_group_msg.assert_not_awaited()
     assert any("/autoat" in one["text"] for one in dispatch_harness.messages)
-
