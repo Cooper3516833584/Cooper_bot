@@ -24,7 +24,7 @@ def _new_service(work_root) -> AIService:
     return svc
 
 
-def test_gemini_chat_with_context_reuses_history(monkeypatch, controlled_time, tmp_project_root) -> None:
+def test_gemini_chat_with_context_ignores_history_and_prompts(monkeypatch, tmp_project_root) -> None:
     svc = _new_service(tmp_project_root)
     prompts: list[str] = []
     seq = {"n": 0}
@@ -36,20 +36,22 @@ def test_gemini_chat_with_context_reuses_history(monkeypatch, controlled_time, t
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "gemini")
     monkeypatch.setattr(svc, "_run_gemini_cli_sync", _fake_run)
-    monkeypatch.setattr(svc, "_select_chat_system_prompt", lambda _session_key: "system-prompt")
+    monkeypatch.setattr(svc, "_load_active_chat_history", lambda _session_key: (_ for _ in ()).throw(AssertionError("no history")))
+    monkeypatch.setattr(svc, "_select_chat_system_prompt", lambda _session_key: (_ for _ in ()).throw(AssertionError("no prompt")))
+    monkeypatch.setattr(svc, "_save_chat_turn", lambda *_args: (_ for _ in ()).throw(AssertionError("no context save")))
 
     first = svc._gemini_chat_with_context_sync("group:20001", "hello")
     assert first == "reply-1"
 
-    controlled_time.advance(10)
     second = svc._gemini_chat_with_context_sync("group:20001", "follow-up")
     assert second == "reply-2"
 
     assert len(prompts) == 2
-    assert "System:\nsystem-prompt" in prompts[0]
-    assert "User:\nhello" in prompts[0]
-    assert "Assistant:\nreply-1" in prompts[1]
-    assert "User:\nfollow-up" in prompts[1]
+    assert "google_web_search" in prompts[0]
+    assert prompts[0].endswith("hello")
+    assert "system-prompt" not in prompts[0]
+    assert "Assistant:" not in prompts[1]
+    assert prompts[1].endswith("follow-up")
 
 
 def test_run_gemini_cli_sync_parses_json_response(monkeypatch, tmp_project_root) -> None:

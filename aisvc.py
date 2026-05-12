@@ -334,28 +334,11 @@ class AIService:
         history: List[Dict[str, str]],
         user_input: str,
     ) -> str:
-        lines = [
-            "You are the Gemini web chat backend for a QQ bot conversation.",
-            "This Gemini mode is intended for online search and current-information answers.",
-            "Use google_web_search by default before answering factual, current, news, version, price, schedule, or lookup requests.",
-            "Do not attempt to read, list, modify, or execute any local files, directories, or commands.",
-            "Do not use local workspace search tools; if information is needed, search the web instead.",
-            "Answer the latest user request directly.",
-            "Default to concise Chinese unless the user clearly asks for another language.",
-            "",
-        ]
-        sys_text = str(system_prompt or "").strip()
-        if sys_text:
-            lines.extend(["System:", sys_text, ""])
-        for item in self._trim_gemini_history(history):
-            role = str((item or {}).get("role") or "").strip().lower()
-            content = str((item or {}).get("content") or "").strip()
-            if (not content) or role not in {"user", "assistant"}:
-                continue
-            label = "User" if role == "user" else "Assistant"
-            lines.extend([f"{label}:", content, ""])
-        lines.extend(["User:", str(user_input or "").strip(), "", "Assistant:"])
-        return "\n".join(lines).strip()
+        _ = system_prompt, history
+        content = str(user_input or "").strip()
+        if not content:
+            return ""
+        return "Use google_web_search before answering this exact user request:\n\n" + content
 
     def _run_gemini_cli_sync(self, prompt: str) -> str:
         base_cmd = self._build_gemini_cli_base_command()
@@ -2639,35 +2622,8 @@ class AIService:
         return text
 
     def _gemini_chat_with_context_sync(self, session_key: str, user_input: str) -> str:
-        if not self.gemini_chat_ready:
-            raise RuntimeError("gemini chat not ready")
-
-        content = str(user_input or "").strip()
-        if not content:
-            return self._gemini_chat_sync(content)
-
-        key = str(session_key or "").strip()
-        if not key:
-            return self._gemini_chat_sync(content)
-
-        history: List[Dict[str, str]] = []
-        try:
-            history = self._load_active_chat_history(key)
-        except Exception as e:
-            self.log.warning(f"AI gemini chat context read failed, fallback to stateless: session={key[:80]} err={e}")
-            history = []
-
-        system_prompt = self._select_chat_system_prompt(key) or self.system_prompt
-        prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
-        text = self._run_gemini_cli_sync(prompt)
-        if not text:
-            raise RuntimeError("empty gemini chat response")
-
-        try:
-            self._save_chat_turn(key, content, text)
-        except Exception as e:
-            self.log.warning(f"AI gemini chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
-        return text
+        _ = session_key
+        return self._gemini_chat_sync(user_input)
 
     @staticmethod
     def _normalize_chat_history_item(item: object) -> Optional[Dict[str, str]]:
