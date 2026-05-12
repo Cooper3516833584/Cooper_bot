@@ -6,15 +6,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
 import html
-import importlib
 import re
 import time
 import shutil
 import uuid
 import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 from filesvc import FileService
 from logsvc import LogService
 from handinsvc import (
@@ -47,9 +43,6 @@ from config import (
     FIND_DIR_LIMIT,
     FIND_FILE_LIMIT,
     AI_BOT_NICK,
-    NAPCAT_TEMP_CONTAINER_DIR,
-    NAPCAT_TEMP_HOST_DIR,
-    ENABLE_OCR,
 )
 if TYPE_CHECKING:
     from aisvc import AIService
@@ -73,8 +66,12 @@ _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_PENDING_COUNT_SECONDS = 6.0 * 60.0 * 60.0
 _STATE_TTL_GROUP_NOTICE_SECONDS = 5.0 * 60.0
+_STATE_TTL_SIGNIN_SECONDS = 30.0 * 60.0 * 60.0
 _HANDIN_SUBMIT_REMINDER_SECONDS = 10.0 * 60.0
 _HANDIN_SUBMIT_REMINDER_TEXT = "发完文件需要选择提交任务哇，文件还没提交上去呐（哭唧唧）"
+_SIGNIN_VISUAL_TIMESTAMP_TOLERANCE_SECONDS = 3.0 * 60.0
+_SIGNIN_DEADLINE_TOLERANCE_SECONDS = 30.0 * 60.0
+_SIGNIN_FINALIZE_GRACE_SECONDS = 5.0
 _TEXT_COMPANION_EMOJI_SEG_TYPES = {"face", "mface", "market_face"}
 _MEDIA_OR_EMOJI_SEG_TYPES = {"image"} | _TEXT_COMPANION_EMOJI_SEG_TYPES
 _KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES = {"at", "reply"} | _TEXT_COMPANION_EMOJI_SEG_TYPES
@@ -84,6 +81,7 @@ _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
 )
 _CQ_SEG_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,[^\]]*)?\]")
 _CQ_IMAGE_RE = re.compile(r"\[CQ:image,([^\]]+)\]", flags=re.IGNORECASE)
+_SIGNIN_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 _COUNT_NAME_SPLIT_RE = re.compile(r"[\s,，、;；/|]+")
 _COUNT_NAME_PREFIX_RE = re.compile(r"^[\d\.\)\(、\-_:：]+")
 _COUNT_END_RE = re.compile(r"^/?end[\s。.!！?？]*$", flags=re.IGNORECASE)
@@ -100,13 +98,6 @@ def _strip_text_companion_cq_segments(text: str) -> str:
         return match.group(0)
 
     return _CQ_SEG_RE.sub(_replace, str(text or "")).strip()
-
-
-_BLACKBOARD_OCR_TEMP_DIR = (DATA_DIR / "temp" / "blackboard_ocr").resolve()
-_BLACKBOARD_OCR_IMPORT_ERROR: Optional[str] = None
-_BLACKBOARD_OCR_IMPORTED = False
-_BLACKBOARD_OCR_MODULE = None
-
 
 def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECONDS) -> bool:
     now = time.time()
@@ -407,6 +398,10 @@ class BotState:
     pending_handin_submit_reminders: Dict[int, dict] = field(default_factory=dict)
     # Count: conv_key -> {"names": [str, ...], "ts": float}
     pending_count_session: Dict[str, dict] = field(default_factory=dict)
+    # Signin: group_id -> in-memory task state.
+    signin_tasks: Dict[int, dict] = field(default_factory=dict)
+    # Signin: user_id -> {"group_id": int, "task_id": str, ...} after private image passes time check.
+    pending_signin_name_input: Dict[int, dict] = field(default_factory=dict)
     # Group notice digest dedup cache: notice_key -> ts
     recent_group_notice_keys: Dict[str, float] = field(default_factory=dict)
     # Opportunistic cleanup guard.
@@ -612,6 +607,31 @@ def _sweep_bot_state_ttl(state: BotState, *, now: Optional[float] = None, force:
         except Exception:
             state.recent_group_notice_keys.pop(k, None)
 
+    stale_signin_before = now_ts - _STATE_TTL_SIGNIN_SECONDS
+    for gid, item in list(state.signin_tasks.items()):
+        if not isinstance(item, dict):
+            state.signin_tasks.pop(gid, None)
+            continue
+        try:
+            deadline_ts = float(item.get("deadline_ts") or 0.0)
+        except Exception:
+            deadline_ts = 0.0
+        if item.get("closed") or (deadline_ts > 0.0 and deadline_ts < stale_signin_before):
+            _cancel_signin_deadline_task(item)
+            state.signin_tasks.pop(gid, None)
+
+    for uid, item in list(state.pending_signin_name_input.items()):
+        if not isinstance(item, dict):
+            state.pending_signin_name_input.pop(uid, None)
+            continue
+        try:
+            gid = int(item.get("group_id") or 0)
+        except Exception:
+            gid = 0
+        task = state.signin_tasks.get(gid)
+        if not isinstance(task, dict) or str(task.get("task_id") or "") != str(item.get("task_id") or ""):
+            state.pending_signin_name_input.pop(uid, None)
+
 
 def conv_key(ctx) -> str:
     # 文件检索结果最好按“人”隔离，避免群里互相覆盖
@@ -732,6 +752,726 @@ def _split_args(text: str):
     cmd = parts[0]
     rest = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
     return cmd, rest
+
+
+def _parse_signin_deadline_hhmm(text: str) -> Optional[Tuple[int, int]]:
+    s = unicodedata.normalize("NFKC", str(text or "")).strip()
+    m = re.fullmatch(r"(\d{1,2})\s*:\s*(\d{1,2})", s)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        return None
+    return hh, mm
+
+
+def _signin_deadline_ts(hh: int, mm: int, now_ts: Optional[float] = None) -> float:
+    now = float(now_ts if now_ts is not None else time.time())
+    lt = time.localtime(now)
+    target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, int(hh), int(mm), 0, lt.tm_wday, lt.tm_yday, lt.tm_isdst))
+    if target <= now:
+        target += 24.0 * 60.0 * 60.0
+    return float(target)
+
+
+def _format_signin_deadline(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+
+
+def _format_hhmmss_from_ts(ts: Optional[float] = None) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(float(ts if ts is not None else time.time())))
+
+
+def _time_text_to_seconds(text: str) -> Optional[int]:
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", str(text or "").strip())
+    if not m:
+        return None
+    hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60):
+        return None
+    return hh * 3600 + mm * 60 + ss
+
+
+def _clock_delta_seconds(a: str, b: str) -> Optional[float]:
+    aa = _time_text_to_seconds(a)
+    bb = _time_text_to_seconds(b)
+    if aa is None or bb is None:
+        return None
+    diff = abs(int(aa) - int(bb))
+    return float(min(diff, 24 * 3600 - diff))
+
+
+def _time_delta_to_now_seconds(text: str, now_ts: Optional[float] = None) -> Optional[float]:
+    now_text = _format_hhmmss_from_ts(now_ts)
+    return _clock_delta_seconds(text, now_text)
+
+
+def _seconds_to_hhmmss(seconds: float) -> str:
+    sec = int(round(float(seconds))) % (24 * 3600)
+    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+
+
+def _clock_average_time_text(a: str, b: str) -> Optional[str]:
+    aa = _time_text_to_seconds(a)
+    bb = _time_text_to_seconds(b)
+    if aa is None or bb is None:
+        return None
+    a2 = float(aa)
+    b2 = float(bb)
+    if abs(a2 - b2) > 12 * 3600:
+        if a2 < b2:
+            a2 += 24 * 3600
+        else:
+            b2 += 24 * 3600
+    return _seconds_to_hhmmss((a2 + b2) / 2.0)
+
+
+def _parse_cq_kvs(raw: str) -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    for kv in str(raw or "").split(","):
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        key = str(k).strip().lower()
+        if not key:
+            continue
+        data[key] = html.unescape(str(v).strip())
+    return data
+
+
+def _normalize_image_src(raw: str) -> str:
+    return html.unescape(str(raw or "").strip()).replace("&amp;", "&")
+
+
+def _extract_signin_image_items(evt: dict) -> List[dict]:
+    out: List[dict] = []
+    seen = set()
+
+    def _push(item: dict) -> None:
+        url = _normalize_image_src(item.get("url") or "")
+        file = _normalize_image_src(item.get("file") or "")
+        file_id = str(item.get("file_id") or "").strip()
+        path = _normalize_image_src(item.get("path") or "")
+        key = (url, file, file_id, path)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(
+            {
+                "url": url,
+                "file": file,
+                "file_id": file_id,
+                "path": path,
+                "name": str(item.get("name") or "").strip(),
+                "size": str(item.get("size") or "").strip(),
+            }
+        )
+
+    msg = evt.get("message")
+    segments = msg if isinstance(msg, list) else ([msg] if isinstance(msg, dict) else [])
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        if str(seg.get("type") or "").strip().lower() != "image":
+            continue
+        data = seg.get("data") or {}
+        _push(
+            {
+                "url": data.get("url") or data.get("download_url") or data.get("file_url") or "",
+                "file": data.get("file") or "",
+                "file_id": data.get("file_id") or data.get("id") or "",
+                "path": data.get("path") or data.get("file_path") or "",
+                "name": data.get("name") or data.get("file") or "",
+                "size": data.get("file_size") or data.get("size") or "",
+            }
+        )
+
+    raw_values = [evt.get("raw_message")]
+    if isinstance(msg, str):
+        raw_values.append(msg)
+    for raw_value in raw_values:
+        raw = str(raw_value or "")
+        for m in _CQ_IMAGE_RE.findall(raw):
+            kvs = _parse_cq_kvs(m)
+            _push(
+                {
+                    "url": kvs.get("url") or kvs.get("download_url") or kvs.get("file_url") or "",
+                    "file": kvs.get("file") or "",
+                    "file_id": kvs.get("file_id") or kvs.get("id") or "",
+                    "path": kvs.get("path") or kvs.get("file_path") or "",
+                    "name": kvs.get("name") or kvs.get("file") or "",
+                    "size": kvs.get("file_size") or kvs.get("size") or "",
+                }
+            )
+
+    return out
+
+
+def _is_direct_signin_image_src(src: str) -> bool:
+    s = _normalize_image_src(src)
+    if not s:
+        return False
+    if s.startswith(("http://", "https://", "file:///")):
+        return True
+    if s.startswith("/"):
+        return True
+    return re.match(r"^[A-Za-z]:[\\/]", s) is not None
+
+
+def _extract_signin_src_from_resp(resp: Optional[dict]) -> str:
+    if not resp or resp.get("status") != "ok":
+        return ""
+    data = resp.get("data")
+    if isinstance(data, str):
+        return _normalize_image_src(data)
+    data = data or {}
+    return _normalize_image_src(
+        data.get("url")
+        or data.get("download_url")
+        or data.get("file")
+        or data.get("file_path")
+        or data.get("path")
+        or ""
+    )
+
+
+async def _resolve_signin_image_source(api, item: dict) -> str:
+    for key in ("url", "path", "file"):
+        src = _normalize_image_src(item.get(key) or "")
+        if src and (key == "url" or _is_direct_signin_image_src(src)):
+            return src
+
+    call = getattr(api, "call", None)
+    tried = set()
+    for token in (item.get("file"), item.get("file_id")):
+        file_token = str(token or "").strip()
+        if not file_token or file_token in tried:
+            continue
+        tried.add(file_token)
+        if callable(call):
+            resp = await call("get_image", {"file": file_token}, timeout=60.0)
+            src = _extract_signin_src_from_resp(resp)
+            if src:
+                return src
+
+    get_file = getattr(api, "get_file", None)
+    for token in (item.get("file_id"), item.get("file")):
+        file_token = str(token or "").strip()
+        if not file_token or not callable(get_file):
+            continue
+        resp = await get_file(file_token, timeout=60.0, retries=1, retry_delay=1.0)
+        src = _extract_signin_src_from_resp(resp)
+        if src:
+            return src
+    return ""
+
+
+def _signin_image_filename(item: dict, user_id: int, src: str = "") -> str:
+    candidates = [
+        item.get("name") or "",
+        item.get("file") or "",
+        item.get("path") or "",
+        src,
+    ]
+    name = ""
+    for raw in candidates:
+        s = _normalize_image_src(raw)
+        if not s:
+            continue
+        s = re.split(r"[?#]", s, maxsplit=1)[0]
+        name = Path(s).name or s
+        if name:
+            break
+    if not name:
+        name = f"signin_{int(user_id)}.jpg"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).stem).strip("._-") or f"signin_{int(user_id)}"
+    ext = Path(name).suffix.lower()
+    if ext not in _SIGNIN_IMAGE_SUFFIXES:
+        ext = ".jpg"
+    return f"{stem}{ext}"
+
+
+async def _download_signin_image(api, ctx, item: dict, handin: HandinService, logsvc: LogService) -> Tuple[bool, str, Optional[Path]]:
+    src = await _resolve_signin_image_source(api, item)
+    if not src:
+        return False, "图片下载链接获取失败，请重新发送。", None
+    expected_size: Optional[int] = None
+    try:
+        raw_size = str(item.get("size") or "").strip()
+        expected_size = int(raw_size) if raw_size else None
+    except Exception:
+        expected_size = None
+    fname = _signin_image_filename(item, ctx.user_id, src)
+    ok, msg, p = await asyncio.to_thread(
+        handin.download_to_inbox,
+        ctx.user_id,
+        fname,
+        src,
+        expected_size,
+        180.0,
+    )
+    if not ok or not p:
+        try:
+            logsvc.log.warning(f"signin image download failed: user={ctx.user_id} msg={msg}")
+        except Exception:
+            pass
+        return False, "图片下载失败，请重新发送。", None
+    return True, "", Path(p)
+
+
+def _signin_get_roster(handin: HandinService) -> List[Tuple[str, str]]:
+    get_roster = getattr(handin, "_get_roster", None)
+    if not callable(get_roster):
+        return []
+    try:
+        return list(get_roster() or [])
+    except Exception:
+        return []
+
+
+def _signin_get_roster_names(handin: HandinService) -> List[str]:
+    get_names = getattr(handin, "_get_roster_names", None)
+    if callable(get_names):
+        try:
+            names = [str(x).strip() for x in list(get_names() or [])]
+            return [x for x in names if x]
+        except Exception:
+            pass
+    names: List[str] = []
+    seen = set()
+    for _, name in _signin_get_roster(handin):
+        nm = str(name or "").strip()
+        if nm and nm not in seen:
+            seen.add(nm)
+            names.append(nm)
+    names.sort(key=lambda s: len(s), reverse=True)
+    return names
+
+
+def _signin_match_roster_name(ctx, handin: HandinService) -> str:
+    text = " ".join([str(getattr(ctx, "card", "") or ""), str(getattr(ctx, "nickname", "") or "")]).strip()
+    if not text:
+        return ""
+    names = _signin_get_roster_names(handin)
+    finder = getattr(handin, "find_roster_name_in_filename", None)
+    if callable(finder):
+        try:
+            found = finder(text, roster_names=names)
+            if isinstance(found, str) and found.strip():
+                return found.strip()
+        except Exception:
+            pass
+    compact = re.sub(r"\s+", "", text)
+    for name in names:
+        if name and (name in text or name in compact):
+            return name
+    return ""
+
+
+def _signin_list_add(values: List[str], value: str) -> None:
+    v = str(value or "").strip()
+    if v and v not in values:
+        values.append(v)
+
+
+def _signin_event_ts(evt: dict) -> float:
+    try:
+        ts = float(evt.get("time") or 0.0)
+    except Exception:
+        ts = 0.0
+    return ts if ts > 0.0 else time.time()
+
+
+def _signin_begin_job(task: dict) -> None:
+    active = int(task.get("active_jobs") or 0) + 1
+    task["active_jobs"] = active
+    event = task.get("idle_event")
+    if not isinstance(event, asyncio.Event):
+        event = asyncio.Event()
+        task["idle_event"] = event
+    event.clear()
+
+
+def _signin_end_job(task: dict) -> None:
+    active = max(0, int(task.get("active_jobs") or 0) - 1)
+    task["active_jobs"] = active
+    if active <= 0:
+        event = task.get("idle_event")
+        if isinstance(event, asyncio.Event):
+            event.set()
+
+
+def _signin_task_deadline_time_text(task_or_ts) -> str:
+    if isinstance(task_or_ts, dict):
+        ts = float(task_or_ts.get("deadline_ts") or time.time())
+    else:
+        ts = float(task_or_ts if task_or_ts is not None else time.time())
+    return _format_hhmmss_from_ts(ts)
+
+
+def _signin_average_image_time_text(res) -> Optional[str]:
+    visual_text = str(getattr(res, "visual_time_text", "") or "").strip()
+    stamp_text = str(getattr(res, "timestamp_time_text", "") or "").strip()
+    if visual_text and stamp_text:
+        return _clock_average_time_text(visual_text, stamp_text)
+    return None
+
+
+def _evaluate_signin_ocr_result(res, deadline_ts: Optional[float] = None, now_ts: Optional[float] = None) -> Optional[str]:
+    visual_text = str(getattr(res, "visual_time_text", "") or "").strip()
+    stamp_text = str(getattr(res, "timestamp_time_text", "") or "").strip()
+    if not visual_text:
+        return "未识别到有效时间，请重新拍摄。"
+    if not stamp_text:
+        return "未读取到图片时间戳，请重新拍摄或发送原图。"
+
+    stamp_diff = _clock_delta_seconds(visual_text, stamp_text)
+    if stamp_diff is None or stamp_diff > _SIGNIN_VISUAL_TIMESTAMP_TOLERANCE_SECONDS:
+        return f"识别时间与图片时间戳相差超过3分钟（识别 {visual_text}，时间戳 {stamp_text}），请重新拍摄。"
+
+    avg_text = _signin_average_image_time_text(res)
+    if not avg_text:
+        return "未识别到有效时间，请重新拍摄。"
+    deadline_text = _signin_task_deadline_time_text(deadline_ts if deadline_ts is not None else now_ts)
+    deadline_diff = _clock_delta_seconds(avg_text, deadline_text)
+    if deadline_diff is None or deadline_diff > _SIGNIN_DEADLINE_TOLERANCE_SECONDS:
+        return f"图片时间与signin截止时间相差超过30分钟（图片平均时间 {avg_text}，截止 {deadline_text}），请重新拍摄。"
+    return None
+
+
+async def _send_signin_creator_notice(api, logsvc: LogService, creator_id: int, text: str) -> None:
+    try:
+        resp = await api.send_private_msg(int(creator_id), text)
+        if resp is not None and not _onebot_resp_ok(resp):
+            logsvc.log.warning(f"signin private notice failed: user={creator_id}, detail={_onebot_resp_detail(resp)}")
+    except Exception as e:
+        try:
+            logsvc.log.warning(f"signin private notice failed: user={creator_id}, err={e}")
+        except Exception:
+            pass
+
+
+def _cancel_signin_deadline_task(task: dict) -> None:
+    scheduled = task.get("deadline_task") if isinstance(task, dict) else None
+    if scheduled is None or not hasattr(scheduled, "done") or not hasattr(scheduled, "cancel"):
+        return
+    try:
+        current = asyncio.current_task()
+    except Exception:
+        current = None
+    try:
+        if scheduled is not current and not scheduled.done():
+            scheduled.cancel()
+    except Exception:
+        pass
+
+
+def _signin_submitted_user_lines(users: Dict[str, dict]) -> List[str]:
+    lines: List[str] = []
+    for i, (uid, item) in enumerate(users.items(), 1):
+        nick = str(item.get("nickname") or uid)
+        name = str(item.get("name") or "").strip()
+        suffix = f"（{name}）" if name else ""
+        lines.append(f"{i}. {nick}{suffix}（QQ {uid}）")
+    return lines
+
+
+async def _finish_signin_task(
+    api,
+    state: BotState,
+    group_id: int,
+    handin: HandinService,
+    logsvc: LogService,
+    task_id: Optional[str] = None,
+) -> bool:
+    gid = int(group_id)
+    task = state.signin_tasks.get(gid)
+    if not isinstance(task, dict):
+        return False
+    if task_id is not None and str(task.get("task_id") or "") != str(task_id):
+        return False
+    if task.get("finalizing"):
+        return False
+    task["closing"] = True
+    task["finalizing"] = True
+    try:
+        deadline_ts = float(task.get("deadline_ts") or 0.0)
+    except Exception:
+        deadline_ts = 0.0
+    grace_until = deadline_ts + _SIGNIN_FINALIZE_GRACE_SECONDS
+    if deadline_ts > 0.0 and time.time() < grace_until:
+        await asyncio.sleep(max(0.0, grace_until - time.time()))
+    while int(task.get("active_jobs") or 0) > 0:
+        event = task.get("idle_event")
+        if isinstance(event, asyncio.Event):
+            try:
+                await asyncio.wait_for(event.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(0.2)
+        if state.signin_tasks.get(gid) is not task:
+            return False
+    state.signin_tasks.pop(gid, None)
+    task["closed"] = True
+    _cancel_signin_deadline_task(task)
+
+    creator_id = int(task.get("creator_id") or 0)
+    roster = _signin_get_roster(handin)
+    roster_names = [str(name or "").strip() for _, name in roster if str(name or "").strip()]
+    submitted_names = set(str(x).strip() for x in list(task.get("submitted_names") or []) if str(x).strip())
+    users = task.get("submitted_users") if isinstance(task.get("submitted_users"), dict) else {}
+
+    lines = [
+        f"signin任务已截止（群 {gid}）",
+        f"截止时间：{_format_signin_deadline(float(task.get('deadline_ts') or time.time()))}",
+    ]
+    if roster_names:
+        missing = [name for name in roster_names if name not in submitted_names]
+        lines.append(f"已签到：{len(submitted_names)}/{len(roster_names)}")
+        if missing:
+            lines.append(f"未签到名单（{len(missing)}）：")
+            for i, name in enumerate(missing, 1):
+                lines.append(f"{i}. {name}")
+        else:
+            lines.append("未签到名单：无")
+        unmatched = [item for item in users.values() if not str(item.get("name") or "").strip()]
+        if unmatched:
+            lines.append("")
+            lines.append("未匹配名册的已签到用户：")
+            for item in unmatched:
+                nick = str(item.get("nickname") or item.get("qq") or "")
+                qq = str(item.get("qq") or "")
+                lines.append(f"- {nick}（QQ {qq}）")
+    else:
+        lines.append("未读取到班级名册，无法核对未签到名单。")
+        user_lines = _signin_submitted_user_lines(users)
+        lines.append(f"已收到签到（{len(user_lines)}）：")
+        lines.extend(user_lines or ["无"])
+
+    if creator_id > 0:
+        await _send_signin_creator_notice(api, logsvc, creator_id, "\n".join(lines))
+    for uid, item in list(state.pending_signin_name_input.items()):
+        if isinstance(item, dict) and int(item.get("group_id") or 0) == gid and str(item.get("task_id") or "") == str(task.get("task_id") or ""):
+            state.pending_signin_name_input.pop(uid, None)
+    return True
+
+
+def _schedule_signin_deadline(api, state: BotState, group_id: int, handin: HandinService, logsvc: LogService, task_id: str) -> None:
+    task = state.signin_tasks.get(int(group_id))
+    if not isinstance(task, dict):
+        return
+    deadline_ts = float(task.get("deadline_ts") or 0.0)
+
+    async def _runner() -> None:
+        try:
+            while True:
+                delay = deadline_ts - time.time()
+                if delay <= 0:
+                    break
+                await asyncio.sleep(min(float(delay), 3600.0))
+            await _finish_signin_task(api, state, int(group_id), handin, logsvc, task_id=task_id)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            try:
+                logsvc.log.warning(f"signin deadline task failed: group={group_id}, err={e}")
+            except Exception:
+                pass
+
+    task["deadline_task"] = asyncio.create_task(_runner())
+
+
+async def _record_signin_failure(api, ctx, logsvc: LogService, task: dict, reason: str) -> None:
+    uid = str(ctx.user_id)
+    failures = task.setdefault("failures", {})
+    if not isinstance(failures, dict):
+        failures = {}
+        task["failures"] = failures
+    reasons = list(failures.get(uid) or [])
+    reasons.append(str(reason or "提交失败，请重新拍摄。"))
+    failures[uid] = reasons[-2:]
+
+    if len(reasons) < 2:
+        await reply(api, ctx, failures[uid][-1], logsvc)
+        return
+
+    await reply(api, ctx, "多次失败已联系任务创建人，请重新拍摄后再提交。", logsvc)
+    notified = task.setdefault("failure_notified", [])
+    if uid in notified:
+        return
+    notified.append(uid)
+    creator_id = int(task.get("creator_id") or 0)
+    if creator_id <= 0:
+        return
+    display = str(getattr(ctx, "card", "") or getattr(ctx, "nickname", "") or ctx.user_id)
+    lines = [
+        "signin提交多次失败：",
+        f"用户：{display}",
+        f"QQ：{ctx.user_id}",
+        "失败原因：",
+    ]
+    for i, one in enumerate(failures[uid], 1):
+        lines.append(f"{i}. {one}")
+    await _send_signin_creator_notice(api, logsvc, creator_id, "\n".join(lines))
+
+
+def _select_private_signin_task(state: BotState, ctx) -> Tuple[Optional[int], Optional[dict], str]:
+    if not str(getattr(ctx, "scene", "") or "").startswith("private"):
+        return None, None, ""
+    ctx_gid = getattr(ctx, "group_id", None)
+    if ctx_gid is not None:
+        try:
+            gid = int(ctx_gid)
+        except Exception:
+            gid = 0
+        task = state.signin_tasks.get(gid)
+        if isinstance(task, dict) and not task.get("closed"):
+            return gid, task, ""
+
+    items: List[Tuple[int, dict]] = []
+    for gid, task in state.signin_tasks.items():
+        if isinstance(task, dict) and not task.get("closed"):
+            items.append((int(gid), task))
+    if not items:
+        return None, None, ""
+    if len(items) == 1:
+        return items[0][0], items[0][1], ""
+    items.sort(key=lambda pair: float(pair[1].get("deadline_ts") or 0.0))
+    return None, None, "当前有多个signin任务，无法判断这张图片属于哪一个；请通过对应群的临时会话发送，或联系任务创建人。"
+
+
+def _record_signin_name(task: dict, user_id: int, nickname: str, name: str, pend: dict) -> None:
+    uid = str(user_id)
+    clean_name = str(name or "").strip()
+    submitted_names = task.setdefault("submitted_names", [])
+    if isinstance(submitted_names, list):
+        _signin_list_add(submitted_names, clean_name)
+    submitted_users = task.setdefault("submitted_users", {})
+    if isinstance(submitted_users, dict):
+        submitted_users[uid] = {
+            "nickname": str(nickname or uid),
+            "qq": uid,
+            "name": clean_name,
+            "time": str(pend.get("time") or ""),
+            "image_time": str(pend.get("image_time") or ""),
+            "source": str(pend.get("source") or ""),
+            "ts": float(pend.get("ts") or time.time()),
+        }
+    task.setdefault("failures", {}).pop(uid, None)
+
+
+async def _handle_private_signin_name_input(api, ctx, text: str, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
+    if not str(getattr(ctx, "scene", "") or "").startswith("private"):
+        return False
+    pend = state.pending_signin_name_input.get(int(ctx.user_id))
+    if not isinstance(pend, dict):
+        return False
+    t = unicodedata.normalize("NFKC", str(text or "")).strip()
+    if not t:
+        return False
+    logsvc.log_in(ctx, t)
+    if t in ("0", "取消", "/cancel", "／cancel"):
+        state.pending_signin_name_input.pop(int(ctx.user_id), None)
+        await reply(api, ctx, "已取消本次signin姓名记录，请重新发送图片提交。", logsvc)
+        return True
+    try:
+        gid = int(pend.get("group_id") or 0)
+    except Exception:
+        gid = 0
+    task = state.signin_tasks.get(gid)
+    if not isinstance(task, dict) or str(task.get("task_id") or "") != str(pend.get("task_id") or ""):
+        state.pending_signin_name_input.pop(int(ctx.user_id), None)
+        await reply(api, ctx, "对应的signin任务已结束，请联系任务创建人。", logsvc)
+        return True
+
+    roster_name = ""
+    finder = getattr(handin, "find_roster_name_in_filename", None)
+    if callable(finder):
+        try:
+            roster_name = str(finder(t, roster_names=_signin_get_roster_names(handin)) or "").strip()
+        except Exception:
+            roster_name = ""
+    name = roster_name or t
+    display = str(getattr(ctx, "nickname", "") or ctx.user_id)
+    _record_signin_name(task, int(ctx.user_id), display, name, pend)
+    state.pending_signin_name_input.pop(int(ctx.user_id), None)
+    await reply(api, ctx, f"signin成功，已记录姓名：{name}", logsvc)
+    return True
+
+
+async def _handle_signin_image(api, ctx, evt: dict, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
+    if not str(getattr(ctx, "scene", "") or "").startswith("private"):
+        return False
+    gid, task, select_msg = _select_private_signin_task(state, ctx)
+    if select_msg:
+        if _extract_signin_image_items(evt):
+            await reply(api, ctx, select_msg, logsvc)
+            return True
+        return False
+    if gid is None or not isinstance(task, dict):
+        return False
+    images = _extract_signin_image_items(evt)
+    if not images:
+        return False
+
+    logsvc.log_in(ctx, "[signin image]")
+    now_ts = time.time()
+    deadline_ts = float(task.get("deadline_ts") or 0.0)
+    event_ts = _signin_event_ts(evt)
+    if event_ts > deadline_ts:
+        if not task.get("finalizing"):
+            asyncio.create_task(_finish_signin_task(api, state, int(gid), handin, logsvc, task_id=str(task.get("task_id") or "")))
+        await reply(api, ctx, "signin任务已截止。", logsvc)
+        return True
+
+    _signin_begin_job(task)
+    try:
+        try:
+            from signin_ocr import recognize_led_time_from_path
+        except Exception as e:
+            logsvc.log.warning(f"signin ocr import failed: err={e}")
+            await reply(api, ctx, "signin识别模块暂不可用，请稍后重试。", logsvc)
+            return True
+
+        ok, msg, path = await _download_signin_image(api, ctx, images[0], handin, logsvc)
+        if not ok or path is None:
+            await _record_signin_failure(api, ctx, logsvc, task, msg)
+            return True
+
+        try:
+            res = await asyncio.to_thread(recognize_led_time_from_path, path)
+        except Exception as e:
+            logsvc.log.warning(f"signin ocr failed: path={path} err={e}")
+            await _record_signin_failure(api, ctx, logsvc, task, "未识别到有效时间，请重新拍摄。")
+            return True
+        finally:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        reason = _evaluate_signin_ocr_result(res, deadline_ts=deadline_ts)
+        if reason:
+            await _record_signin_failure(api, ctx, logsvc, task, reason)
+            return True
+
+        uid = str(ctx.user_id)
+        image_time = _signin_average_image_time_text(res) or str(getattr(res, "time_text", "") or "")
+        state.pending_signin_name_input[int(ctx.user_id)] = {
+            "group_id": int(gid),
+            "task_id": str(task.get("task_id") or ""),
+            "time": str(getattr(res, "time_text", "") or ""),
+            "image_time": image_time,
+            "source": str(getattr(res, "source", "") or ""),
+            "ts": now_ts,
+        }
+        source = str(getattr(res, "source", "") or "")
+        await reply(api, ctx, f"时间校验通过：{image_time}\n请回复你的姓名完成signin记录。", logsvc)
+        return True
+    finally:
+        _signin_end_job(task)
 
 
 def _parse_count_names(text: str) -> List[str]:
@@ -1277,396 +2017,6 @@ def _extract_urls_from_evt(evt: dict) -> List[str]:
         _push(str(msg or ""))
 
     return urls
-
-
-def _parse_cq_kvs(raw: str) -> Dict[str, str]:
-    data: Dict[str, str] = {}
-    for kv in str(raw or "").split(","):
-        if "=" not in kv:
-            continue
-        k, v = kv.split("=", 1)
-        key = str(k).strip().lower()
-        if not key:
-            continue
-        data[key] = html.unescape(str(v).strip())
-    return data
-
-
-def _normalize_image_src(raw: str) -> str:
-    s = html.unescape(str(raw or "").strip())
-    # 某些客户端会把 query 分隔符编码成 &amp;，这里恢复为 &
-    s = s.replace("&amp;", "&")
-    return s
-
-
-def _extract_images_from_evt(evt: dict) -> List[dict]:
-    out: List[dict] = []
-    seen = set()
-
-    def _push(item: dict) -> None:
-        url = _normalize_image_src(item.get("url") or "")
-        file = _normalize_image_src(item.get("file") or "")
-        fid = str(item.get("file_id") or "").strip()
-        key = (url, file, fid)
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(
-            {
-                "url": url,
-                "file": file,
-                "file_id": fid,
-                "name": str(item.get("name") or "").strip(),
-                "size": str(item.get("size") or "").strip(),
-            }
-        )
-
-    msg = evt.get("message")
-    if isinstance(msg, list):
-        for seg in msg:
-            if not isinstance(seg, dict):
-                continue
-            tp = str(seg.get("type") or "").strip().lower()
-            if tp != "image":
-                continue
-            data = seg.get("data") or {}
-            _push(
-                {
-                    "url": data.get("url") or "",
-                    "file": data.get("file") or "",
-                    "file_id": data.get("file_id") or data.get("id") or "",
-                    "name": data.get("name") or data.get("file") or "",
-                    "size": data.get("file_size") or data.get("size") or "",
-                }
-            )
-
-    raw = str(evt.get("raw_message") or "")
-    for m in _CQ_IMAGE_RE.findall(raw):
-        kvs = _parse_cq_kvs(m)
-        _push(
-            {
-                "url": kvs.get("url") or "",
-                "file": kvs.get("file") or "",
-                "file_id": kvs.get("file_id") or kvs.get("id") or "",
-                "name": kvs.get("name") or kvs.get("file") or "",
-                "size": kvs.get("file_size") or kvs.get("size") or "",
-            }
-        )
-
-    return out
-
-
-def _sanitize_temp_image_name(raw_name: str, fallback_stem: str = "img") -> str:
-    nm = str(raw_name or "").strip()
-    p = Path(nm)
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", (p.stem or fallback_stem)).strip("._-") or fallback_stem
-    ext = (p.suffix or "").lower()
-    if ext not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
-        ext = ".jpg"
-    return f"{stem}{ext}"
-
-
-def _safe_delete_ocr_temp_file(path: Path, logsvc: Optional[LogService] = None) -> None:
-    try:
-        rp = Path(path).resolve()
-        root = _BLACKBOARD_OCR_TEMP_DIR
-        if rp != root and root not in rp.parents:
-            if logsvc is not None:
-                logsvc.log.warning(f"跳过清理非识别临时目录文件：{rp}")
-            return
-        if rp.exists() and rp.is_file():
-            rp.unlink(missing_ok=True)
-    except Exception as e:
-        if logsvc is not None:
-            logsvc.log.warning(f"识别临时文件清理失败：path={path} err={e}")
-
-
-def _cleanup_ocr_temp_files(paths: List[Path], logsvc: Optional[LogService] = None) -> None:
-    for p in paths:
-        _safe_delete_ocr_temp_file(Path(p), logsvc=logsvc)
-
-
-def _resolve_local_source_path(src: str) -> Optional[Path]:
-    raw = str(src or "").strip()
-    if not raw:
-        return None
-
-    if raw.startswith("file:///"):
-        u = urllib.parse.urlsplit(raw)
-        local = urllib.parse.unquote(u.path)
-        if local.startswith("/") and len(local) >= 4 and local[2] == ":":
-            local = local[1:]
-        raw = local
-
-    cdir = str(NAPCAT_TEMP_CONTAINER_DIR).rstrip("/")
-    temp_root = Path(NAPCAT_TEMP_HOST_DIR).resolve()
-
-    if raw.startswith("/"):
-        if raw.startswith(cdir + "/") or raw == cdir:
-            rel = raw[len(cdir):].lstrip("/\\")
-            cand = (temp_root / rel).resolve()
-        else:
-            cand = (temp_root / Path(raw).name).resolve()
-        if cand != temp_root and temp_root not in cand.parents:
-            return None
-        return cand
-
-    win_abs = re.match(r"^[A-Za-z]:[\\/]", raw) is not None
-    if win_abs:
-        cand = Path(raw).resolve()
-        if cand != temp_root and temp_root not in cand.parents:
-            return None
-        return cand
-
-    return None
-
-
-async def _resolve_image_source(api, entry: dict) -> str:
-    src = _normalize_image_src(entry.get("url") or "")
-    if src:
-        return src
-
-    file_id = str(entry.get("file_id") or "").strip()
-    if file_id:
-        resp = await api.get_file(file_id, timeout=60.0, retries=1, retry_delay=1.0)
-        if resp and resp.get("status") == "ok":
-            data = resp.get("data")
-            if isinstance(data, str):
-                src = _normalize_image_src(data)
-            else:
-                data = data or {}
-                src = _normalize_image_src(
-                    data.get("url")
-                    or data.get("download_url")
-                    or data.get("file")
-                    or data.get("file_path")
-                    or data.get("path")
-                    or ""
-                )
-            if src:
-                return src
-
-    file_val = _normalize_image_src(entry.get("file") or "")
-    if file_val.startswith("http://") or file_val.startswith("https://") or file_val.startswith("file:///") or file_val.startswith("/"):
-        return file_val
-
-    if file_val:
-        resp2 = await api.call("get_image", {"file": file_val}, timeout=30.0)
-        if resp2 and resp2.get("status") == "ok":
-            data2 = resp2.get("data")
-            if isinstance(data2, str):
-                src2 = _normalize_image_src(data2)
-            else:
-                data2 = data2 or {}
-                src2 = _normalize_image_src(data2.get("url") or data2.get("file") or "")
-            if src2:
-                return src2
-
-    return ""
-
-
-async def _download_image_for_ocr(api, entry: dict, logsvc: Optional[LogService] = None) -> Optional[Path]:
-    src = await _resolve_image_source(api, entry)
-    if not src:
-        return None
-
-    _BLACKBOARD_OCR_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    name = _sanitize_temp_image_name(entry.get("name") or entry.get("file") or "image")
-    dst = _BLACKBOARD_OCR_TEMP_DIR / f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}_{name}"
-    dst = dst.resolve()
-
-    try:
-        if src.startswith("http://") or src.startswith("https://"):
-            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-
-            def _http_download() -> None:
-                with urllib.request.urlopen(req, timeout=45.0) as resp, open(dst, "wb") as f:
-                    shutil.copyfileobj(resp, f)
-
-            await asyncio.to_thread(_http_download)
-            return dst
-
-        local_src = _resolve_local_source_path(src)
-        if local_src and local_src.exists() and local_src.is_file():
-            await asyncio.to_thread(shutil.copy2, local_src, dst)
-            return dst
-    except (urllib.error.URLError, OSError) as e:
-        # 图片下载链接存在时效/转义差异，属于可预期失败，不刷告警。
-        _safe_delete_ocr_temp_file(dst, logsvc=logsvc)
-        return None
-    except Exception as e:
-        if logsvc is not None:
-            logsvc.log.warning(f"题号识别图片下载出现异常：src={src[:120]} err={e}")
-        _safe_delete_ocr_temp_file(dst, logsvc=logsvc)
-        return None
-
-    return None
-
-
-def _load_blackboard_ocr(logsvc: Optional[LogService] = None):
-    global _BLACKBOARD_OCR_IMPORTED, _BLACKBOARD_OCR_IMPORT_ERROR, _BLACKBOARD_OCR_MODULE
-    if _BLACKBOARD_OCR_IMPORTED:
-        return _BLACKBOARD_OCR_MODULE
-
-    try:
-        import blackboard_ocr as _mod
-
-        _BLACKBOARD_OCR_MODULE = _mod
-        _BLACKBOARD_OCR_IMPORT_ERROR = None
-    except Exception as e:
-        _BLACKBOARD_OCR_MODULE = None
-        _BLACKBOARD_OCR_IMPORT_ERROR = str(e)
-        if logsvc is not None:
-            logsvc.log.warning(f"黑板题号识别模块加载失败：{e}")
-    _BLACKBOARD_OCR_IMPORTED = True
-    return _BLACKBOARD_OCR_MODULE
-
-
-def _retry_low_count_ocr_with_enhancement(ocr_mod, image_path: Path) -> Optional[dict]:
-    """
-    首次题号条数过少时，做轻量图像增强后重试一次识别。
-    仅作为兜底，不影响正常图片主流程。
-    """
-    try:
-        import cv2  # type: ignore
-    except Exception:
-        return None
-
-    if not hasattr(ocr_mod, "recognize_homework_from_array"):
-        return None
-
-    img = cv2.imread(str(image_path))
-    if img is None or getattr(img, "size", 0) == 0:
-        return None
-
-    h, w = img.shape[:2]
-    candidates = []
-
-    # 轻裁切：去掉边缘噪声与畸变，提升分隔符可读性。
-    if h >= 240 and w >= 240:
-        y1 = int(h * 0.06)
-        y2 = int(h * 0.96)
-        x1 = int(w * 0.05)
-        x2 = int(w * 0.98)
-        if (y2 - y1) >= 120 and (x2 - x1) >= 120:
-            cropped = img[y1:y2, x1:x2]
-            candidates.append(cropped)
-
-    # 轻提饱和度：对粉笔/底色对比弱的场景有帮助。
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    sat = hsv.copy()
-    sat[..., 1] = cv2.add(sat[..., 1], 15)
-    sat_img = cv2.cvtColor(sat, cv2.COLOR_HSV2BGR)
-    candidates.append(sat_img)
-
-    # 裁切 + 提饱和度
-    if h >= 240 and w >= 240:
-        y1 = int(h * 0.06)
-        y2 = int(h * 0.96)
-        x1 = int(w * 0.05)
-        x2 = int(w * 0.98)
-        if (y2 - y1) >= 120 and (x2 - x1) >= 120:
-            crop2 = img[y1:y2, x1:x2]
-            hsv2 = cv2.cvtColor(crop2, cv2.COLOR_BGR2HSV)
-            sat2 = hsv2.copy()
-            sat2[..., 1] = cv2.add(sat2[..., 1], 15)
-            sat2_img = cv2.cvtColor(sat2, cv2.COLOR_HSV2BGR)
-            candidates.append(sat2_img)
-            # 轻度提对比：帮助点号/分隔符从粘连字符中分离。
-            candidates.append(cv2.convertScaleAbs(sat2_img, alpha=1.3, beta=8))
-
-    best_result = None
-    best_count = -1
-    for cand in candidates:
-        try:
-            res = ocr_mod.recognize_homework_from_array(cand)
-        except Exception:
-            continue
-        if not bool(res.get("is_green_blackboard")):
-            continue
-        cnt = len(ocr_mod.format_assignment_lines(list(res.get("assignments") or [])))
-        if cnt > best_count:
-            best_count = cnt
-            best_result = res
-
-    return best_result
-
-
-async def _handle_blackboard_ocr_images(api, ctx, evt: dict, logsvc: LogService) -> bool:
-    if not bool(ENABLE_OCR):
-        return False
-    images = _extract_images_from_evt(evt)
-    if not images:
-        return False
-
-    ocr_mod = _load_blackboard_ocr(logsvc=logsvc)
-    if ocr_mod is None:
-        return False
-    try:
-        # 避免长驻进程使用旧版识别逻辑，按需热刷新模块。
-        ocr_mod = importlib.reload(ocr_mod)
-    except Exception as e:
-        if logsvc is not None:
-            logsvc.log.warning(f"黑板题号识别模块热刷新失败：{e}")
-
-    temp_files: List[Path] = []
-    has_green_board = False
-    merged_lines: List[str] = []
-    seen_lines = set()
-
-    try:
-        for img in images:
-            p = await _download_image_for_ocr(api, img, logsvc=logsvc)
-            if p is None:
-                continue
-            temp_files.append(p)
-
-            try:
-                result = await asyncio.to_thread(ocr_mod.recognize_homework_from_path, p)
-            except Exception as e:
-                logsvc.log.warning(f"黑板题号识别执行失败：path={p} err={e}")
-                continue
-
-            if not bool(result.get("is_green_blackboard")):
-                continue
-
-            has_green_board = True
-            lines = ocr_mod.format_assignment_lines(list(result.get("assignments") or []))
-            if len(lines) < 3:
-                # 低条数图片：尝试轻量增强后重扫一次，取更优结果。
-                retry_result = await asyncio.to_thread(_retry_low_count_ocr_with_enhancement, ocr_mod, p)
-                if retry_result is not None:
-                    retry_lines = ocr_mod.format_assignment_lines(list(retry_result.get("assignments") or []))
-                    if len(retry_lines) > len(lines):
-                        lines = retry_lines
-                    if len(lines) < 3 and retry_lines:
-                        # 若单次结果仍偏少，合并两次识别结果补全题号覆盖面。
-                        merged_try = []
-                        seen_try = set()
-                        for x in list(lines) + list(retry_lines):
-                            if x in seen_try:
-                                continue
-                            seen_try.add(x)
-                            merged_try.append(x)
-                        lines = merged_try
-            for line in lines:
-                if line in seen_lines:
-                    continue
-                seen_lines.add(line)
-                merged_lines.append(line)
-    finally:
-        _cleanup_ocr_temp_files(temp_files, logsvc=logsvc)
-
-    if not has_green_board:
-        return False
-
-    # 题号过少时不输出，避免误触发场景下产生干扰回复
-    if len(merged_lines) < 3:
-        return False
-
-    out = "题号识别结果：\n" + "\n".join(merged_lines)
-    await reply(api, ctx, out, logsvc)
-    return True
 
 
 async def _resolve_src_by_get_file_for_notice(
@@ -3087,7 +3437,13 @@ async def _handle_pre_dispatch_state(
     filesvc: FileService,
     aisvc: Optional["AIService"] = None,
 ):
+    handled = await _handle_signin_image(api, ctx, evt, logsvc, state, handin)
+    if handled:
+        return True
     if ctx.scene.startswith("private"):
+        handled = await _handle_private_signin_name_input(api, ctx, text, logsvc, state, handin)
+        if handled:
+            return True
         handled = await _handle_private_file(api, ctx, evt, logsvc, state, handin)
         if handled:
             return True
@@ -3368,6 +3724,50 @@ async def _handle_explicit_command(
         session["ts"] = time.time()
         await reply(api, ctx, f"已移除：{removed}\n当前已提交 {len(names)} 人。可发送 /countlist 查看。", logsvc)
         return
+    if cmd == "signin":
+        if ctx.level < 2:
+            await reply(api, ctx, "权限不足：/signin 仅对 2 级及以上开放。", logsvc)
+            return
+        if ctx.scene != "group" or ctx.group_id is None:
+            await reply(api, ctx, "/signin 只能在群聊中使用。", logsvc)
+            return
+        parsed = _parse_signin_deadline_hhmm(rest)
+        if parsed is None:
+            await reply(api, ctx, "用法：/signin 截止时间\n例如：/signin 18:30（冒号中英文都可以；若该时间已过，将自动设为下一天）", logsvc)
+            return
+        hh, mm = parsed
+        gid = int(ctx.group_id)
+        old = state.signin_tasks.get(gid)
+        replaced = isinstance(old, dict)
+        if replaced:
+            _cancel_signin_deadline_task(old)
+            for uid, item in list(state.pending_signin_name_input.items()):
+                if isinstance(item, dict) and int(item.get("group_id") or 0) == gid:
+                    state.pending_signin_name_input.pop(uid, None)
+        now_ts = time.time()
+        deadline_ts = _signin_deadline_ts(hh, mm, now_ts=now_ts)
+        task_id = f"{gid}:{int(now_ts * 1000)}:{int(ctx.user_id)}"
+        state.signin_tasks[gid] = {
+            "task_id": task_id,
+            "group_id": gid,
+            "creator_id": int(ctx.user_id),
+            "creator_nickname": str(getattr(ctx, "card", "") or getattr(ctx, "nickname", "") or ctx.user_id),
+            "created_ts": now_ts,
+            "deadline_ts": deadline_ts,
+            "submitted_names": [],
+            "submitted_users": {},
+            "failures": {},
+            "failure_notified": [],
+        }
+        _schedule_signin_deadline(api, state, gid, handin, logsvc, task_id)
+        prefix = "已替换原有signin任务。" if replaced else "signin任务已创建。"
+        await reply(
+            api,
+            ctx,
+            f"{prefix}\n截止时间：{_format_signin_deadline(deadline_ts)}\n请私聊发送包含带有教室时间牌的图片完成signin。",
+            logsvc,
+        )
+        return
     if cmd in ("help", "h"):
         lines = [
             "命令速览：",
@@ -3381,6 +3781,7 @@ async def _handle_explicit_command(
         ]
         if ctx.level >= 2:
             lines.append("/autoat  单条消息依次 @ 当前群全部成员（仅群聊）")
+            lines.append("/signin 截止时间  创建signin任务（群内创建，私聊发图提交）")
         if ctx.level >= 3:
             lines.extend([
                 "",
@@ -3934,8 +4335,6 @@ async def dispatch(
     _sweep_bot_state_ttl(state)
     await _ensure_group_context_and_schedule_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
     if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc, aisvc):
-        return
-    if await _handle_blackboard_ocr_images(api, ctx, evt, logsvc):
         return
     t = (text or "").strip()
     if not t:
