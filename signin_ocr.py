@@ -127,9 +127,19 @@ def _has_led_red_candidate(img: np.ndarray) -> bool:
 
 def _recognize_visual_time(img: np.ndarray) -> SigninOcrResult:
     candidates: list[_ParsedCandidate] = []
-    ocr_boxes: list[tuple[float, tuple[int, int, int, int]]] = []
+    panel_ocr_boxes: list[tuple[float, tuple[int, int, int, int]]] = []
+    red_ocr_boxes: list[tuple[float, tuple[int, int, int, int]]] = []
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     panel_mask = _red_mask_hsv(img, 80, 80)
+
+    panel_boxes = _black_panel_frame_candidate_boxes(img, gray, panel_mask)[:3]
+    for panel_score, panel_box in panel_boxes:
+        for sat_min, val_min in _RED_THRESHOLDS:
+            mask = panel_mask if (sat_min, val_min) == (80, 80) else _red_mask_hsv(img, sat_min, val_min)
+            candidate = _parse_panel_candidate_mask(mask, panel_box, panel_score)
+            if candidate is not None:
+                candidates.append(candidate)
+        panel_ocr_boxes.append((panel_score + 1.2, panel_box))
 
     for sat_min, val_min in _RED_THRESHOLDS:
         mask = _red_mask_hsv(img, sat_min, val_min)
@@ -139,16 +149,16 @@ def _recognize_visual_time(img: np.ndarray) -> SigninOcrResult:
             if candidate is not None:
                 candidates.append(candidate)
             if box_score >= 1.15:
-                ocr_boxes.append((box_score, box))
-
-    for panel_score, panel_box in _black_panel_candidate_boxes(img, gray, panel_mask):
-        candidate = _parse_candidate_mask(panel_mask, panel_box, panel_score)
-        if candidate is not None and candidate.score >= -0.5:
-            candidates.append(candidate)
-        ocr_boxes.append((panel_score + 1.2, panel_box))
+                red_ocr_boxes.append((box_score, box))
 
     best = _select_consensus_candidate(candidates)
-    if best is None or best.score < -3.0:
+    if best is not None and best.confidence >= 0.90:
+        return SigninOcrResult(best.time_text, best.confidence, "visual", best.reason)
+    if best is None or best.confidence < 0.40 or best.score < -3.0:
+        ocr_boxes = red_ocr_boxes
+    else:
+        ocr_boxes = panel_ocr_boxes[:1] + red_ocr_boxes[:1]
+    if ocr_boxes:
         candidates.extend(_recognize_ocr_candidates(img, ocr_boxes))
         best = _select_consensus_candidate(candidates)
 
@@ -315,6 +325,93 @@ def _black_panel_candidate_boxes(
     return out
 
 
+def _black_panel_frame_candidate_boxes(
+    img: np.ndarray,
+    gray: np.ndarray,
+    red_mask: np.ndarray,
+) -> list[tuple[float, tuple[int, int, int, int]]]:
+    count, _labels, stats, centroids = cv2.connectedComponentsWithStats(red_mask, 8)
+    comps = []
+    for i in range(1, count):
+        x, y, w, h, area = [int(v) for v in stats[i]]
+        if area < 20 or h < 8 or w < 2:
+            continue
+        comps.append((x, y, w, h, area, float(centroids[i][0]), float(centroids[i][1])))
+
+    h_img, w_img = red_mask.shape[:2]
+    boxes: list[tuple[float, tuple[int, int, int, int]]] = []
+    for comp in comps:
+        _x, _y, _w, h, _area, _cx, cy = comp
+        row = sorted([c for c in comps if abs(c[6] - cy) <= max(18.0, h * 0.90)], key=lambda c: c[0])
+        if len(row) < 3:
+            continue
+
+        x1 = min(c[0] for c in row)
+        y1 = min(c[1] for c in row)
+        x2 = max(c[0] + c[2] for c in row)
+        y2 = max(c[1] + c[3] for c in row)
+        span = x2 - x1
+        height = y2 - y1
+        if span < 80 or height < 18:
+            continue
+
+        pad_x = int(round(span * 0.80))
+        pad_y = int(round(height * 1.35))
+        sx1 = max(0, x1 - pad_x)
+        sy1 = max(0, y1 - pad_y)
+        sx2 = min(w_img, x2 + pad_x)
+        sy2 = min(h_img, y2 + pad_y)
+        if sx2 <= sx1 or sy2 <= sy1:
+            continue
+
+        roi = gray[sy1:sy2, sx1:sx2]
+        dark = cv2.inRange(roi, 0, 115)
+        kernel_w = max(15, int(round(span * 0.08)))
+        kernel_h = max(9, int(round(height * 0.45)))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, kernel_h))
+        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel, iterations=1)
+        contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        red_center_x = (x1 + x2) * 0.5
+        red_center_y = (y1 + y2) * 0.5
+        for cnt in contours:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            bx += sx1
+            by += sy1
+            if bw < span * 1.05 or bh < height * 1.05:
+                continue
+            if not (bx <= red_center_x <= bx + bw and by <= red_center_y <= by + bh):
+                continue
+            aspect = float(bw) / float(max(bh, 1))
+            if not (1.8 <= aspect <= 8.5):
+                continue
+            rel_size = max(float(bw) / float(w_img), float(bh) / float(h_img))
+            if rel_size > 0.60:
+                continue
+
+            panel_gray = gray[by : by + bh, bx : bx + bw]
+            panel_red = red_mask[by : by + bh, bx : bx + bw]
+            dark_ratio = float((panel_gray < 115).mean()) if panel_gray.size else 0.0
+            red_count = int(cv2.countNonZero(panel_red))
+            red_density = float(red_count) / float(max(bw * bh, 1))
+            if dark_ratio < 0.28 or red_count < 120:
+                continue
+
+            score = dark_ratio * 2.8 + red_density * 10.0
+            score += math.exp(-((aspect - 4.6) / 2.6) ** 2) * 1.2
+            score -= max(0.0, rel_size - 0.45) * 3.0
+            boxes.append((score + 0.8, _expand_box((bx, by, bw, bh), w_img, h_img, 0.22)))
+
+    out: list[tuple[float, tuple[int, int, int, int]]] = []
+    for score, box in sorted(boxes, key=lambda item: item[0], reverse=True):
+        if any(_box_iou(box, old_box) >= 0.55 for _old_score, old_box in out):
+            continue
+        out.append((score, box))
+        if len(out) >= 8:
+            break
+    return out
+
+
 def _expand_box(box: tuple[int, int, int, int], img_w: int, img_h: int, ratio: float) -> tuple[int, int, int, int]:
     x, y, w, h = box
     px = int(round(w * ratio))
@@ -355,7 +452,8 @@ def _parse_candidate_mask(mask: np.ndarray, box: tuple[int, int, int, int], box_
         return None
 
     best: Optional[_ParsedCandidate] = None
-    for variant in (crop, _deskew_red_crop(crop)):
+    tight_crop = _trim_red_crop(crop)
+    for variant in (tight_crop, _deskew_red_crop(tight_crop), crop, _deskew_red_crop(crop)):
         if cv2.countNonZero(variant) < 80:
             continue
         for digit_width_factor in (0.55, 0.62, 0.68, 0.75, 0.82):
@@ -372,6 +470,40 @@ def _parse_candidate_mask(mask: np.ndarray, box: tuple[int, int, int, int], box_
             if best is None or candidate.score > best.score:
                 best = candidate
     return best
+
+
+def _parse_panel_candidate_mask(
+    mask: np.ndarray,
+    box: tuple[int, int, int, int],
+    box_score: float = 0.0,
+) -> Optional[_ParsedCandidate]:
+    x, y, w, h = box
+    crop = mask[y : y + h, x : x + w]
+    if cv2.countNonZero(crop) < 80:
+        return None
+
+    best = _parse_candidate_mask(mask, box, box_score)
+    for led_box in _candidate_boxes_from_mask(crop):
+        candidate = _parse_candidate_mask(crop, led_box, box_score + 0.4)
+        if candidate is not None and (best is None or candidate.score > best.score):
+            best = candidate
+    return best
+
+
+def _trim_red_crop(crop: np.ndarray, pad_ratio: float = 0.08) -> np.ndarray:
+    ys, xs = np.where(crop > 0)
+    if len(xs) < 20:
+        return crop
+    h, w = crop.shape[:2]
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    pad_x = max(1, int(round((x2 - x1) * pad_ratio)))
+    pad_y = max(1, int(round((y2 - y1) * pad_ratio)))
+    x1 = max(0, x1 - pad_x)
+    x2 = min(w, x2 + pad_x)
+    y1 = max(0, y1 - pad_y)
+    y2 = min(h, y2 + pad_y)
+    return crop[y1:y2, x1:x2]
 
 
 def _deskew_red_crop(crop: np.ndarray) -> np.ndarray:
@@ -456,6 +588,18 @@ def _rank_digit(win: np.ndarray) -> list[tuple[int, float]]:
     if win.size == 0:
         return [(0, -9.0)]
     active_mask = win > 0
+    ys, xs = np.where(active_mask)
+    if len(xs) == 0:
+        return [(0, -9.0)]
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    pad_x = max(1, int(round((x2 - x1) * 0.08)))
+    pad_y = max(1, int(round((y2 - y1) * 0.08)))
+    x1 = max(0, x1 - pad_x)
+    x2 = min(active_mask.shape[1], x2 + pad_x)
+    y1 = max(0, y1 - pad_y)
+    y2 = min(active_mask.shape[0], y2 + pad_y)
+    active_mask = active_mask[y1:y2, x1:x2]
     ys, xs = np.where(active_mask)
     if len(xs) == 0:
         return [(0, -9.0)]
