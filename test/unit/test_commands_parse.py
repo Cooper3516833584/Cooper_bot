@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import time
 from types import SimpleNamespace
 
@@ -46,6 +47,18 @@ def test_parse_semantic_find_query() -> None:
 def test_parse_semantic_find_query_rejects_invalid_tail() -> None:
     assert commands._parse_semantic_find_query('"考试安排" public') is None
     assert commands._parse_semantic_find_query("考试安排") is None
+
+
+def test_merge_find_hits_keeps_semantic_duplicate(tmp_path: Path) -> None:
+    hit = tmp_path / "shared.pdf"
+    semantic_only = tmp_path / "semantic_only.pdf"
+    hit.write_text("shared", encoding="utf-8")
+    semantic_only.write_text("semantic", encoding="utf-8")
+
+    merged, flags = commands._merge_find_hits([hit], [hit, semantic_only, semantic_only])
+
+    assert merged == [hit, hit, semantic_only]
+    assert flags == [False, True, True]
 
 
 def test_parse_signin_deadline_accepts_ascii_and_chinese_colon() -> None:

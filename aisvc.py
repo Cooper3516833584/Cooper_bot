@@ -103,6 +103,7 @@ class AIService:
     _MISPLACED_REVIEW_MAX_CANDIDATES = 24
     _ORGANIZE_PROGRESS_EVERY = 5
     _DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash"
+    _DEEPSEEK_V4_PRO_MODEL = "deepseek-v4-pro"
     _THINKING_DISABLED = {"type": "disabled"}
     _THINKING_ENABLED = {"type": "enabled"}
     _REASONING_EFFORT_HIGH = "high"
@@ -130,7 +131,7 @@ class AIService:
         self.incremental_store_path = Path(BASE_DIR) / self._INCREMENTAL_STORE_FILENAME
 
         self.bot_nick = str(AI_BOT_NICK or "Cooper_bot")
-        self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_FLASH_MODEL)
+        self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_PRO_MODEL)
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
         self.gemini_cli_path = str(AI_GEMINI_CLI_PATH or "").strip()
         self.gemini_model = str(AI_GEMINI_MODEL or "").strip()
@@ -172,13 +173,16 @@ class AIService:
         messages: List[dict],
         temperature: float,
         response_format: Optional[dict] = None,
+        enable_thinking: bool = False,
     ) -> dict:
         payload = {
-            "model": str(self.chat_model or self._DEEPSEEK_V4_FLASH_MODEL),
+            "model": str(self.chat_model or self._DEEPSEEK_V4_PRO_MODEL),
             "messages": list(messages),
             "temperature": float(temperature),
-            "thinking": dict(self._THINKING_DISABLED),
+            "thinking": dict(self._THINKING_ENABLED if enable_thinking else self._THINKING_DISABLED),
         }
+        if enable_thinking:
+            payload["reasoning_effort"] = self._REASONING_EFFORT_HIGH
         if response_format is not None:
             payload["response_format"] = response_format
         return payload
@@ -2566,6 +2570,7 @@ class AIService:
                 {"role": "user", "content": content},
             ],
             self._CHAT_TEMPERATURE,
+            enable_thinking=True,
         )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
@@ -2608,6 +2613,7 @@ class AIService:
         payload = self._build_chat_payload(
             [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
             self._CHAT_TEMPERATURE,
+            enable_thinking=True,
         )
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)

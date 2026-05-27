@@ -110,12 +110,6 @@ async def run_forever():
     async def _run_post_startup_sync_tasks() -> None:
         ai_ok = False
         try:
-            await aisvc.bootstrap_post_startup_sync()
-            ai_ok = True
-        except Exception as e:
-            log.warning(f"AI 启动后同步失败: {e}")
-
-        try:
             log.info("普通 /find 索引：启动后后台构建开始")
             find_stats = await asyncio.to_thread(filesvc.build_find_index)
             log.info(
@@ -124,6 +118,12 @@ async def run_forever():
             )
         except Exception as e:
             log.warning(f"普通 /find 索引：启动后后台构建失败: {e}")
+
+        try:
+            await aisvc.bootstrap_post_startup_sync()
+            ai_ok = True
+        except Exception as e:
+            log.warning(f"AI 启动后同步失败: {e}")
 
         if ai_ok:
             log.info("AI 启动后同步已完成")

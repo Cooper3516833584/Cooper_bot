@@ -27,6 +27,122 @@ from config import (
 
 _FIND_SPLIT_RE = re.compile(r"[\s\-_./\\,，;；:：|+&（）()【】\[\]{}<>《》“”\"'`~!@#$%^*=?]+")
 _FIND_KEEP_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+_FIND_BLOCKED_FILE_SUFFIXES = {
+    ".aux",
+    ".a",
+    ".adoc",
+    ".bak",
+    ".bcf",
+    ".bbl",
+    ".blg",
+    ".bmp",
+    ".bat",
+    ".bin",
+    ".c",
+    ".cat",
+    ".cc",
+    ".class",
+    ".cmd",
+    ".com",
+    ".cpp",
+    ".conf",
+    ".cproj",
+    ".cxx",
+    ".css",
+    ".download",
+    ".dll",
+    ".drv",
+    ".elf",
+    ".eps",
+    ".exe",
+    ".fdb_latexmk",
+    ".fls",
+    ".gif",
+    ".gz",
+    ".h",
+    ".hex",
+    ".heic",
+    ".hh",
+    ".hpp",
+    ".htm",
+    ".html",
+    ".ico",
+    ".img",
+    ".inf",
+    ".ini",
+    ".ino",
+    ".jar",
+    ".java",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".json",
+    ".lib",
+    ".lds",
+    ".log",
+    ".lst",
+    ".mbn",
+    ".mui",
+    ".nav",
+    ".o",
+    ".obj",
+    ".old",
+    ".only",
+    ".otf",
+    ".orig",
+    ".out",
+    ".part",
+    ".pdb",
+    ".pf",
+    ".png",
+    ".properties",
+    ".py",
+    ".pyc",
+    ".pyo",
+    ".rc",
+    ".res",
+    ".run.xml",
+    ".sh",
+    ".skip",
+    ".snm",
+    ".so",
+    ".svg",
+    ".swo",
+    ".swp",
+    ".synctex",
+    ".sys",
+    ".temp",
+    ".tex",
+    ".tif",
+    ".tiff",
+    ".tmp",
+    ".toc",
+    ".template",
+    ".ttf",
+    ".vrb",
+    ".webp",
+    ".xml",
+    ".x",
+    ".xbn",
+    ".xn",
+    ".xr",
+    ".xu",
+    ".yaml",
+    ".yml",
+}
+_FIND_BLOCKED_FILE_NAMES = {".ds_store", "desktop.ini", "thumbs.db"}
+_FIND_SKIP_DIR_NAMES = {".git", ".idea", "__pycache__"}
+_FIND_LOW_SIGNAL_DIR_NAMES = {
+    "assets",
+    "back_cover",
+    "fig",
+    "figs",
+    "image",
+    "images",
+    "titlepage",
+    "video",
+    "videos",
+}
 
 # Optional built-in alias groups for common course abbreviations.
 _FIND_ALIAS_GROUPS = [
@@ -147,6 +263,29 @@ class FileService:
             return t.startswith(b)
         return t.startswith(b + os.sep)
 
+    @staticmethod
+    def _find_dir_is_walkable(name: str) -> bool:
+        return str(name or "").strip().casefold() not in _FIND_SKIP_DIR_NAMES
+
+    @staticmethod
+    def _find_dir_is_searchable(name: str) -> bool:
+        return str(name or "").strip().casefold() not in _FIND_LOW_SIGNAL_DIR_NAMES
+
+    @staticmethod
+    def _find_file_is_searchable(path: Path) -> bool:
+        name = str(path.name or "").strip().casefold()
+        if (not name) or name.startswith("~$") or name in _FIND_BLOCKED_FILE_NAMES:
+            return False
+        suffixes = [str(s or "").casefold() for s in path.suffixes]
+        if suffixes and "".join(suffixes[-2:]) in _FIND_BLOCKED_FILE_SUFFIXES:
+            return False
+        suffix = suffixes[-1] if suffixes else ""
+        if not suffix:
+            return False
+        if suffix[1:].isdigit():
+            return False
+        return suffix not in _FIND_BLOCKED_FILE_SUFFIXES
+
     def _iter_find_index_bases(self) -> List[Tuple[str, Path]]:
         out: List[Tuple[str, Path]] = []
         seen = set()
@@ -260,10 +399,13 @@ class FileService:
                 continue
             for root, dirs, files in os.walk(base):
                 dirs.sort(key=lambda s: s.lower())
+                dirs[:] = [d for d in dirs if self._find_dir_is_walkable(d)]
                 files.sort(key=lambda s: s.lower())
                 root_p = Path(root)
 
                 for dn in dirs:
+                    if not self._find_dir_is_searchable(dn):
+                        continue
                     p = root_p / dn
                     try:
                         key = os.path.normcase(str(p.resolve()))
@@ -295,6 +437,8 @@ class FileService:
 
                 for fn in files:
                     p = root_p / fn
+                    if not self._find_file_is_searchable(p):
+                        continue
                     try:
                         key = os.path.normcase(str(p.resolve()))
                     except (OSError, RuntimeError):
@@ -619,10 +763,13 @@ class FileService:
                 break
             for root, dirs, files in os.walk(base):
                 dirs.sort(key=lambda s: s.lower())
+                dirs[:] = [d for d in dirs if self._find_dir_is_walkable(d)]
                 files.sort(key=lambda s: s.lower())
                 root_p = Path(root)
 
                 for dn in dirs:
+                    if not self._find_dir_is_searchable(dn):
+                        continue
                     scanned += 1
                     if scanned > FIND_MAX_SCAN:
                         stop_scan = True
@@ -645,11 +792,13 @@ class FileService:
                     break
 
                 for fn in files:
+                    p = root_p / fn
+                    if not self._find_file_is_searchable(p):
+                        continue
                     scanned += 1
                     if scanned > FIND_MAX_SCAN:
                         stop_scan = True
                         break
-                    p = root_p / fn
                     score = self._score_candidate(p, base, True, query_compact, query_groups)
                     if score < min_score:
                         continue
@@ -667,9 +816,9 @@ class FileService:
 
         dir_hits_scored.sort(key=lambda x: (-x[0], x[1], x[2]))
         file_hits_scored.sort(key=lambda x: (-x[0], x[1], x[2]))
-        dir_hits = [x[3] for x in dir_hits_scored[:FIND_DIR_LIMIT]]
         file_hits = [x[3] for x in file_hits_scored[:FIND_FILE_LIMIT]]
-        return dir_hits + file_hits
+        dir_hits = [x[3] for x in dir_hits_scored[:FIND_DIR_LIMIT]]
+        return file_hits + dir_hits
 
     def _find_with_index(
         self,
@@ -717,6 +866,8 @@ class FileService:
             score = self._score_candidate(p, matched_base, is_file, query_compact, query_groups)
             if score < min_score:
                 continue
+            if not p.exists():
+                continue
             try:
                 key = os.path.normcase(str(p.resolve()))
             except (OSError, RuntimeError):
@@ -732,9 +883,9 @@ class FileService:
 
         dir_hits_scored.sort(key=lambda x: (-x[0], x[1], x[2]))
         file_hits_scored.sort(key=lambda x: (-x[0], x[1], x[2]))
-        dir_hits = [x[3] for x in dir_hits_scored[:FIND_DIR_LIMIT]]
         file_hits = [x[3] for x in file_hits_scored[:FIND_FILE_LIMIT]]
-        return dir_hits + file_hits
+        dir_hits = [x[3] for x in dir_hits_scored[:FIND_DIR_LIMIT]]
+        return file_hits + dir_hits
 
     def find(self, ctx, keyword: str, in_dir: Optional[str] = None) -> List[Path]:
         keyword = (keyword or "").strip()

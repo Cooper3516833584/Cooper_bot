@@ -1670,11 +1670,12 @@ def _merge_find_hits(primary_hits: List[Path], semantic_hits: List[Path]) -> Tup
         seen.add(k)
         merged.append(p)
         semantic_flags.append(False)
+    semantic_seen = set()
     for p in semantic_hits:
         k = _path_identity_key(p)
-        if k in seen:
+        if k in semantic_seen:
             continue
-        seen.add(k)
+        semantic_seen.add(k)
         merged.append(p)
         semantic_flags.append(True)
     return merged, semantic_flags

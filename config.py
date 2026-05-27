@@ -203,7 +203,7 @@ AI_INDEX_PATH = AI_MATERIAL_DIR / "all_files_index.json"
 AI_METADATA_PATH = AI_MATERIAL_DIR / "file_metadata.json"
 AI_VECTORS_PATH = AI_MATERIAL_DIR / "file_vectors.npy"
 
-AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-flash")
+AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-pro")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
 AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "gemini")
