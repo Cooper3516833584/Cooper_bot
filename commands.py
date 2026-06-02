@@ -3,7 +3,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
 import html
 import re
@@ -88,6 +88,26 @@ _COUNT_END_RE = re.compile(r"^/?end[\s。.!！?？]*$", flags=re.IGNORECASE)
 _COUNT_END_CN_RE = re.compile(r"^结束[\s。.!！?？]*$")
 _FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
 _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
+_EXPLICIT_COMMAND_NAMES = {
+    "autoat",
+    "chandin",
+    "count",
+    "countlist",
+    "countremove",
+    "find",
+    "get",
+    "h",
+    "handin",
+    "handincheck",
+    "handinget",
+    "handinstat",
+    "help",
+    "level",
+    "ls",
+    "ping",
+    "signin",
+    "whoami",
+}
 
 
 def _strip_text_companion_cq_segments(text: str) -> str:
@@ -752,6 +772,14 @@ def _split_args(text: str):
     cmd = parts[0]
     rest = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
     return cmd, rest
+
+
+def _is_known_explicit_command(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw.startswith(("/", "／")):
+        return False
+    parts = raw[1:].strip().split(maxsplit=1)
+    return bool(parts) and parts[0].lower() in _EXPLICIT_COMMAND_NAMES
 
 
 def _parse_signin_deadline_hhmm(text: str) -> Optional[Tuple[int, int]]:
@@ -3285,7 +3313,14 @@ async def _handle_cancel_number_choice(api, ctx, text: str, logsvc: LogService, 
     state.pending_handin_choose.pop(ctx.user_id, None)
     await reply(api, ctx, msg2, logsvc)
     return True
-async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogService, state: BotState) -> bool:
+async def _handle_find_folder_number_choice(
+    api,
+    ctx,
+    text: str,
+    logsvc: LogService,
+    state: BotState,
+    before_handle: Optional[Callable[[], None]] = None,
+) -> bool:
     """处理 /find 结果的“直接回复序号查看目录内容（仅下一级）”。"""
     t = (text or "").strip()
     if not re.fullmatch(r"\d{1,3}", t):
@@ -3299,9 +3334,13 @@ async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogServ
         return False
     p = hits[idx - 1]
     if not p.exists():
+        if before_handle is not None:
+            before_handle()
         await reply(api, ctx, "该条目已不存在，请重新 /find。", logsvc)
         return True
     if p.is_file():
+        if before_handle is not None:
+            before_handle()
         await reply(api, ctx, f"「{p.name}」是文件，请用 /get {idx} 获取。", logsvc)
         return True
     if not p.is_dir():
@@ -3309,12 +3348,16 @@ async def _handle_find_folder_number_choice(api, ctx, text: str, logsvc: LogServ
     try:
         entries = list(p.iterdir())
     except Exception as e:
+        if before_handle is not None:
+            before_handle()
         await reply(api, ctx, f"读取目录失败：{e}", logsvc)
         return True
     entries.sort(key=lambda x: (not x.is_dir(), x.name.lower()))
     has_more = len(entries) > int(LS_LIMIT)
     entries = entries[: int(LS_LIMIT)]
     # 下钻后刷新 /get 的候选列表，支持继续按数字进入下一层目录。
+    if before_handle is not None:
+        before_handle()
     _mark_last_find_cache(state, k, entries, p.name)
     if not entries:
         await reply(api, ctx, f"📁 {p.name}/ 目录为空。", logsvc)
@@ -3479,8 +3522,11 @@ async def _handle_ai_chat_trigger(
     t: str,
     logsvc: LogService,
     aisvc: Optional["AIService"] = None,
+    forced_ai_input: Optional[str] = None,
 ):
-    ai_input = _extract_ai_chat_input(ctx, evt, t, bot_nick=(aisvc.bot_nick if aisvc else AI_BOT_NICK))
+    ai_input = forced_ai_input
+    if ai_input is None:
+        ai_input = _extract_ai_chat_input(ctx, evt, t, bot_nick=(aisvc.bot_nick if aisvc else AI_BOT_NICK))
     if ai_input is not None:
         backend, raw_ai_input = _split_ai_chat_backend(ai_input)
         ai_input = _augment_ai_input_with_sender(ctx, raw_ai_input)
@@ -3541,29 +3587,40 @@ async def _handle_plain_text_input(
     t: str,
     logsvc: LogService,
     state: BotState,
+    *,
+    business_only: bool = False,
+    before_handle: Optional[Callable[[], None]] = None,
 ):
     if not (t.startswith("/") or t.startswith("／")):
-        handled = await _handle_find_folder_number_choice(api, ctx, t, logsvc, state)
+        handled = await _handle_find_folder_number_choice(api, ctx, t, logsvc, state, before_handle)
         if handled:
             return True
         answer_text = _strip_text_companion_cq_segments(t)
         fixed_answers = _lookup_fixed_answers(answer_text)
         if fixed_answers:
+            if before_handle is not None:
+                before_handle()
             for msg in fixed_answers:
                 await reply(api, ctx, msg, logsvc)
             return True
         if _is_media_or_emoji_only_message(evt, t):
+            if before_handle is not None:
+                before_handle()
             return True
         if not _is_keyword_text_message(evt, t):
+            if before_handle is not None:
+                before_handle()
             return True
         if getattr(ctx, "scene", "") != "group":
-            return True
+            return not business_only
         keyword_answers = _lookup_keyword_answers(answer_text)
         if keyword_answers:
+            if before_handle is not None:
+                before_handle()
             for msg in keyword_answers:
                 await reply(api, ctx, msg, logsvc)
             return True
-        return True
+        return not business_only
     return False
 
 async def _handle_explicit_command(
@@ -3577,7 +3634,10 @@ async def _handle_explicit_command(
     perm=None,
     aisvc: Optional["AIService"] = None,
 ):
-    t = t[1:]  # 去掉 /
+    t = t[1:].strip()  # 去掉 /
+    if not t:
+        await reply(api, ctx, "未知命令：/（用 /help 查看）", logsvc)
+        return
     cmd, rest = _split_args(t)
     cmd = cmd.lower()
     if cmd in ("ping",):
@@ -4342,12 +4402,41 @@ async def dispatch(
         return
     # 记录 IN（只有最终 log_out 才会落盘）
     logsvc.log_in(ctx, t)
+    non_ai_remembered = False
+
+    def _remember_non_ai_once() -> None:
+        nonlocal non_ai_remembered
+        if non_ai_remembered:
+            return
+        _remember_non_ai_chat_message(ctx, t, logsvc, aisvc)
+        non_ai_remembered = True
+
+    if t.startswith(("/", "／")):
+        if _is_known_explicit_command(t) or int(getattr(ctx, "level", 0) or 0) < 1:
+            _remember_non_ai_once()
+            await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc)
+            return
+        if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc, forced_ai_input=t):
+            return
+        _remember_non_ai_once()
+        await reply(api, ctx, "未知命令（用 /help 查看）", logsvc)
+        return
+    if await _handle_plain_text_input(
+        api,
+        ctx,
+        evt,
+        t,
+        logsvc,
+        state,
+        business_only=True,
+        before_handle=_remember_non_ai_once,
+    ):
+        return
     if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc):
         return
-    _remember_non_ai_chat_message(ctx, t, logsvc, aisvc)
+    _remember_non_ai_once()
     if await _handle_plain_text_input(api, ctx, evt, t, logsvc, state):
         return
-    await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc)
 
 async def _handle_private_done_batch(api, ctx, text: str, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
     """处理私聊批量文件的 done 指令：进入“等待 zip 命名”阶段。"""

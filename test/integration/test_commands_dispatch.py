@@ -184,6 +184,49 @@ async def test_command_find_dispatch(tmp_data_dirs: dict, dispatch_harness) -> N
 
 
 @pytest.mark.asyncio
+async def test_command_find_folder_number_choice_precedes_private_aichat(tmp_data_dirs: dict, dispatch_harness) -> None:
+    target_dir = Path(tmp_data_dirs["public_dir"]) / "find_drill_dir"
+    child = target_dir / "nested.txt"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    child.write_text("nested", encoding="utf-8")
+
+    filesvc = _make_filesvc_stub(find_impl=Mock(return_value=[target_dir]))
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
+    state = commands.BotState()
+    aisvc = _FakeAIService()
+    evt = {"post_type": "message", "message_type": "private", "sub_type": "friend"}
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt=evt,
+        text="/find drill",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt=evt,
+        text="1",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.chat_with_context.assert_not_awaited()
+    assert child in state.last_find[commands.conv_key(ctx)]
+    assert any("find_drill_dir/ 下一级目录与文件" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
 async def test_command_ls_dispatch_uses_list_service(dispatch_harness) -> None:
     list_mock = Mock(return_value=(True, "目录内容：\n📁 textbook_and_material/"))
     filesvc = _make_filesvc_stub(list_impl=list_mock)
@@ -255,7 +298,7 @@ async def test_command_aichat_dispatch(dispatch_harness) -> None:
         api=SimpleNamespace(),
         ctx=ctx,
         evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="你好",
+        text="请解释一下量子纠缠",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=commands.BotState(),
@@ -268,8 +311,30 @@ async def test_command_aichat_dispatch(dispatch_harness) -> None:
     assert aisvc.chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
     model_input = aisvc.chat_with_context.await_args.args[1]
     assert "发言人QQ:" not in model_input
-    assert "你好" in model_input
+    assert "请解释一下量子纠缠" in model_input
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_command_fixed_answer_precedes_private_aichat(dispatch_harness) -> None:
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
+    aisvc = _FakeAIService()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="你好",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.chat_with_context.assert_not_awaited()
+    assert any("我是Cooper_bot" in one["text"] for one in dispatch_harness.messages)
 
 
 @pytest.mark.asyncio
@@ -324,9 +389,99 @@ async def test_dispatch_slash_command_still_reaches_explicit_command(dispatch_ha
         aisvc=None,
     )
 
-    ai_trigger_mock.assert_awaited_once()
-    plain_mock.assert_awaited_once()
+    ai_trigger_mock.assert_not_awaited()
+    plain_mock.assert_not_awaited()
     explicit_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unknown_private_slash_command_reaches_aichat(dispatch_harness) -> None:
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
+    aisvc = _FakeAIService()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="/fnd 高数",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.chat_with_context.assert_awaited_once_with(f"private:{ctx.user_id}", "/fnd 高数")
+    assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
+    assert not any("未知命令" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unknown_group_slash_command_reaches_aichat_without_mention(dispatch_harness) -> None:
+    ctx = _make_ctx(scene="group", group_id=20001, level=1)
+    aisvc = _FakeAIService()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="/fnd 高数",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.chat_with_context.assert_awaited_once()
+    assert aisvc.chat_with_context.await_args.args[0] == f"group:{ctx.group_id}"
+    assert "/fnd 高数" in aisvc.chat_with_context.await_args.args[1]
+    assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
+    assert not any("未知命令" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unknown_guest_slash_command_keeps_fixed_reply(dispatch_harness) -> None:
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=0)
+    aisvc = _FakeAIService()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="/fnd 高数",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.chat_with_context.assert_not_awaited()
+    assert any("未知命令：/fnd" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_bare_slash_does_not_crash_for_guest(dispatch_harness) -> None:
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=0)
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="/",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=None,
+    )
+
+    assert any("未知命令：/" in one["text"] for one in dispatch_harness.messages)
 
 
 @pytest.mark.asyncio
@@ -345,7 +500,7 @@ async def test_dispatch_private_plain_text_reaches_ai_trigger(dispatch_harness, 
         api=SimpleNamespace(),
         ctx=ctx,
         evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="你好",
+        text="请解释一下量子纠缠",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=commands.BotState(),
@@ -355,7 +510,8 @@ async def test_dispatch_private_plain_text_reaches_ai_trigger(dispatch_harness, 
     )
 
     ai_trigger_mock.assert_awaited_once()
-    plain_mock.assert_not_awaited()
+    plain_mock.assert_awaited_once()
+    assert plain_mock.await_args.kwargs["business_only"] is True
     explicit_mock.assert_not_awaited()
 
 
@@ -364,7 +520,7 @@ async def test_dispatch_plain_text_still_reaches_plain_text_input(dispatch_harne
     filesvc = _make_filesvc_stub()
     ctx = _make_ctx(scene="private_friend", group_id=None, level=3, user_id=900001)
     ai_trigger_mock = AsyncMock(return_value=False)
-    plain_mock = AsyncMock(return_value=True)
+    plain_mock = AsyncMock(side_effect=[False, True])
     explicit_mock = AsyncMock(return_value=None)
 
     monkeypatch.setattr(commands, "_handle_ai_chat_trigger", ai_trigger_mock)
@@ -385,7 +541,8 @@ async def test_dispatch_plain_text_still_reaches_plain_text_input(dispatch_harne
     )
 
     ai_trigger_mock.assert_awaited_once()
-    plain_mock.assert_awaited_once()
+    assert plain_mock.await_count == 2
+    assert plain_mock.await_args_list[0].kwargs["business_only"] is True
     explicit_mock.assert_not_awaited()
 
 
@@ -587,7 +744,7 @@ async def test_aichat_reply_does_not_duplicate_assistant_memory(monkeypatch) -> 
         api=SimpleNamespace(send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0})),
         ctx=ctx,
         evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="你好",
+        text="请解释一下量子纠缠",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=commands.BotState(),

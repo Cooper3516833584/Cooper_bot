@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import aisvc
+import config
 from aisvc import AIService
 
 
@@ -36,6 +37,34 @@ def _install_fake_chat_backend(monkeypatch, svc: AIService) -> list[dict[str, An
     monkeypatch.setattr(svc, "_post_json", _fake_post_json)
     monkeypatch.setattr(svc, "_select_chat_system_prompt", lambda _session_key: "system-prompt")
     return payloads
+
+
+def test_default_system_prompt_includes_level_one_command_guidance() -> None:
+    prompt = config.AI_SYSTEM_PROMPT
+
+    assert "机器人业务指令提示（1 级用户）" in prompt
+    assert "/help 或 /h" in prompt
+    assert "/find 搜索内容" in prompt
+    assert "/get 序号" in prompt
+    assert "不要声称已经替用户执行指令" in prompt
+
+
+def test_custom_chat_prompt_override_remains_independent(monkeypatch) -> None:
+    svc = _new_service()
+    monkeypatch.setattr(
+        svc,
+        "_load_private_chat_prompt_config",
+        lambda: {"default": {}, "users": {"10001": {"system_prompt": "private-special"}}},
+    )
+    monkeypatch.setattr(
+        svc,
+        "_load_group_chat_prompt_config",
+        lambda: {"default": "", "groups": {"20001": "group-special"}},
+    )
+
+    assert svc._select_chat_system_prompt("private:10001") == "private-special"
+    assert svc._select_chat_system_prompt("group:20001") == "group-special"
+    assert svc._select_chat_system_prompt("private:99999") == "system-prompt"
 
 
 def test_chat_context_keeps_history_within_30_minutes(monkeypatch, controlled_time) -> None:
