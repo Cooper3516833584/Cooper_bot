@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import zipfile
 
-from handinsvc import HandinService
+from handinsvc import HANDIN_HASH_INDEX_FILENAME, HandinService
 
 
 class _DummyLog:
@@ -138,6 +139,46 @@ def test_submit_success_and_duplicate_behavior(controlled_time) -> None:
     assert overwrite_dst.read_bytes() == b"second-submit"
 
 
+def test_submit_rejects_same_content_with_different_filename(controlled_time) -> None:
+    service = _new_service()
+    now_ts = controlled_time.time()
+    ok, _ = service.create_task(
+        group_id=20001,
+        creator_id=900001,
+        name="hw_hash_duplicate",
+        remind_ts_list=[],
+        deadline_ts=now_ts + 3600,
+    )
+    assert ok is True
+    task = _first_task(service)
+
+    first = service.inbox_dir / "10001" / "Alice_U20230001_hw.pdf"
+    first.parent.mkdir(parents=True, exist_ok=True)
+    first.write_bytes(b"same-content")
+
+    moved_ok, _msg, dst, code = service.move_inbox_to_task(first, task, overwrite=False)
+    assert moved_ok is True
+    assert code == "OK"
+    assert dst is not None and dst.exists()
+
+    files_dir = service._task_files_dir(task.group_id, task.name)
+    hash_index = files_dir / HANDIN_HASH_INDEX_FILENAME
+    assert hash_index.exists()
+    index = json.loads(hash_index.read_text(encoding="utf-8"))
+    assert index["files"][dst.name]["sha256"] == HandinService.file_sha256(dst)
+
+    duplicate = service.inbox_dir / "10001" / "Bob_U20230002_hw.pdf"
+    duplicate.write_bytes(b"same-content")
+    dup_ok, dup_msg, dup_dst, dup_code = service.move_inbox_to_task(duplicate, task, overwrite=False)
+
+    assert dup_ok is False
+    assert dup_code == "DUPLICATE"
+    assert "内容完全相同" in dup_msg
+    assert dup_dst == dst
+    assert duplicate.exists()
+    assert [p.name for p in service.list_submitted_files(task)] == [dst.name]
+
+
 def test_outside_roster_submission_not_counted(monkeypatch, controlled_time) -> None:
     service = _new_service()
     now_ts = controlled_time.time()
@@ -182,6 +223,8 @@ def test_summary_and_zip_core_path(tmp_project_root: Path, monkeypatch, controll
     f2 = files_dir / "Bob_U20230002_hw_pack.docx"
     f1.write_bytes(b"a")
     f2.write_bytes(b"b")
+    hash_index = files_dir / HANDIN_HASH_INDEX_FILENAME
+    hash_index.write_text('{"version":1,"files":{}}', encoding="utf-8")
 
     monkeypatch.setattr(service, "_get_roster", lambda: [("U20230001", "Alice"), ("U20230002", "Bob")])
     ok_stats, _msg, missing, stats = service.compute_missing(task)
@@ -198,3 +241,4 @@ def test_summary_and_zip_core_path(tmp_project_root: Path, monkeypatch, controll
         names = set(zf.namelist())
     assert "Alice_U20230001_hw_pack.pdf" in names
     assert "Bob_U20230002_hw_pack.docx" in names
+    assert HANDIN_HASH_INDEX_FILENAME not in names

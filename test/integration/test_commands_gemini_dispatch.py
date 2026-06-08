@@ -144,10 +144,92 @@ async def test_command_aichat_gemini_dispatch(dispatch_harness) -> None:
     aisvc.gemini_chat_with_context.assert_awaited_once()
     assert aisvc.gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
     model_input = aisvc.gemini_chat_with_context.await_args.args[1]
+    assert aisvc.gemini_chat_with_context.await_args.args[2] == "gemini"
     assert "发言人QQ:" not in model_input
     assert "帮我联网总结一下" in model_input
     aisvc.chat_with_context.assert_not_awaited()
     assert any("gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_command_aichat_claude_dispatch(dispatch_harness) -> None:
+    ctx = _make_ctx()
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="c帮我联网总结一下",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.gemini_chat_with_context.assert_awaited_once()
+    assert aisvc.gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
+    assert aisvc.gemini_chat_with_context.await_args.args[2] == "claude"
+    aisvc.chat_with_context.assert_not_awaited()
+    assert any("gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_ai_fallback_private_when_group_send_unconfirmed() -> None:
+    if hasattr(commands, "_RECENT_REPLY_KEYS"):
+        commands._RECENT_REPLY_KEYS.clear()
+    ctx = _make_ctx(scene="group", group_id=20001, user_id=10001)
+    aisvc = _FakeAIService()
+    aisvc.gemini_chat_with_context = AsyncMock(side_effect=RuntimeError("agy failed"))
+    api = SimpleNamespace(
+        send_group_msg=AsyncMock(return_value=None),
+        send_private_msg=AsyncMock(return_value={"status": "ok", "retcode": 0}),
+    )
+
+    handled = await commands._handle_ai_chat_trigger(
+        api=api,
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        t="",
+        logsvc=_DummyLogService(),
+        aisvc=aisvc,
+        forced_ai_input="c帮我联网总结一下",
+    )
+
+    assert handled is True
+    api.send_group_msg.assert_awaited_once()
+    api.send_private_msg.assert_awaited_once()
+    assert api.send_private_msg.await_args.args[0] == ctx.user_id
+    assert api.send_private_msg.await_args.args[1] == aisvc.fallback_error_reply
+
+
+@pytest.mark.asyncio
+async def test_antigravity_busy_reply_uses_clear_message(dispatch_harness) -> None:
+    ctx = _make_ctx()
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+    aisvc.gemini_chat_with_context = AsyncMock(
+        side_effect=RuntimeError("antigravity cli service busy: No capacity available for model claude-opus-4-6-thinking")
+    )
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="c今天有什么新闻",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    assert any("Claude Opus 4.6 当前服务繁忙" in one["text"] for one in dispatch_harness.messages)
+    assert not any(one["text"] == aisvc.fallback_error_reply for one in dispatch_harness.messages)
 
 
 @pytest.mark.asyncio
@@ -169,5 +251,7 @@ async def test_command_help_mentions_gemini_usage(dispatch_harness) -> None:
         aisvc=aisvc,
     )
 
-    assert any("群聊（Gemini联网）：@Cooper_bot g内容" in one["text"] for one in dispatch_harness.messages)
-    assert any("私聊（Gemini联网）：g内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("群聊（antigravity Gemini）：@Cooper_bot g内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("群聊（antigravity Claude）：@Cooper_bot c内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("私聊（antigravity Gemini）：g内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("私聊（antigravity Claude）：c内容" in one["text"] for one in dispatch_harness.messages)

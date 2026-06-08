@@ -2,6 +2,7 @@
 # handinsvc.py
 from __future__ import annotations
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -106,6 +107,7 @@ _RE_STU = re.compile(r"[Uu]\d{8,12}")
 _RE_ENG = re.compile(r"[A-Za-z]")
 _RE_NUM = re.compile(r"[Uu]?\d{4,}")
 SUBMITTED_FILE_SUFFIXES = {".doc", ".docx", ".pdf", ".txt", ".zip", ".rar", ".7z", ".ppt", ".pptx", ".xls", ".xlsx"}
+HANDIN_HASH_INDEX_FILENAME = ".handin_file_hashes.json"
 
 def clean_filename(filename: str) -> str:
     stem = Path(filename).stem
@@ -627,9 +629,109 @@ class HandinService:
         files_dir = self._task_files_dir(task.group_id, task.name)
         if not files_dir.exists():
             return []
-        out = [p for p in files_dir.iterdir() if p.is_file()]
+        out = [p for p in files_dir.iterdir() if p.is_file() and not self._is_hash_index_file(p.name)]
         out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return out
+
+    @staticmethod
+    def _is_hash_index_file(filename: str) -> bool:
+        name = str(filename or "")
+        return name == HANDIN_HASH_INDEX_FILENAME or name == f"{HANDIN_HASH_INDEX_FILENAME}.tmp"
+
+    @staticmethod
+    def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
+        h = hashlib.sha256()
+        with Path(path).open("rb") as f:
+            while True:
+                b = f.read(chunk_size)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+
+    @staticmethod
+    def _normalize_sha256(value: object) -> str:
+        s = str(value or "").strip().lower()
+        return s if re.fullmatch(r"[0-9a-f]{64}", s) else ""
+
+    def _hash_index_path(self, files_dir: Path) -> Path:
+        return Path(files_dir) / HANDIN_HASH_INDEX_FILENAME
+
+    def _load_hash_index(self, files_dir: Path) -> Dict[str, dict]:
+        path = self._hash_index_path(files_dir)
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        raw = obj.get("files") if isinstance(obj, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, dict] = {}
+        for name, entry in raw.items():
+            if not isinstance(entry, dict):
+                continue
+            fn = str(name or "").strip()
+            sha = self._normalize_sha256(entry.get("sha256"))
+            if not fn or self._is_hash_index_file(fn) or not sha:
+                continue
+            try:
+                size = int(entry.get("size") or 0)
+            except Exception:
+                size = 0
+            try:
+                mtime_ns = int(entry.get("mtime_ns") or 0)
+            except Exception:
+                mtime_ns = 0
+            out[fn] = {"sha256": sha, "size": size, "mtime_ns": mtime_ns}
+        return out
+
+    def _save_hash_index(self, files_dir: Path, entries: Dict[str, dict]) -> None:
+        payload = {
+            "version": 1,
+            "updated_ts": int(time.time()),
+            "files": entries,
+        }
+        path = self._hash_index_path(files_dir)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _refresh_hash_index(self, files_dir: Path) -> Dict[str, dict]:
+        files_dir = Path(files_dir)
+        entries = self._load_hash_index(files_dir)
+        changed = False
+
+        for name in list(entries.keys()):
+            p = files_dir / name
+            if not p.is_file():
+                entries.pop(name, None)
+                changed = True
+
+        for p in files_dir.iterdir():
+            if not p.is_file() or self._is_hash_index_file(p.name):
+                continue
+            try:
+                st = p.stat()
+            except Exception:
+                continue
+            old = entries.get(p.name) or {}
+            old_sha = self._normalize_sha256(old.get("sha256"))
+            if (
+                old_sha
+                and int(old.get("size") or -1) == int(st.st_size)
+                and int(old.get("mtime_ns") or -1) == int(st.st_mtime_ns)
+            ):
+                continue
+            entries[p.name] = {
+                "sha256": self.file_sha256(p),
+                "size": int(st.st_size),
+                "mtime_ns": int(st.st_mtime_ns),
+            }
+            changed = True
+
+        if changed:
+            self._save_hash_index(files_dir, entries)
+        return entries
 
     def zip_submissions(self, task: HandinTask, out_zip: Path) -> Tuple[bool, str, Optional[Path]]:
         """将某任务已提交文件全部打包为 zip。"""
@@ -971,9 +1073,33 @@ class HandinService:
             return False, f"任务「{task.name}」中已存在同名文件：{dst.name}", dst, "EXISTS"
 
         try:
+            try:
+                src_hash = self.file_sha256(inbox_path)
+                entries = self._refresh_hash_index(dst_dir)
+            except Exception as e:
+                return False, f"文件校验失败：{e}", None, "ERR"
+
+            for existing_name, entry in entries.items():
+                if overwrite and existing_name == dst.name:
+                    continue
+                if self._normalize_sha256(entry.get("sha256")) == src_hash:
+                    return (
+                        False,
+                        f"任务「{task.name}」中已存在内容完全相同的提交文件：{existing_name}，本次提交已终止。",
+                        dst_dir / existing_name,
+                        "DUPLICATE",
+                    )
+
             if dst.exists() and overwrite:
                 dst.unlink()
             Path(inbox_path).replace(dst)
+            st = dst.stat()
+            entries[dst.name] = {
+                "sha256": src_hash,
+                "size": int(st.st_size),
+                "mtime_ns": int(st.st_mtime_ns),
+            }
+            self._save_hash_index(dst_dir, entries)
             return True, f"已归档到任务「{task.name}」：{dst.name}", dst, "OK"
         except Exception as e:
             return False, f"归档失败：{e}", None, "ERR"

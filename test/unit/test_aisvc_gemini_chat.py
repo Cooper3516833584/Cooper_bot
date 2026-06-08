@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from aisvc import AIService
 
@@ -18,6 +21,8 @@ def _new_service(work_root) -> AIService:
     svc = AIService(log=_DummyLog())
     svc.system_prompt = "system-prompt"
     svc.gemini_cli_path = "gemini"
+    svc.gemini_model = "Gemini Test Model"
+    svc.claude_model = "Claude Opus 4.6 (Thinking)"
     svc.gemini_policy_path = work_root / "gemini-policy.toml"
     svc.gemini_policy_path.write_text('[[rule]]\ntoolName = "read_file"\ndecision = "deny"\npriority = 999\n', encoding="utf-8")
     svc.gemini_workdir = work_root / "gemini-workdir"
@@ -27,11 +32,13 @@ def _new_service(work_root) -> AIService:
 def test_gemini_chat_with_context_ignores_history_and_prompts(monkeypatch, tmp_project_root) -> None:
     svc = _new_service(tmp_project_root)
     prompts: list[str] = []
+    models: list[str] = []
     seq = {"n": 0}
 
-    def _fake_run(prompt: str) -> str:
+    def _fake_run(prompt: str, model_name: str | None = None) -> str:
         seq["n"] += 1
         prompts.append(prompt)
+        models.append(str(model_name or ""))
         return f"reply-{seq['n']}"
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "gemini")
@@ -46,29 +53,33 @@ def test_gemini_chat_with_context_ignores_history_and_prompts(monkeypatch, tmp_p
     second = svc._gemini_chat_with_context_sync("group:20001", "follow-up")
     assert second == "reply-2"
 
-    assert len(prompts) == 2
+    third = svc._gemini_chat_with_context_sync("group:20001", "claude follow-up", "claude")
+    assert third == "reply-3"
+
+    assert len(prompts) == 3
+    assert models == ["Gemini Test Model", "Gemini Test Model", "Claude Opus 4.6 (Thinking)"]
     assert "google_web_search" in prompts[0]
     assert prompts[0].endswith("hello")
     assert "system-prompt" not in prompts[0]
     assert "Assistant:" not in prompts[1]
     assert prompts[1].endswith("follow-up")
+    assert prompts[2].endswith("claude follow-up")
 
 
 def test_run_gemini_cli_sync_parses_json_response(monkeypatch, tmp_project_root) -> None:
     svc = _new_service(tmp_project_root)
     captured: dict[str, object] = {}
 
-    def _fake_subprocess_run(cmd, cwd, stdout, stderr, text, encoding, errors, timeout, check):
+    def _fake_subprocess_run(cmd, cwd, stdout, stderr, timeout, check, env=None, creationflags=0):
         captured["cmd"] = list(cmd)
         captured["cwd"] = cwd
         captured["stdout"] = stdout
         captured["stderr"] = stderr
-        captured["text"] = text
-        captured["encoding"] = encoding
-        captured["errors"] = errors
         captured["timeout"] = timeout
         captured["check"] = check
-        return SimpleNamespace(returncode=0, stdout='{"response":"OK"}', stderr="warning")
+        captured["env"] = env
+        captured["creationflags"] = creationflags
+        return SimpleNamespace(returncode=0, stdout=b'{"response":"OK"}', stderr=b"warning")
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "C:/tools/gemini.cmd")
     monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
@@ -77,12 +88,110 @@ def test_run_gemini_cli_sync_parses_json_response(monkeypatch, tmp_project_root)
 
     assert out == "OK"
     cmd = [str(x) for x in captured["cmd"]]
-    assert Path(cmd[0]).as_posix() == "C:/tools/gemini.cmd"
-    assert cmd[1:5] == ["-p", "Reply exactly OK", "-o", "json"]
-    assert cmd[5:7] == ["--approval-mode", "default"]
-    assert "--policy" in cmd
+    cli_idx = next(i for i, c in enumerate(cmd) if Path(c).as_posix() == "C:/tools/gemini.cmd")
+    assert cmd[cli_idx + 1:cli_idx + 3] == ["-p", "Reply exactly OK"]
+    assert cmd[cli_idx + 3:cli_idx + 5] == ["--model", "Gemini Test Model"]
     assert captured["cwd"] == str(svc.gemini_workdir)
-    assert captured["encoding"] == "utf-8"
+    assert captured["creationflags"] == 0
+
+
+def test_run_gemini_cli_sync_reads_agy_transcript_when_stdout_empty(monkeypatch, tmp_project_root) -> None:
+    svc = _new_service(tmp_project_root)
+    captured: dict[str, object] = {}
+    conv_id = "7dac489a-31d4-41f8-b9d4-73541c44697a"
+
+    def _fake_subprocess_run(cmd, cwd, stdout, stderr, timeout, check, env=None, creationflags=0):
+        captured["cmd"] = list(cmd)
+        captured["creationflags"] = creationflags
+        log_path = Path(cmd[cmd.index("--log-file") + 1])
+        app_dir = tmp_project_root / "agy-app"
+        transcript = app_dir / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(
+            json.dumps({"source": "MODEL", "content": "OK from transcript"}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        log_path.write_text(
+            f"CLI app data directory: {app_dir}\nI0608 server.go:753] Created conversation {conv_id}\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
+    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+
+    out = svc._run_gemini_cli_sync("Reply exactly OK")
+
+    assert out == "OK from transcript"
+    cmd = [str(x) for x in captured["cmd"]]
+    assert "--log-file" in cmd
+    assert "--model" in cmd
+    assert captured["creationflags"] == getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0)
+
+
+def test_run_gemini_cli_sync_reports_agy_log_error_when_empty(monkeypatch, tmp_project_root) -> None:
+    svc = _new_service(tmp_project_root)
+    conv_id = "e52ea308-be06-4058-a879-86c4ac7f2692"
+
+    def _fake_subprocess_run(cmd, cwd, stdout, stderr, timeout, check, env=None, creationflags=0):
+        log_path = Path(cmd[cmd.index("--log-file") + 1])
+        log_path.write_text(
+            "\n".join(
+                [
+                    f"I0608 server.go:753] Created conversation {conv_id}",
+                    "E0608 log.go:398] agent executor error: UNAVAILABLE (code 503): No capacity available for model claude-opus-4-6-thinking on the server",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
+    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+
+    with pytest.raises(RuntimeError, match="No capacity available"):
+        svc._run_gemini_cli_sync("Reply exactly OK", "Claude Opus 4.6 (Thinking)")
+
+
+def test_run_gemini_cli_sync_rejects_agy_busy_transcript(monkeypatch, tmp_project_root) -> None:
+    svc = _new_service(tmp_project_root)
+    conv_id = "7dac489a-31d4-41f8-b9d4-73541c44697a"
+
+    def _fake_subprocess_run(cmd, cwd, stdout, stderr, timeout, check, env=None, creationflags=0):
+        log_path = Path(cmd[cmd.index("--log-file") + 1])
+        app_dir = tmp_project_root / "agy-app"
+        transcript = app_dir / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(
+            json.dumps({"source": "MODEL", "content": "Our servers are experiencing high traffic right now, please try again in a minute."}) + "\n",
+            encoding="utf-8",
+        )
+        log_path.write_text(
+            f"CLI app data directory: {app_dir}\nI0608 server.go:753] Created conversation {conv_id}\n",
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
+    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+
+    with pytest.raises(RuntimeError, match="service busy"):
+        svc._run_gemini_cli_sync("Reply exactly OK")
+
+
+def test_run_gemini_cli_sync_preserves_agy_cursor_line_breaks(monkeypatch, tmp_project_root) -> None:
+    svc = _new_service(tmp_project_root)
+    raw = "可用命令：\x1b[1E- /help\x1b[1E- /ping\x1b[2E结束"
+
+    def _fake_subprocess_run(cmd, cwd, stdout, stderr, timeout, check, env=None, creationflags=0):
+        return SimpleNamespace(returncode=0, stdout=raw.encode("utf-8"), stderr=b"")
+
+    monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
+    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+
+    out = svc._run_gemini_cli_sync("列出命令")
+
+    assert out == "可用命令：\n- /help\n- /ping\n\n结束"
 
 
 def test_build_gemini_cli_base_command_prefers_node_bundle_for_cmd(monkeypatch, tmp_project_root) -> None:

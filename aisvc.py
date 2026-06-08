@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import html
+import os
 import json
 import re
 import shutil
@@ -22,6 +23,7 @@ from config import (
     AI_API_KEY_PATH,
     AI_BOT_NICK,
     AI_CHAT_MODEL,
+    AI_CLAUDE_MODEL,
     AI_EMBED_MODEL,
     AI_FALLBACK_ERROR_REPLY,
     AI_GEMINI_CLI_PATH,
@@ -135,6 +137,7 @@ class AIService:
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
         self.gemini_cli_path = str(AI_GEMINI_CLI_PATH or "").strip()
         self.gemini_model = str(AI_GEMINI_MODEL or "").strip()
+        self.claude_model = str(AI_CLAUDE_MODEL or "Claude Opus 4.6 (Thinking)").strip()
         self.gemini_policy_path = Path(AI_GEMINI_POLICY_PATH)
         self.gemini_workdir = Path(AI_GEMINI_WORKDIR)
         self.gemini_timeout_seconds = max(10.0, float(AI_GEMINI_TIMEOUT_SECONDS or 120.0))
@@ -277,11 +280,11 @@ class AIService:
     async def chat_with_context(self, session_key: str, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
 
-    async def gemini_chat(self, user_input: str) -> str:
-        return await asyncio.to_thread(self._gemini_chat_sync, user_input)
+    async def gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
+        return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key)
 
-    async def gemini_chat_with_context(self, session_key: str, user_input: str) -> str:
-        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input)
+    async def gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
+        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key)
 
     def remember_user_message(self, session_key: str, message_text: str) -> None:
         self._remember_chat_message(session_key, "user", message_text)
@@ -344,7 +347,123 @@ class AIService:
             return ""
         return "Use google_web_search before answering this exact user request:\n\n" + content
 
-    def _run_gemini_cli_sync(self, prompt: str) -> str:
+    @staticmethod
+    def _normalize_gemini_cli_output(raw: str) -> str:
+        raw = str(raw or "")
+
+        # agy clears the screen before printing the final response. Everything
+        # before this is usually spinner frames or thought logs.
+        if "\x1b[2J" in raw:
+            raw = raw.split("\x1b[2J")[-1]
+
+        # Strip OSC (Operating System Command) sequences such as title updates.
+        raw = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", raw)
+
+        def _line_advance(match: re.Match) -> str:
+            params = str(match.group(1) or "")
+            first = params.split(";", 1)[0]
+            try:
+                count = int(first) if first else 1
+            except Exception:
+                count = 1
+            return "\n" * max(1, min(count, 20))
+
+        # agy/conhost may express visual line breaks as cursor-down/next-line
+        # control sequences. Preserve those before removing the remaining ANSI.
+        raw = re.sub(r"\x1b\[([0-9;]*)(?:B|E|e)", _line_advance, raw)
+        raw = raw.replace("\x1bE", "\n").replace("\x1bD", "\n")
+
+        ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+        raw = ansi_escape.sub("", raw)
+        return raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def _resolve_gemini_cli_model(self, model_key: Optional[str] = None) -> str:
+        raw = str(model_key or "").strip()
+        key = raw.lower()
+        if not key or key == "gemini":
+            return str(self.gemini_model or "").strip()
+        if key in {"claude", "opus", "opus4.6", "claude-opus"}:
+            return str(self.claude_model or "").strip()
+        return raw
+
+    @staticmethod
+    def _is_antigravity_cli_command(base_cmd: List[str]) -> bool:
+        if not base_cmd:
+            return False
+        try:
+            return Path(str(base_cmd[0])).stem.lower() in {"agy", "antigravity"}
+        except Exception:
+            return False
+
+    @staticmethod
+    def _build_antigravity_log_path(workdir: Path) -> Path:
+        log_dir = Path(workdir) / "_agy_cli_logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = f"{int(time.time() * 1000)}_{os.getpid()}_{threading.get_ident()}"
+        return log_dir / f"agy_{stamp}.log"
+
+    @staticmethod
+    def _is_antigravity_cli_busy_text(text: str) -> bool:
+        low = str(text or "").lower()
+        return (
+            "no capacity available" in low
+            or "servers are experiencing high traffic" in low
+            or "high traffic right now" in low
+            or "resource exhausted" in low
+            or "unavailable (code 503)" in low
+        )
+
+    @staticmethod
+    def _extract_antigravity_cli_error(text: str) -> str:
+        for line in reversed(str(text or "").splitlines()):
+            low = line.lower()
+            if (
+                "no capacity available" not in low
+                and "servers are experiencing high traffic" not in low
+                and "high traffic right now" not in low
+                and "resource exhausted" not in low
+                and "authentication timed out" not in low
+                and "you are not logged into antigravity" not in low
+                and "agent executor error" not in low
+            ):
+                continue
+            msg = re.sub(r"^[A-Z]\d{4}\s+\S+\s+\d+\s+[^]]+\]\s*", "", line).strip()
+            msg = re.sub(r"^agent executor error:\s*", "", msg).strip()
+            return msg[:500]
+        return ""
+
+    @staticmethod
+    def _extract_antigravity_cli_transcript_response(log_path: Optional[Path]) -> Tuple[str, str]:
+        if log_path is None or not Path(log_path).is_file():
+            return "", ""
+        log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        conv_ids = re.findall(r"Created conversation ([0-9a-fA-F-]{36})", log_text)
+        if not conv_ids:
+            return "", log_text
+        app_dirs = re.findall(r"CLI app data directory:\s*(.+)", log_text)
+        app_dir = Path(app_dirs[-1].strip()) if app_dirs else Path.home() / ".gemini" / "antigravity-cli"
+        conv_id = conv_ids[-1]
+        logs_dir = app_dir / "brain" / conv_id / ".system_generated" / "logs"
+        for name in ("transcript.jsonl", "transcript_full.jsonl"):
+            transcript = logs_dir / name
+            if not transcript.is_file():
+                continue
+            out: List[str] = []
+            for line in transcript.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if str(obj.get("source") or "") != "MODEL":
+                    continue
+                content = str(obj.get("content") or "").strip()
+                if content:
+                    out.append(content)
+            if out:
+                return out[-1], log_text
+        return "", log_text
+
+    def _run_gemini_cli_sync(self, prompt: str, model_name: Optional[str] = None) -> str:
         base_cmd = self._build_gemini_cli_base_command()
         if not base_cmd:
             raise RuntimeError("gemini cli not found")
@@ -354,19 +473,23 @@ class AIService:
         workdir = Path(self.gemini_workdir)
         workdir.mkdir(parents=True, exist_ok=True)
 
-        cmd = [
-            *base_cmd,
-            "-p",
-            str(prompt or ""),
-            "-o",
-            "json",
-            "--approval-mode",
-            "default",
-            "--policy",
-            str(policy_path),
-        ]
-        if self.gemini_model:
-            cmd.extend(["-m", str(self.gemini_model)])
+        agy_log_path: Optional[Path] = None
+        cmd = [*base_cmd]
+        if self._is_antigravity_cli_command(base_cmd):
+            agy_log_path = self._build_antigravity_log_path(workdir)
+            cmd.extend(["--log-file", str(agy_log_path)])
+        cli_label = "antigravity cli" if agy_log_path is not None else "gemini cli"
+        cmd.extend(["-p", str(prompt or "")])
+        cli_model = str(model_name if model_name is not None else self.gemini_model or "").strip()
+        if cli_model:
+            cmd.extend(["--model", cli_model])
+
+        # Disable markdown hard-wrapping by pretending the console is very wide
+        run_env = os.environ.copy()
+        run_env["COLUMNS"] = "9999"
+        run_creationflags = 0
+        if agy_log_path is not None and os.name == "nt":
+            run_creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
 
         try:
             proc = subprocess.run(
@@ -374,42 +497,46 @@ class AIService:
                 cwd=str(workdir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=float(self.gemini_timeout_seconds),
                 check=False,
+                env=run_env,
+                creationflags=run_creationflags,
             )
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(f"gemini cli timeout after {int(self.gemini_timeout_seconds)}s") from e
         except Exception as e:
             raise RuntimeError(f"gemini cli launch failed: {e}") from e
 
-        raw = str(proc.stdout or "").strip()
-        if proc.returncode != 0:
-            detail = str(proc.stderr or raw or "").strip()
-            raise RuntimeError(f"gemini cli failed: {detail[:300]}")
-        if not raw:
-            detail = str(proc.stderr or "").strip()
-            raise RuntimeError(f"gemini cli empty response: {detail[:300]}")
+        raw_bytes = proc.stdout or b""
+        raw = raw_bytes.decode("utf-8", errors="replace")
+        raw = self._normalize_gemini_cli_output(raw)
+        agy_log_text = ""
+        if agy_log_path is not None and not raw:
+            transcript_text, agy_log_text = self._extract_antigravity_cli_transcript_response(agy_log_path)
+            if transcript_text:
+                raw = transcript_text.strip()
 
+        stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            detail = stderr_text or raw or self._extract_antigravity_cli_error(agy_log_text)
+            raise RuntimeError(f"{cli_label} failed: {detail[:300]}")
+        if not raw:
+            detail = stderr_text or self._extract_antigravity_cli_error(agy_log_text)
+            raise RuntimeError(f"{cli_label} empty response: {detail[:300]}")
+        if agy_log_path is not None and self._is_antigravity_cli_busy_text(raw):
+            raise RuntimeError(f"{cli_label} service busy: {raw[:300]}")
+
+        # agy outputs plain text; try JSON first for backward compat
         try:
             obj = json.loads(raw)
+            if isinstance(obj, dict):
+                text = str(obj.get("response") or "").strip()
+                if text:
+                    return text
         except Exception:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if (start < 0) or (end < start):
-                raise RuntimeError("gemini cli json decode failed")
-            try:
-                obj = json.loads(raw[start : end + 1])
-            except Exception as e:
-                raise RuntimeError(f"gemini cli json decode failed: {e}") from e
-        if not isinstance(obj, dict):
-            raise RuntimeError("gemini cli invalid response type")
-        text = str(obj.get("response") or "").strip()
-        if not text:
-            raise RuntimeError("empty gemini chat response")
-        return text
+            pass
+
+        return raw
 
     async def extract_notice_file_head(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         return await asyncio.to_thread(
@@ -2579,7 +2706,7 @@ class AIService:
             raise RuntimeError("empty chat response")
         return text
 
-    def _gemini_chat_sync(self, user_input: str) -> str:
+    def _gemini_chat_sync(self, user_input: str, model_key: Optional[str] = None) -> str:
         if not self.gemini_chat_ready:
             raise RuntimeError("gemini chat not ready")
 
@@ -2588,7 +2715,7 @@ class AIService:
             return "鎯宠亰鐐瑰暐锛熷彂鎴戜竴鍙ヨ瘽灏辫銆?"
 
         prompt = self._build_gemini_cli_prompt(self.system_prompt, [], content)
-        return self._run_gemini_cli_sync(prompt)
+        return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
     def _chat_with_context_sync(self, session_key: str, user_input: str) -> str:
         if not self.chat_ready:
@@ -2627,9 +2754,9 @@ class AIService:
             self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
         return text
 
-    def _gemini_chat_with_context_sync(self, session_key: str, user_input: str) -> str:
+    def _gemini_chat_with_context_sync(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
         _ = session_key
-        return self._gemini_chat_sync(user_input)
+        return self._gemini_chat_sync(user_input, model_key)
 
     @staticmethod
     def _normalize_chat_history_item(item: object) -> Optional[Dict[str, str]]:
@@ -2875,7 +3002,7 @@ class AIService:
 
         client = self._create_deepseek_client()
         prompt = (
-            "你是电气2410班群消息过滤器。\n"
+            "你是 QQ 群消息过滤器。\n"
             "请判断下面内容是否属于“需要同学执行动作/流程/截止日期”的通知。\n"
             "如果是纯学习资料/课件/教材/日历/介绍，请只输出：[静默]\n"
             "如果是需要执行动作的通知，请只输出：[通知]\n"
@@ -2918,7 +3045,7 @@ class AIService:
 
         prompt = (
             "【角色设定】\n"
-            "你是电气2410班的 AI 助手 Cooper_bot。\n\n"
+            "你是 QQ 群里的 AI 助手 Cooper_bot。\n\n"
             "【任务】\n"
             "根据给定通知全文，生成一份简洁清晰的省流说明。\n"
             "只提取原文中明确出现的信息，不要补充、猜测或外推。\n"

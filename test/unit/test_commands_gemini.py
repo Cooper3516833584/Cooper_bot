@@ -10,10 +10,18 @@ def test_split_ai_chat_backend_gemini_prefix() -> None:
     assert backend == "gemini"
     assert text == "帮我联网查一下"
 
+    backend, text = commands._split_ai_chat_backend("c 帮我联网查一下")
+    assert backend == "claude"
+    assert text == "帮我联网查一下"
+
 
 def test_split_ai_chat_backend_gemini_prefix_without_space_and_uppercase() -> None:
     backend, text = commands._split_ai_chat_backend("G帮我联网查一下")
     assert backend == "gemini"
+    assert text == "帮我联网查一下"
+
+    backend, text = commands._split_ai_chat_backend("C帮我联网查一下")
+    assert backend == "claude"
     assert text == "帮我联网查一下"
 
 
@@ -21,6 +29,10 @@ def test_split_ai_chat_backend_default_prefix() -> None:
     backend, text = commands._split_ai_chat_backend("正常聊天内容")
     assert backend == "default"
     assert text == "正常聊天内容"
+
+    backend, text = commands._split_ai_chat_backend("a 帮我联网查一下")
+    assert backend == "default"
+    assert text == "a 帮我联网查一下"
 
 
 def test_private_ai_chat_accepts_plain_text() -> None:
@@ -40,16 +52,22 @@ def test_private_ai_chat_gemini_prefix() -> None:
     assert backend == "gemini"
     assert text == "查一下"
 
+    ai_input = commands._extract_ai_chat_input(ctx, evt, "c查一下", "Cooper_bot")
+    backend, text = commands._split_ai_chat_backend(ai_input or "")
 
-def test_private_ai_chat_keeps_leading_cg_as_default_text() -> None:
+    assert backend == "claude"
+    assert text == "查一下"
+
+
+def test_private_ai_chat_keeps_non_prefix_g_as_default_text() -> None:
     ctx = SimpleNamespace(scene="private_friend")
-    evt = {"message": [{"type": "text", "data": {"text": "Cg查一下"}}], "raw_message": "Cg查一下"}
+    evt = {"message": [{"type": "text", "data": {"text": "xg查一下"}}], "raw_message": "xg查一下"}
 
-    ai_input = commands._extract_ai_chat_input(ctx, evt, "Cg查一下", "Cooper_bot")
+    ai_input = commands._extract_ai_chat_input(ctx, evt, "xg查一下", "Cooper_bot")
     backend, text = commands._split_ai_chat_backend(ai_input or "")
 
     assert backend == "default"
-    assert text == "Cg查一下"
+    assert text == "xg查一下"
 
 
 def test_private_ai_chat_ignores_image_message() -> None:

@@ -24251,9 +24251,9 @@
           ]
         },
         {
-          "rel": "电路实验/综合试验/电气2410第7组综合实验报告.docx",
-          "path": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\电路实验\\综合试验\\电气2410第7组综合实验报告.docx",
-          "filename": "电气2410第7组综合实验报告.docx",
+          "rel": "电路实验/综合试验/第7组综合实验报告.docx",
+          "path": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\电路实验\\综合试验\\第7组综合实验报告.docx",
+          "filename": "第7组综合实验报告.docx",
           "size_mb": 1.77,
           "summary": "基于NI MyDAQ和LabVIEW的直流电机PWM调速综合实验报告，涵盖虚拟仪器编程、脉宽调制原理、ULN2003驱动电路搭建及占空比可调PWM波生成，实现电机转速控制。",
           "keywords": [

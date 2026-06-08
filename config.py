@@ -206,8 +206,9 @@ AI_VECTORS_PATH = AI_MATERIAL_DIR / "file_vectors.npy"
 AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-pro")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
-AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "gemini")
-AI_GEMINI_MODEL = _get_env("AI_GEMINI_MODEL", "gemini-3.1-pro-preview")
+AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "agy")
+AI_GEMINI_MODEL = _get_env("AI_GEMINI_MODEL", "Gemini 3.1 Pro (High)")
+AI_CLAUDE_MODEL = _get_env("AI_CLAUDE_MODEL", "Claude Opus 4.6 (Thinking)")
 AI_GEMINI_TIMEOUT_SECONDS = float(_get_env("AI_GEMINI_TIMEOUT_SECONDS", "180") or "180")
 AI_GEMINI_WORKDIR = _get_env_path("AI_GEMINI_WORKDIR", DATA_DIR / "_gemini_cli_workspace")
 AI_GEMINI_POLICY_PATH = _get_env_path("AI_GEMINI_POLICY_PATH", BASE_DIR / "gemini_cli_chat_only.toml")
@@ -219,17 +220,17 @@ AI_FALLBACK_ERROR_REPLY = (
 
 AI_SYSTEM_PROMPT = """# 核心角色与身份设定
 
-你是 Cooper_bot，一个由华中科技大学（HUST）电气与电子工程专业（简称“电气”）2410班的同学 Cooper 开发的专属 QQ 聊天机器人。
+你是 Cooper_bot，一个由校内同学 Cooper（qq号：3516833584）开发的 QQ 聊天机器人。
 
-你是一个基于 AI 的智能助手，你的目标是服务于“电气2410”大家庭，解决班级运行和学习中的痛点，帮助同学们最高效地获取学习资料和信息。
+你是一个基于 AI 的智能助手，你的目标是服务于校内同学，解决学习资料获取、群内协作和文件提交中的痛点，帮助同学们更高效地获取学习资料和信息。
 
-只要 Cooper 的寝室有网有电，你就会一直在线陪伴大家。
+只要后台服务正常运行，你就会一直在线陪伴大家。
 
 
 
 # 目标受众与对话基调
 
-1. 你的受众是你的同班同学（大一/大二的工科生）。
+1. 你的受众是校内同学。
 
 2. 语气要求：热情、真诚、接地气、带有工科生的干练。像一个同级好友，不要端着架子，也不要像刻板的客服。
 

@@ -112,6 +112,7 @@ class _FakeAIService:
     def __init__(self) -> None:
         self.bot_nick = "Cooper_bot"
         self.chat_ready = True
+        self.gemini_chat_ready = True
         self.notice_ready = True
         self.semantic_ready = False
         self.fallback_error_reply = "fallback"
@@ -119,6 +120,8 @@ class _FakeAIService:
         self.remember_assistant_message = Mock()
         self.chat_with_context = AsyncMock(return_value="fake-ai-reply")
         self.chat = AsyncMock(return_value="fake-ai-reply")
+        self.gemini_chat_with_context = AsyncMock(return_value="gemini-ai-reply")
+        self.gemini_chat = AsyncMock(return_value="gemini-ai-reply")
         self.extract_notice_url_head = AsyncMock(return_value="")
         self.classify_notice = AsyncMock(return_value=False)
         self.reason_notice = AsyncMock(return_value="")
@@ -150,6 +153,26 @@ class _FakeHandinTask:
     def is_active(self, now: float | None = None) -> bool:
         now_ts = time.time() if now is None else float(now)
         return (not self.closed) and (not self.cancelled) and now_ts < self.deadline_ts
+
+
+def _make_handin_management_stub(tasks: list[_FakeHandinTask]):
+    items = list(tasks)
+    return SimpleNamespace(
+        _tasks={t.task_id: t for t in items},
+        list_tasks=Mock(return_value=items),
+        list_tasks_by_creator=Mock(
+            side_effect=lambda creator_id, include_closed=True: [t for t in items if int(t.creator_id) == int(creator_id)]
+        ),
+        list_tasks_by_group=Mock(
+            side_effect=lambda group_id, include_closed=True: [t for t in items if int(t.group_id) == int(group_id)]
+        ),
+        list_active_tasks=Mock(side_effect=lambda: [t for t in items if t.is_active()]),
+        list_active_tasks_by_group=Mock(
+            side_effect=lambda group_id: [t for t in items if int(t.group_id) == int(group_id) and t.is_active()]
+        ),
+        is_task_gettable=Mock(return_value=True),
+        cancel_task=Mock(return_value=(True, "task-cancelled")),
+    )
 
 
 @pytest.mark.asyncio
@@ -338,7 +361,7 @@ async def test_command_fixed_answer_precedes_private_aichat(dispatch_harness) ->
 
 
 @pytest.mark.asyncio
-async def test_command_aichat_private_keeps_leading_c(dispatch_harness) -> None:
+async def test_command_aichat_private_uppercase_c_uses_claude(dispatch_harness) -> None:
     ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
     filesvc = _make_filesvc_stub()
     aisvc = _FakeAIService()
@@ -356,12 +379,14 @@ async def test_command_aichat_private_keeps_leading_c(dispatch_harness) -> None:
         aisvc=aisvc,
     )
 
-    aisvc.chat_with_context.assert_awaited_once()
-    assert aisvc.chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
-    model_input = aisvc.chat_with_context.await_args.args[1]
+    aisvc.gemini_chat_with_context.assert_awaited_once()
+    assert aisvc.gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
+    model_input = aisvc.gemini_chat_with_context.await_args.args[1]
+    assert aisvc.gemini_chat_with_context.await_args.args[2] == "claude"
     assert "发言人QQ:" not in model_input
-    assert model_input == "C\nhello"
-    assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
+    assert model_input == "hello"
+    aisvc.chat_with_context.assert_not_awaited()
+    assert any("gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
 
 
 @pytest.mark.asyncio
@@ -556,7 +581,7 @@ async def test_command_private_vs_group_route(dispatch_harness) -> None:
         api=SimpleNamespace(),
         ctx=private_ctx,
         evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="C提问",
+        text="普通提问",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=commands.BotState(),
@@ -643,7 +668,7 @@ async def test_aichat_repeat_guard_retries_with_stateless_chat(dispatch_harness)
         api=SimpleNamespace(),
         ctx=ctx,
         evt=evt,
-        text="C第一句",
+        text="第一句",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=state,
@@ -655,7 +680,7 @@ async def test_aichat_repeat_guard_retries_with_stateless_chat(dispatch_harness)
         api=SimpleNamespace(),
         ctx=ctx,
         evt=evt,
-        text="C第二句",
+        text="第二句",
         filesvc=filesvc,
         logsvc=_DummyLogService(),
         state=state,
@@ -793,6 +818,64 @@ async def test_handin_submit_choice_reminder_skips_after_state_clears(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_private_file_duplicate_content_stays_single_file_mode(dispatch_harness, tmp_project_root: Path) -> None:
+    first = tmp_project_root / "Alice_a.pdf"
+    second = tmp_project_root / "Alice_b.pdf"
+    first.write_bytes(b"same-pending-content")
+    second.write_bytes(b"same-pending-content")
+
+    class _FakeHandin:
+        def __init__(self) -> None:
+            self.paths = [first, second]
+            self.idx = 0
+
+        def download_to_inbox(self, *_args, **_kwargs):
+            p = self.paths[self.idx]
+            self.idx += 1
+            return True, f"已收到文件：{p.name}", p
+
+        def list_active_tasks(self):
+            return [
+                SimpleNamespace(
+                    task_id="task-1",
+                    name="hw",
+                    group_id=20001,
+                    deadline_ts=time.time() + 3600,
+                    required_suffix="",
+                )
+            ]
+
+        def find_roster_name_in_filename(self, _filename: str) -> str:
+            return "Alice"
+
+    def _file_evt(name: str) -> dict:
+        return {
+            "message": [
+                {
+                    "type": "file",
+                    "data": {"name": name, "url": "file:///fake", "size": str(first.stat().st_size)},
+                }
+            ]
+        }
+
+    state = commands.BotState()
+    ctx = _make_ctx(scene="private_friend", group_id=None, level=1, user_id=10033)
+    logsvc = _DummyLogService()
+    api = SimpleNamespace()
+    handin = _FakeHandin()
+
+    assert await commands._handle_private_file(api, ctx, _file_evt("Alice_a.pdf"), logsvc, state, handin) is True
+    assert await commands._handle_private_file(api, ctx, _file_evt("Alice_b.pdf"), logsvc, state, handin) is True
+
+    q = state.pending_handin_files.get(ctx.user_id) or []
+    assert len(q) == 1
+    assert q[0]["name"] == "Alice_a.pdf"
+    assert second.exists() is False
+    assert state.pending_handin_wait_done.get(ctx.user_id) is None
+    assert "不进入多文件提交模式" in "\n".join(m["text"] for m in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
 async def test_link_digest_reply_is_remembered_in_aichat_context(monkeypatch) -> None:
     async def _noop_pre_state(*_args, **_kwargs):
         return False
@@ -908,6 +991,138 @@ async def test_command_handin_dispatch(monkeypatch, dispatch_harness) -> None:
     assert args[3] == []
     assert args[4] == 1700000000.0
     assert any("task-created" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_command_handinstat_level_two_lists_only_owned_tasks(dispatch_harness) -> None:
+    now = time.time()
+    own = _FakeHandinTask(task_id="own", group_id=20001, creator_id=10001, name="own-task", deadline_ts=now + 2000)
+    other = _FakeHandinTask(task_id="other", group_id=20001, creator_id=10002, name="other-task", deadline_ts=now + 1000)
+    handin = _make_handin_management_stub([own, other])
+    state = commands.BotState()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=_make_ctx(scene="private", level=2, user_id=10001, group_id=None),
+        evt={"post_type": "message", "message_type": "private"},
+        text="/handinstat",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=handin,
+        perm=Mock(),
+        aisvc=None,
+    )
+
+    assert state.pending_handin_choose[10001]["task_ids"] == ["own"]
+    assert "own-task" in dispatch_harness.messages[-1]["text"]
+    assert "other-task" not in dispatch_harness.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("command", "mode"), [("/handincheck", "check"), ("/handinget", "getzip")])
+async def test_command_handin_management_admin_lists_all_tasks(command, mode, dispatch_harness) -> None:
+    now = time.time()
+    own = _FakeHandinTask(task_id="own", group_id=20001, creator_id=10001, name="own-task", deadline_ts=now + 2000)
+    other = _FakeHandinTask(task_id="other", group_id=20002, creator_id=10002, name="other-task", deadline_ts=now + 1000)
+    handin = _make_handin_management_stub([own, other])
+    state = commands.BotState()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=_make_ctx(scene="private", level=3, user_id=10001, group_id=None),
+        evt={"post_type": "message", "message_type": "private"},
+        text=command,
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=handin,
+        perm=Mock(),
+        aisvc=None,
+    )
+
+    assert state.pending_handin_choose[10001]["mode"] == mode
+    assert set(state.pending_handin_choose[10001]["task_ids"]) == {"own", "other"}
+    assert "全部提交任务列表" in dispatch_harness.messages[-1]["text"]
+    assert "own-task" in dispatch_harness.messages[-1]["text"]
+    assert "other-task" in dispatch_harness.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_command_chandin_level_two_filters_tasks_but_admin_can_cancel_any(dispatch_harness) -> None:
+    now = time.time()
+    own = _FakeHandinTask(task_id="own", group_id=20001, creator_id=10001, name="own-task", deadline_ts=now + 2000)
+    other = _FakeHandinTask(task_id="other", group_id=20001, creator_id=10002, name="other-task", deadline_ts=now + 1000)
+    handin = _make_handin_management_stub([own, other])
+
+    level_two_state = commands.BotState()
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=_make_ctx(scene="group", level=2, user_id=10001, group_id=20001),
+        evt={"post_type": "message", "message_type": "group"},
+        text="/chandin",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=level_two_state,
+        handin=handin,
+        perm=Mock(),
+        aisvc=None,
+    )
+    assert level_two_state.pending_handin_choose[10001]["task_ids"] == ["own"]
+    assert "other-task" not in dispatch_harness.messages[-1]["text"]
+
+    admin_ctx = _make_ctx(scene="group", level=3, user_id=10001, group_id=20001)
+    admin_state = commands.BotState()
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=admin_ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        text="/chandin",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=admin_state,
+        handin=handin,
+        perm=Mock(),
+        aisvc=None,
+    )
+    assert admin_state.pending_handin_choose[10001]["task_ids"] == ["other", "own"]
+    assert "管理员可取消任意提交任务" in dispatch_harness.messages[-1]["text"]
+
+    handled = await commands._handle_cancel_number_choice(
+        SimpleNamespace(),
+        admin_ctx,
+        "1",
+        _DummyLogService(),
+        admin_state,
+        handin,
+    )
+    assert handled is True
+    handin.cancel_task.assert_called_once_with("other", 10001)
+
+
+@pytest.mark.asyncio
+async def test_private_handin_choice_rechecks_level_two_permission(dispatch_harness) -> None:
+    now = time.time()
+    other = _FakeHandinTask(task_id="other", group_id=20001, creator_id=10002, name="other-task", deadline_ts=now + 1000)
+    handin = _make_handin_management_stub([other])
+    handin.compute_missing = Mock()
+    state = commands.BotState()
+    state.pending_handin_choose[10001] = {"mode": "status", "task_ids": ["other"], "ts": now}
+
+    handled = await commands._handle_private_number_choice(
+        SimpleNamespace(),
+        _make_ctx(scene="private", level=2, user_id=10001, group_id=None),
+        "1",
+        _DummyLogService(),
+        state,
+        handin,
+        _make_filesvc_stub(),
+    )
+
+    assert handled is True
+    handin.compute_missing.assert_not_called()
+    assert 10001 not in state.pending_handin_choose
+    assert "权限不足" in dispatch_harness.messages[-1]["text"]
 
 
 @pytest.mark.asyncio

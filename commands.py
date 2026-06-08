@@ -745,13 +745,13 @@ async def reply(
     reply_key = f"{send_scene}:{target}:{text.strip()}"
     if not _claim_recent_reply(reply_key):
         logsvc.log.info(f"消息发送去重：已拦截重复回复 target={target}")
-        return
+        return False
     resp = await _send_once()
     if resp is None:
         logsvc.log.info(
             f"消息发送未确认：scene={send_scene}, group={send_group_id}, user={send_user_id}，为避免重复发送不再重试"
         )
-        return
+        return False
     if not _onebot_resp_ok(resp):
         # transient network / bridge timeout retry once
         await asyncio.sleep(0.35)
@@ -761,10 +761,12 @@ async def reply(
         logsvc.log_out(ctx, text)
         if not skip_context_once:
             _remember_bot_reply_message(ctx, text, logsvc, send_scene, send_group_id, send_user_id)
+        return True
     else:
         logsvc.log.warning(
             f"reply send failed: scene={send_scene}, group={send_group_id}, user={send_user_id}, detail={_onebot_resp_detail(resp)}"
         )
+        return False
 
 
 def _split_args(text: str):
@@ -1846,11 +1848,34 @@ def _split_ai_chat_backend(ai_input: str) -> Tuple[str, str]:
     if not text:
         return "default", ""
     low = text.lower()
+    if low.startswith("antigravity"):
+        return "gemini", text[11:].strip()
     if low.startswith("gemini"):
         return "gemini", text[6:].strip()
+    if low.startswith("claude"):
+        return "claude", text[6:].strip()
     if text[:1] in {"g", "G"}:
         return "gemini", text[1:].strip()
+    if text[:1] in {"c", "C"}:
+        return "claude", text[1:].strip()
     return "default", text
+
+
+def _is_antigravity_busy_error(err: object) -> bool:
+    low = str(err or "").lower()
+    return (
+        "no capacity available" in low
+        or "servers are experiencing high traffic" in low
+        or "high traffic right now" in low
+        or "resource exhausted" in low
+        or "service busy" in low
+        or "unavailable (code 503)" in low
+    )
+
+
+def _antigravity_busy_reply(backend: str) -> str:
+    model = "Claude Opus 4.6" if backend == "claude" else "Gemini 3.1 Pro"
+    return f"antigravity 的 {model} 当前服务繁忙，上游暂时没有可用容量，请稍后再试。"
 
 
 def _ai_chat_session_key(ctx) -> Optional[str]:
@@ -2692,6 +2717,19 @@ def _handin_tasks_list_text(tasks) -> str:
     return "\n".join(lines)
 
 
+def _can_manage_handin_task(ctx, task) -> bool:
+    try:
+        if int(getattr(ctx, "level", 0) or 0) >= 3:
+            return True
+        return int(getattr(task, "creator_id", 0) or 0) == int(getattr(ctx, "user_id", 0) or 0)
+    except Exception:
+        return False
+
+
+def _filter_manageable_handin_tasks(ctx, tasks):
+    return [t for t in tasks if _can_manage_handin_task(ctx, t)]
+
+
 def _looks_like_handin_suffix_token(token: str) -> bool:
     raw = str(token or "").strip()
     if not raw:
@@ -2759,6 +2797,44 @@ def _pending_handin_matches_required_suffix(item: dict, required_suffix: str) ->
     if not suffix:
         return True
     return any(file_matches_required_suffix(name, suffix) for name in _pending_handin_source_names(item))
+
+
+def _find_pending_duplicate_by_hash(items: List[dict], file_sha: str) -> str:
+    sha = str(file_sha or "").strip().lower()
+    if not sha:
+        return ""
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        old_sha = str(it.get("sha256") or "").strip().lower()
+        if not old_sha:
+            p = Path(str(it.get("path") or ""))
+            if p.exists() and p.is_file():
+                old_sha = HandinService.file_sha256(p)
+                it["sha256"] = old_sha
+        if old_sha and old_sha == sha:
+            return str(it.get("name") or Path(str(it.get("path") or "")).name or "已在队列中的文件")
+    return ""
+
+
+def _pending_duplicate_skip_message(download_msg: str, duplicate_name: str, q_len: int, state: BotState, user_id: int) -> str:
+    lines = [
+        download_msg,
+        f"检测到该文件内容与当前待提交文件「{duplicate_name}」完全一致，已自动跳过。",
+    ]
+    if q_len == 1:
+        lines.append("当前仍只有 1 个待提交文件，不进入多文件提交模式。")
+    if state.pending_handin_zip_name.get(user_id):
+        lines.append(f"当前打包队列共 {q_len} 个文件，请回复压缩包名称（无需加 .zip）。")
+    elif state.pending_handin_wait_done.get(user_id):
+        lines.append(f"当前打包队列共 {q_len} 个文件；发完后请回复 done。")
+    elif state.pending_handin_name_input.get(user_id):
+        lines.append("请继续回复提交者姓名（或回复 0 跳过）。")
+    else:
+        pend = state.pending_handin_choose.get(user_id)
+        if isinstance(pend, dict) and pend.get("mode") == "submit":
+            lines.append("请继续回复任务序号处理当前待提交文件。")
+    return "\n".join(lines)
 
 
 async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: BotState, handin: HandinService) -> bool:
@@ -2839,7 +2915,30 @@ async def _handle_private_file(api, ctx, evt: dict, logsvc: LogService, state: B
         return True
     # 入队
     q = state.pending_handin_files.get(ctx.user_id) or []
-    q.append({"path": str(p), "name": fname, "ts": time.time()})
+    try:
+        file_sha = await asyncio.to_thread(HandinService.file_sha256, Path(p))
+        duplicate_name = await asyncio.to_thread(_find_pending_duplicate_by_hash, q, file_sha)
+    except Exception as e:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except Exception as e2:
+            logsvc.log.warning(f"cleanup hash-failed handin file failed: user={ctx.user_id} err={e2}")
+        await reply(api, ctx, f"{msg}\n文件校验失败，本次提交已终止：{e}", logsvc)
+        return True
+    state.pending_handin_files[ctx.user_id] = q
+    if duplicate_name:
+        try:
+            Path(p).unlink(missing_ok=True)
+        except Exception as e:
+            logsvc.log.warning(f"cleanup duplicate pending handin file failed: user={ctx.user_id} err={e}")
+        await reply(
+            api,
+            ctx,
+            _pending_duplicate_skip_message(msg, duplicate_name, len(q), state, ctx.user_id),
+            logsvc,
+        )
+        return True
+    q.append({"path": str(p), "name": fname, "sha256": file_sha, "ts": time.time()})
     state.pending_handin_files[ctx.user_id] = q
     # 已进入“等待 zip 名称”阶段时，新文件继续加入队列并保持等待命名
     if state.pending_handin_zip_name.get(ctx.user_id):
@@ -2969,7 +3068,12 @@ async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogServic
         state.pending_handin_overwrite.pop(ctx.user_id, None)
         await reply(api, ctx, "已取消覆盖，请修改文件名后重新发送。", logsvc)
     else:
-        ok, msg2, dst, code = handin.move_inbox_to_task(Path(item.get("path")), task, overwrite=True)
+        ok, msg2, dst, code = await asyncio.to_thread(
+            handin.move_inbox_to_task,
+            Path(item.get("path")),
+            task,
+            True,
+        )
         if ok:
             q.pop(item_idx)
             state.pending_handin_files[ctx.user_id] = q
@@ -2979,6 +3083,15 @@ async def _handle_private_overwrite_yesno(api, ctx, text: str, logsvc: LogServic
             sid = extract_student_id(name)
             warn = ""
             await reply(api, ctx, msg2 + warn, logsvc)
+        elif code == "DUPLICATE":
+            try:
+                Path(item.get("path")).unlink(missing_ok=True)
+            except Exception as e:
+                logsvc.log.warning(f"cleanup duplicate overwrite file failed: user={ctx.user_id} item={item} err={e}")
+            q.pop(item_idx)
+            state.pending_handin_files[ctx.user_id] = q
+            state.pending_handin_overwrite.pop(ctx.user_id, None)
+            await reply(api, ctx, msg2, logsvc)
         else:
             # 覆盖失败：保留文件，让用户重新选择或取消
             state.pending_handin_overwrite.pop(ctx.user_id, None)
@@ -3140,12 +3253,36 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
                 msg = f"任务「{task.name}」仅接收 {suffix_text} 文件；本次提交的文件格式不符，已取消本轮提交。"
             await reply(api, ctx, msg + "\n请重新发送符合要求的文件。", logsvc)
             return True
-        ok, msg2, dst, code = handin.move_inbox_to_task(Path(item["path"]), task, overwrite=False)
+        ok, msg2, dst, code = await asyncio.to_thread(
+            handin.move_inbox_to_task,
+            Path(item["path"]),
+            task,
+            False,
+        )
         if (not ok) and code == "EXISTS":
             # 等待 Y/N
             state.pending_handin_overwrite[ctx.user_id] = {"task_id": tid, "path": str(item["path"]), "name": item.get("name") or "", "ts": time.time()}
             state.pending_handin_choose.pop(ctx.user_id, None)
             await reply(api, ctx, f"{msg2}\n是否覆盖？(Y/N)", logsvc)
+            return True
+        if (not ok) and code == "DUPLICATE":
+            try:
+                Path(item["path"]).unlink(missing_ok=True)
+            except Exception as e:
+                logsvc.log.warning(f"cleanup duplicate submitted file failed: user={ctx.user_id} item={item} err={e}")
+            q.pop(0)
+            state.pending_handin_files[ctx.user_id] = q
+            await reply(api, ctx, msg2, logsvc)
+            if q:
+                tasks = handin.list_active_tasks()
+                state.pending_handin_name_input.pop(ctx.user_id, None)
+                _set_pending_handin_submit_choice(api, ctx, logsvc, state, [t.task_id for t in tasks])
+                await reply(api, ctx, f"你还有 {len(q)} 份待分配文件。\n" + _handin_tasks_list_text(tasks), logsvc)
+            else:
+                state.pending_handin_wait_done.pop(ctx.user_id, None)
+                state.pending_handin_zip_name.pop(ctx.user_id, None)
+                state.pending_handin_name_input.pop(ctx.user_id, None)
+                state.pending_handin_choose.pop(ctx.user_id, None)
             return True
         if not ok:
             # 归档失败：保留文件，让用户重新选择或取消
@@ -3184,6 +3321,10 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
             await reply(api, ctx, "任务不存在。", logsvc)
             state.pending_handin_choose.pop(ctx.user_id, None)
             return True
+        if not _can_manage_handin_task(ctx, task):
+            await reply(api, ctx, "权限不足：只能操作你创建的任务（或联系管理员）。", logsvc)
+            state.pending_handin_choose.pop(ctx.user_id, None)
+            return True
         ok, msgx, missing, stats = handin.compute_missing(task)
         if ok:
             text2 = handin.format_missing_message(task, missing, stats, "📋 未提交名单")
@@ -3205,6 +3346,10 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
         task = handin._tasks.get(tid)
         if not task:
             await reply(api, ctx, "任务不存在。", logsvc)
+            state.pending_handin_choose.pop(ctx.user_id, None)
+            return True
+        if not _can_manage_handin_task(ctx, task):
+            await reply(api, ctx, "权限不足：只能操作你创建的任务（或联系管理员）。", logsvc)
             state.pending_handin_choose.pop(ctx.user_id, None)
             return True
         files = handin.list_submitted_files(task)
@@ -3233,6 +3378,10 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
         task = handin._tasks.get(tid)
         if not task:
             await reply(api, ctx, "任务不存在。", logsvc)
+            state.pending_handin_choose.pop(ctx.user_id, None)
+            return True
+        if not _can_manage_handin_task(ctx, task):
+            await reply(api, ctx, "权限不足：只能操作你创建的任务（或联系管理员）。", logsvc)
             state.pending_handin_choose.pop(ctx.user_id, None)
             return True
         safe = handin._safe_component(task.name)
@@ -3305,7 +3454,7 @@ async def _handle_cancel_number_choice(api, ctx, text: str, logsvc: LogService, 
         await reply(api, ctx, "任务不存在或已结束。", logsvc)
         return True
     # 权限：仅允许创建者或管理员取消
-    if ctx.level < 3 and int(task.creator_id) != int(ctx.user_id):
+    if not _can_manage_handin_task(ctx, task):
         state.pending_handin_choose.pop(ctx.user_id, None)
         await reply(api, ctx, "权限不足：只能取消你创建的任务（或联系管理员）。", logsvc)
         return True
@@ -3536,10 +3685,11 @@ async def _handle_ai_chat_trigger(
         if aisvc is None:
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
-        use_gemini = backend == "gemini"
+        use_gemini = backend in {"gemini", "claude"}
+        model_key = backend if use_gemini else None
         ready = bool(getattr(aisvc, "gemini_chat_ready", False)) if use_gemini else bool(getattr(aisvc, "chat_ready", False))
         if not ready:
-            msg = "Gemini 联网聊天暂时不可用（Gemini CLI 未就绪）。" if use_gemini else "AI 聊天暂时不可用（配置未就绪）。"
+            msg = "antigravity 联网聊天暂时不可用（antigravity CLI 未就绪）。" if use_gemini else "AI 聊天暂时不可用（配置未就绪）。"
             await reply(api, ctx, msg, logsvc)
             return True
         chat_with_context_fn = getattr(aisvc, "gemini_chat_with_context", None) if use_gemini else getattr(aisvc, "chat_with_context", None)
@@ -3550,19 +3700,28 @@ async def _handle_ai_chat_trigger(
         try:
             session_key = _ai_chat_session_key(ctx)
             if session_key and callable(chat_with_context_fn):
-                out = (await chat_with_context_fn(session_key, ai_input)).strip()
+                if use_gemini:
+                    out = (await chat_with_context_fn(session_key, ai_input, model_key)).strip()
+                else:
+                    out = (await chat_with_context_fn(session_key, ai_input)).strip()
                 try:
                     setattr(ctx, "_skip_reply_context_once", True)
                 except Exception:
                     pass
             else:
-                out = (await chat_fn(ai_input)).strip()
+                if use_gemini:
+                    out = (await chat_fn(ai_input, model_key)).strip()
+                else:
+                    out = (await chat_fn(ai_input)).strip()
             if out and _is_likely_ai_stuck_repeat(session_key, ai_input, out):
                 retry_prompt = (
                     "你刚才出现了机械复读。请只根据这条新消息给出新的、准确的回复，不要复述上一条答案。\n"
                     + ai_input
                 )
-                retry_out = (await chat_fn(retry_prompt)).strip()
+                if use_gemini:
+                    retry_out = (await chat_fn(retry_prompt, model_key)).strip()
+                else:
+                    retry_out = (await chat_fn(retry_prompt)).strip()
                 if retry_out:
                     out = retry_out
             if not out:
@@ -3571,12 +3730,15 @@ async def _handle_ai_chat_trigger(
         except Exception as e:
             try:
                 logsvc.log.warning(
-                    f"AI chat failed: backend={'gemini' if use_gemini else 'default'} "
+                    f"AI chat failed: backend={backend} "
                     f"session={(session_key or '')[:80]} err={e}"
                 )
             except Exception:
                 pass
-            await reply(api, ctx, aisvc.fallback_error_reply, logsvc)
+            fallback_text = _antigravity_busy_reply(backend) if use_gemini and _is_antigravity_busy_error(e) else aisvc.fallback_error_reply
+            fallback_sent = await reply(api, ctx, fallback_text, logsvc)
+            if fallback_sent is False and ctx.scene == "group":
+                await reply(api, ctx, fallback_text, logsvc, force_private_user_id=ctx.user_id)
         return True
     return False
 
@@ -3865,21 +4027,23 @@ async def _handle_explicit_command(
             ])
         lines.extend([
             "",
-            "AI聊天：",
+            "AI聊天（默认 DeepSeek）：",
             "群聊：@Cooper_bot + 内容",
-            "群聊（Gemini联网）：@Cooper_bot g内容（g/G 后面可不加空格）",
+            "群聊（antigravity Gemini）：@Cooper_bot g内容（g/G 后面可不加空格）",
+            "群聊（antigravity Claude）：@Cooper_bot c内容（c/C 后面可不加空格）",
             "私聊：直接发送文本内容",
-            "私聊（Gemini联网）：g内容（g/G 后面可不加空格）",
+            "私聊（antigravity Gemini）：g内容（g/G 后面可不加空格）",
+            "私聊（antigravity Claude）：c内容（c/C 后面可不加空格）",
         ])
         if ctx.level >= 2:
             lines.extend([
                 "",
                 "提交功能：",
                 "/handin 任务名 [文件后缀] [提醒时间...] 截止时间（仅群聊，如 pdf/docx）",
-                "/handinstat  查看任务并查询未交",
-                "/handincheck  查看你创建任务的已交文件（可配合 /get）",
-                "/handinget  打包你创建任务的已交文件并发送",
-                "/chandin  取消提交任务（按提示回复序号）",
+                "/handinstat  查看可管理任务并查询未交",
+                "/handincheck  查看可管理任务的已交文件（可配合 /get）",
+                "/handinget  打包可管理任务的已交文件并发送",
+                "/chandin  取消可管理的提交任务（按提示回复序号）",
                 "私聊发送文件后按提示操作；多文件发完后回复 done；限定后缀时多文件至少包含一个匹配文件。",
             ])
         msg = "\n".join(lines)
@@ -3963,6 +4127,7 @@ async def _handle_explicit_command(
             tasks = handin.list_tasks(include_closed=True)
             # 仅保留仍可 /handinget 的任务（归档未被清理）
             tasks = [t for t in tasks if handin.is_task_gettable(t)]
+        tasks = _filter_manageable_handin_tasks(ctx, tasks)
         if not tasks:
             await reply(api, ctx, "当前没有提交任务记录。", logsvc)
             return
@@ -3998,11 +4163,11 @@ async def _handle_explicit_command(
         if ctx.level < 2:
             await reply(api, ctx, "权限不足：/handincheck 仅对 2 级及以上开放。", logsvc)
             return
-        tasks = handin.list_tasks_by_creator(ctx.user_id, include_closed=True)
+        tasks = handin.list_tasks(include_closed=True) if ctx.level >= 3 else handin.list_tasks_by_creator(ctx.user_id, include_closed=True)
         # 仅保留仍可 /handinget 的任务（归档未被清理）
         tasks = [t for t in tasks if handin.is_task_gettable(t)]
         if not tasks:
-            await reply(api, ctx, "你当前没有提交任务记录。", logsvc)
+            await reply(api, ctx, "当前没有提交任务记录。", logsvc)
             return
         now = time.time()
         def _status_tag(t):
@@ -4014,7 +4179,7 @@ async def _handle_explicit_command(
                 return "已结束"
             return "进行中"
         tasks.sort(key=lambda t: (0 if t.is_active(now) else 1, -float(t.deadline_ts)))
-        text_list = ["你创建的提交任务列表："]
+        text_list = ["全部提交任务列表：" if ctx.level >= 3 else "你创建的提交任务列表："]
         for i, tsk in enumerate(tasks, 1):
             text_list.append(f"{i}. [{_status_tag(tsk)}] {tsk.name}（群 {tsk.group_id}，截止 {pretty_ts(tsk.deadline_ts)}）")
         text_list.append("回复数字选择任务（回复 0 取消），我会列出已提交文件列表（已截止任务也可查看）。")
@@ -4029,11 +4194,11 @@ async def _handle_explicit_command(
         if ctx.level < 2:
             await reply(api, ctx, "权限不足：/handinget 仅对 2 级及以上开放。", logsvc)
             return
-        tasks = handin.list_tasks_by_creator(ctx.user_id, include_closed=True)
+        tasks = handin.list_tasks(include_closed=True) if ctx.level >= 3 else handin.list_tasks_by_creator(ctx.user_id, include_closed=True)
         # 仅保留仍可 /handinget 的任务（归档未被清理）
         tasks = [t for t in tasks if handin.is_task_gettable(t)]
         if not tasks:
-            await reply(api, ctx, "你当前没有提交任务记录。", logsvc)
+            await reply(api, ctx, "当前没有提交任务记录。", logsvc)
             return
         now = time.time()
         def _status_tag(t):
@@ -4045,7 +4210,7 @@ async def _handle_explicit_command(
                 return "已结束"
             return "进行中"
         tasks.sort(key=lambda t: (0 if t.is_active(now) else 1, -float(t.deadline_ts)))
-        text_list = ["你创建的提交任务列表："]
+        text_list = ["全部提交任务列表：" if ctx.level >= 3 else "你创建的提交任务列表："]
         for i, tsk in enumerate(tasks, 1):
             text_list.append(f"{i}. [{_status_tag(tsk)}] {tsk.name}（群 {tsk.group_id}，截止 {pretty_ts(tsk.deadline_ts)}）")
         text_list.append("回复数字选择任务（回复 0 取消），我会把已提交文件打包为 zip 并发送（已截止任务也可导出）。")
@@ -4060,7 +4225,7 @@ async def _handle_explicit_command(
         if ctx.level < 2:
             await reply(api, ctx, "权限不足：/chandin 仅对 2 级及以上开放。", logsvc)
             return
-        # 群里默认只列本群任务；私聊则列“你创建的任务”（管理员可列全部）
+        # 群里默认只列本群可管理任务；私聊则列全部可管理任务
         if ctx.scene == "group" and ctx.group_id is not None:
             list_res = list_handin_tasks_for_group(
                 handin=handin,
@@ -4073,12 +4238,9 @@ async def _handle_explicit_command(
             tasks = list_res.data.get("tasks") if (list_res.ok and isinstance(list_res.data, dict)) else []
             pend_gid = int(ctx.group_id)
         else:
-            all_tasks = handin.list_active_tasks()
-            if ctx.level >= 3:
-                tasks = all_tasks
-            else:
-                tasks = [t for t in all_tasks if int(t.creator_id) == int(ctx.user_id)]
+            tasks = handin.list_active_tasks()
             pend_gid = None
+        tasks = _filter_manageable_handin_tasks(ctx, tasks)
         if not tasks:
             await reply(api, ctx, "当前没有可取消的提交任务。", logsvc)
             return
@@ -4086,7 +4248,7 @@ async def _handle_explicit_command(
         for i, tsk in enumerate(tasks, 1):
             text_list.append(f"{i}. {tsk.name}（群 {tsk.group_id}，截止 {pretty_ts(tsk.deadline_ts)}）")
         text_list.append("回复数字取消该任务；回复 0 取消操作。")
-        text_list.append("（提示：仅允许取消你创建的任务。）")
+        text_list.append("（管理员可取消任意提交任务。）" if ctx.level >= 3 else "（仅允许取消你创建的任务。）")
         await reply(api, ctx, "\n".join(text_list), logsvc)
         state.pending_handin_choose[ctx.user_id] = {"mode": "cancel", "task_ids": [t.task_id for t in tasks], "group_id": pend_gid, "ts": time.time()}
         return
