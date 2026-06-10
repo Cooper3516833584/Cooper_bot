@@ -29,6 +29,7 @@ from config import (
     AI_GEMINI_CLI_PATH,
     AI_GEMINI_MODEL,
     AI_GEMINI_POLICY_PATH,
+    AI_GEMINI_RESTRICTED_WORKDIR,
     AI_GEMINI_TIMEOUT_SECONDS,
     AI_GEMINI_WORKDIR,
     AI_INDEX_PATH,
@@ -140,6 +141,7 @@ class AIService:
         self.claude_model = str(AI_CLAUDE_MODEL or "Claude Opus 4.6 (Thinking)").strip()
         self.gemini_policy_path = Path(AI_GEMINI_POLICY_PATH)
         self.gemini_workdir = Path(AI_GEMINI_WORKDIR)
+        self.gemini_restricted_workdir = Path(AI_GEMINI_RESTRICTED_WORKDIR)
         self.gemini_timeout_seconds = max(10.0, float(AI_GEMINI_TIMEOUT_SECONDS or 120.0))
         self.search_limit = max(1, int(AI_SEARCH_LIMIT))
         self.search_min_similarity = float(AI_SEARCH_MIN_SIMILARITY)
@@ -286,6 +288,12 @@ class AIService:
     async def gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
         return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key)
 
+    async def restricted_gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
+        return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key, True)
+
+    async def restricted_gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
+        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, True)
+
     def remember_user_message(self, session_key: str, message_text: str) -> None:
         self._remember_chat_message(session_key, "user", message_text)
 
@@ -346,6 +354,26 @@ class AIService:
         if not content:
             return ""
         return "Use google_web_search before answering this exact user request:\n\n" + content
+
+    def _build_restricted_gemini_cli_prompt(
+        self,
+        system_prompt: str,
+        history: List[Dict[str, str]],
+        user_input: str,
+    ) -> str:
+        _ = system_prompt, history
+        content = str(user_input or "").strip()
+        if not content:
+            return ""
+        return (
+            "Security policy for this QQ bot request:\n"
+            "- You may answer the user and, when current/public information is needed, use google_web_search only.\n"
+            "- Do not use any local-computer capability: no read_file, read_many_files, list_directory, glob, grep_search, write_file, replace, run_shell_command, ask_user, save_memory, activate_skill, or MCP/local tools.\n"
+            "- Do not inspect, modify, execute, or summarize files, folders, processes, environment variables, shell output, browser state, or credentials on this computer.\n"
+            "- If the request cannot be answered with normal model knowledge plus public web search, say you can only help with联网搜索获取信息.\n\n"
+            "Use google_web_search before answering this exact user request:\n\n"
+            + content
+        )
 
     @staticmethod
     def _normalize_gemini_cli_output(raw: str) -> str:
@@ -463,14 +491,14 @@ class AIService:
                 return out[-1], log_text
         return "", log_text
 
-    def _run_gemini_cli_sync(self, prompt: str, model_name: Optional[str] = None) -> str:
+    def _run_gemini_cli_sync(self, prompt: str, model_name: Optional[str] = None, restricted: bool = False) -> str:
         base_cmd = self._build_gemini_cli_base_command()
         if not base_cmd:
             raise RuntimeError("gemini cli not found")
         policy_path = Path(self.gemini_policy_path)
         if not policy_path.is_file():
             raise RuntimeError("gemini policy file not found")
-        workdir = Path(self.gemini_workdir)
+        workdir = Path(self.gemini_restricted_workdir if restricted else self.gemini_workdir)
         workdir.mkdir(parents=True, exist_ok=True)
 
         agy_log_path: Optional[Path] = None
@@ -478,6 +506,10 @@ class AIService:
         if self._is_antigravity_cli_command(base_cmd):
             agy_log_path = self._build_antigravity_log_path(workdir)
             cmd.extend(["--log-file", str(agy_log_path)])
+            if restricted:
+                cmd.append("--sandbox")
+        elif restricted:
+            raise RuntimeError("restricted gemini chat requires antigravity cli")
         cli_label = "antigravity cli" if agy_log_path is not None else "gemini cli"
         cmd.extend(["-p", str(prompt or "")])
         cli_model = str(model_name if model_name is not None else self.gemini_model or "").strip()
@@ -2706,7 +2738,7 @@ class AIService:
             raise RuntimeError("empty chat response")
         return text
 
-    def _gemini_chat_sync(self, user_input: str, model_key: Optional[str] = None) -> str:
+    def _gemini_chat_sync(self, user_input: str, model_key: Optional[str] = None, restricted: bool = False) -> str:
         if not self.gemini_chat_ready:
             raise RuntimeError("gemini chat not ready")
 
@@ -2714,6 +2746,9 @@ class AIService:
         if not content:
             return "鎯宠亰鐐瑰暐锛熷彂鎴戜竴鍙ヨ瘽灏辫銆?"
 
+        if restricted:
+            prompt = self._build_restricted_gemini_cli_prompt(self.system_prompt, [], content)
+            return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
         prompt = self._build_gemini_cli_prompt(self.system_prompt, [], content)
         return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
@@ -2754,9 +2789,15 @@ class AIService:
             self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
         return text
 
-    def _gemini_chat_with_context_sync(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
+    def _gemini_chat_with_context_sync(
+        self,
+        session_key: str,
+        user_input: str,
+        model_key: Optional[str] = None,
+        restricted: bool = False,
+    ) -> str:
         _ = session_key
-        return self._gemini_chat_sync(user_input, model_key)
+        return self._gemini_chat_sync(user_input, model_key, restricted)
 
     @staticmethod
     def _normalize_chat_history_item(item: object) -> Optional[Dict[str, str]]:

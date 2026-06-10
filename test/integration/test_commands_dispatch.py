@@ -122,6 +122,8 @@ class _FakeAIService:
         self.chat = AsyncMock(return_value="fake-ai-reply")
         self.gemini_chat_with_context = AsyncMock(return_value="gemini-ai-reply")
         self.gemini_chat = AsyncMock(return_value="gemini-ai-reply")
+        self.restricted_gemini_chat_with_context = AsyncMock(return_value="restricted-gemini-ai-reply")
+        self.restricted_gemini_chat = AsyncMock(return_value="restricted-gemini-ai-reply")
         self.extract_notice_url_head = AsyncMock(return_value="")
         self.classify_notice = AsyncMock(return_value=False)
         self.reason_notice = AsyncMock(return_value="")
@@ -361,7 +363,7 @@ async def test_command_fixed_answer_precedes_private_aichat(dispatch_harness) ->
 
 
 @pytest.mark.asyncio
-async def test_command_aichat_private_uppercase_c_uses_claude(dispatch_harness) -> None:
+async def test_command_aichat_private_uppercase_c_uses_restricted_antigravity(dispatch_harness) -> None:
     ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
     filesvc = _make_filesvc_stub()
     aisvc = _FakeAIService()
@@ -379,14 +381,15 @@ async def test_command_aichat_private_uppercase_c_uses_claude(dispatch_harness) 
         aisvc=aisvc,
     )
 
-    aisvc.gemini_chat_with_context.assert_awaited_once()
-    assert aisvc.gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
-    model_input = aisvc.gemini_chat_with_context.await_args.args[1]
-    assert aisvc.gemini_chat_with_context.await_args.args[2] == "claude"
+    aisvc.restricted_gemini_chat_with_context.assert_awaited_once()
+    assert aisvc.restricted_gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
+    model_input = aisvc.restricted_gemini_chat_with_context.await_args.args[1]
+    assert aisvc.restricted_gemini_chat_with_context.await_args.args[2] == "claude"
     assert "发言人QQ:" not in model_input
     assert model_input == "hello"
+    aisvc.gemini_chat_with_context.assert_not_awaited()
     aisvc.chat_with_context.assert_not_awaited()
-    assert any("gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
+    assert any("restricted-gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
 
 
 @pytest.mark.asyncio

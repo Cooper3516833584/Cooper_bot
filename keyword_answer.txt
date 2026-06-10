@@ -29,7 +29,6 @@ a:唉农批
 
 q:二游
 q:二次元
-q:动画
 q:ciallo
 q:Ciallo
 a:唉臭二次元

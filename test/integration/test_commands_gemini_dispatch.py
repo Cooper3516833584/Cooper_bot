@@ -62,6 +62,8 @@ class _FakeAIService:
         self.chat = AsyncMock(return_value="fake-ai-reply")
         self.gemini_chat_with_context = AsyncMock(return_value="gemini-ai-reply")
         self.gemini_chat = AsyncMock(return_value="gemini-ai-reply")
+        self.restricted_gemini_chat_with_context = AsyncMock(return_value="restricted-gemini-ai-reply")
+        self.restricted_gemini_chat = AsyncMock(return_value="restricted-gemini-ai-reply")
         self.extract_notice_url_head = AsyncMock(return_value="")
         self.classify_notice = AsyncMock(return_value=False)
         self.reason_notice = AsyncMock(return_value="")
@@ -123,8 +125,66 @@ def dispatch_harness(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_command_aichat_gemini_dispatch(dispatch_harness) -> None:
+async def test_level_one_aichat_gemini_uses_restricted_web_search(dispatch_harness) -> None:
     ctx = _make_ctx()
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="g帮我联网总结一下",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.restricted_gemini_chat_with_context.assert_awaited_once()
+    assert aisvc.restricted_gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
+    model_input = aisvc.restricted_gemini_chat_with_context.await_args.args[1]
+    assert aisvc.restricted_gemini_chat_with_context.await_args.args[2] == "gemini"
+    assert "发言人QQ:" not in model_input
+    assert "帮我联网总结一下" in model_input
+    aisvc.gemini_chat_with_context.assert_not_awaited()
+    aisvc.chat_with_context.assert_not_awaited()
+    assert any("restricted-gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_level_one_aichat_claude_uses_restricted_web_search(dispatch_harness) -> None:
+    ctx = _make_ctx()
+    filesvc = _make_filesvc_stub()
+    aisvc = _FakeAIService()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
+        text="c帮我联网总结一下",
+        filesvc=filesvc,
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+    )
+
+    aisvc.restricted_gemini_chat_with_context.assert_awaited_once()
+    assert aisvc.restricted_gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
+    assert "帮我联网总结一下" in aisvc.restricted_gemini_chat_with_context.await_args.args[1]
+    assert aisvc.restricted_gemini_chat_with_context.await_args.args[2] == "claude"
+    aisvc.gemini_chat_with_context.assert_not_awaited()
+    aisvc.chat_with_context.assert_not_awaited()
+    assert any("restricted-gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_level_three_aichat_gemini_keeps_full_antigravity(dispatch_harness) -> None:
+    ctx = _make_ctx(level=3)
     filesvc = _make_filesvc_stub()
     aisvc = _FakeAIService()
 
@@ -143,37 +203,7 @@ async def test_command_aichat_gemini_dispatch(dispatch_harness) -> None:
 
     aisvc.gemini_chat_with_context.assert_awaited_once()
     assert aisvc.gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
-    model_input = aisvc.gemini_chat_with_context.await_args.args[1]
     assert aisvc.gemini_chat_with_context.await_args.args[2] == "gemini"
-    assert "发言人QQ:" not in model_input
-    assert "帮我联网总结一下" in model_input
-    aisvc.chat_with_context.assert_not_awaited()
-    assert any("gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
-
-
-@pytest.mark.asyncio
-async def test_command_aichat_claude_dispatch(dispatch_harness) -> None:
-    ctx = _make_ctx()
-    filesvc = _make_filesvc_stub()
-    aisvc = _FakeAIService()
-
-    await commands.dispatch(
-        api=SimpleNamespace(),
-        ctx=ctx,
-        evt={"post_type": "message", "message_type": "private", "sub_type": "friend"},
-        text="c帮我联网总结一下",
-        filesvc=filesvc,
-        logsvc=_DummyLogService(),
-        state=commands.BotState(),
-        handin=Mock(),
-        perm=Mock(),
-        aisvc=aisvc,
-    )
-
-    aisvc.gemini_chat_with_context.assert_awaited_once()
-    assert aisvc.gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
-    assert aisvc.gemini_chat_with_context.await_args.args[2] == "claude"
-    aisvc.chat_with_context.assert_not_awaited()
     assert any("gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
 
 
@@ -181,7 +211,7 @@ async def test_command_aichat_claude_dispatch(dispatch_harness) -> None:
 async def test_ai_fallback_private_when_group_send_unconfirmed() -> None:
     if hasattr(commands, "_RECENT_REPLY_KEYS"):
         commands._RECENT_REPLY_KEYS.clear()
-    ctx = _make_ctx(scene="group", group_id=20001, user_id=10001)
+    ctx = _make_ctx(scene="group", level=3, group_id=20001, user_id=10001)
     aisvc = _FakeAIService()
     aisvc.gemini_chat_with_context = AsyncMock(side_effect=RuntimeError("agy failed"))
     api = SimpleNamespace(
@@ -208,7 +238,7 @@ async def test_ai_fallback_private_when_group_send_unconfirmed() -> None:
 
 @pytest.mark.asyncio
 async def test_antigravity_busy_reply_uses_clear_message(dispatch_harness) -> None:
-    ctx = _make_ctx()
+    ctx = _make_ctx(level=3)
     filesvc = _make_filesvc_stub()
     aisvc = _FakeAIService()
     aisvc.gemini_chat_with_context = AsyncMock(
@@ -251,7 +281,8 @@ async def test_command_help_mentions_gemini_usage(dispatch_harness) -> None:
         aisvc=aisvc,
     )
 
-    assert any("群聊（antigravity Gemini）：@Cooper_bot g内容" in one["text"] for one in dispatch_harness.messages)
-    assert any("群聊（antigravity Claude）：@Cooper_bot c内容" in one["text"] for one in dispatch_harness.messages)
-    assert any("私聊（antigravity Gemini）：g内容" in one["text"] for one in dispatch_harness.messages)
-    assert any("私聊（antigravity Claude）：c内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("群聊（联网搜索 Gemini）：@Cooper_bot g内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("群聊（联网搜索 Claude）：@Cooper_bot c内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("私聊（联网搜索 Gemini）：g内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("私聊（联网搜索 Claude）：c内容" in one["text"] for one in dispatch_harness.messages)
+    assert any("2级及以下仅开放联网搜索问答" in one["text"] for one in dispatch_harness.messages)

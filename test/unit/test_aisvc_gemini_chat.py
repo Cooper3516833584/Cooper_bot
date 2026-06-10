@@ -26,6 +26,7 @@ def _new_service(work_root) -> AIService:
     svc.gemini_policy_path = work_root / "gemini-policy.toml"
     svc.gemini_policy_path.write_text('[[rule]]\ntoolName = "read_file"\ndecision = "deny"\npriority = 999\n', encoding="utf-8")
     svc.gemini_workdir = work_root / "gemini-workdir"
+    svc.gemini_restricted_workdir = work_root / "gemini-restricted-workdir"
     return svc
 
 
@@ -64,6 +65,17 @@ def test_gemini_chat_with_context_ignores_history_and_prompts(monkeypatch, tmp_p
     assert "Assistant:" not in prompts[1]
     assert prompts[1].endswith("follow-up")
     assert prompts[2].endswith("claude follow-up")
+
+
+def test_restricted_gemini_prompt_blocks_local_tools(tmp_project_root) -> None:
+    svc = _new_service(tmp_project_root)
+
+    prompt = svc._build_restricted_gemini_cli_prompt("system", [], "查一下今天新闻")
+
+    assert "google_web_search only" in prompt
+    assert "run_shell_command" in prompt
+    assert "read_file" in prompt
+    assert "Do not inspect, modify, execute" in prompt
 
 
 def test_run_gemini_cli_sync_parses_json_response(monkeypatch, tmp_project_root) -> None:
@@ -126,6 +138,29 @@ def test_run_gemini_cli_sync_reads_agy_transcript_when_stdout_empty(monkeypatch,
     cmd = [str(x) for x in captured["cmd"]]
     assert "--log-file" in cmd
     assert "--model" in cmd
+    assert captured["creationflags"] == getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0)
+
+
+def test_run_gemini_cli_sync_restricted_uses_agy_sandbox(monkeypatch, tmp_project_root) -> None:
+    svc = _new_service(tmp_project_root)
+    captured: dict[str, object] = {}
+
+    def _fake_subprocess_run(cmd, cwd, stdout, stderr, timeout, check, env=None, creationflags=0):
+        captured["cmd"] = list(cmd)
+        captured["cwd"] = cwd
+        captured["creationflags"] = creationflags
+        return SimpleNamespace(returncode=0, stdout=b"OK", stderr=b"")
+
+    monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
+    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+
+    out = svc._run_gemini_cli_sync("Reply exactly OK", "Claude Opus 4.6 (Thinking)", restricted=True)
+
+    assert out == "OK"
+    cmd = [str(x) for x in captured["cmd"]]
+    assert "--sandbox" in cmd
+    assert cmd[cmd.index("--model") + 1] == "Claude Opus 4.6 (Thinking)"
+    assert captured["cwd"] == str(svc.gemini_restricted_workdir)
     assert captured["creationflags"] == getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0)
 
 

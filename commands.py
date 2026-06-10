@@ -1878,6 +1878,13 @@ def _antigravity_busy_reply(backend: str) -> str:
     return f"antigravity 的 {model} 当前服务繁忙，上游暂时没有可用容量，请稍后再试。"
 
 
+def _ai_chat_allows_full_cli(ctx) -> bool:
+    try:
+        return int(getattr(ctx, "level", 0) or 0) >= 3
+    except Exception:
+        return False
+
+
 def _ai_chat_session_key(ctx) -> Optional[str]:
     scene = str(getattr(ctx, "scene", "") or "")
     if scene == "group":
@@ -3685,15 +3692,31 @@ async def _handle_ai_chat_trigger(
         if aisvc is None:
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
+        restricted_cli = backend in {"gemini", "claude"} and not _ai_chat_allows_full_cli(ctx)
+        route_backend = "restricted_antigravity" if restricted_cli else ("deepseek" if backend == "default" else backend)
         use_gemini = backend in {"gemini", "claude"}
         model_key = backend if use_gemini else None
-        ready = bool(getattr(aisvc, "gemini_chat_ready", False)) if use_gemini else bool(getattr(aisvc, "chat_ready", False))
+        if use_gemini:
+            ready = bool(getattr(aisvc, "gemini_chat_ready", False))
+        else:
+            ready = bool(getattr(aisvc, "chat_ready", False))
         if not ready:
-            msg = "antigravity 联网聊天暂时不可用（antigravity CLI 未就绪）。" if use_gemini else "AI 聊天暂时不可用（配置未就绪）。"
+            if use_gemini:
+                msg = "antigravity 联网聊天暂时不可用（antigravity CLI 未就绪）。"
+            else:
+                msg = "AI 聊天暂时不可用（配置未就绪）。"
             await reply(api, ctx, msg, logsvc)
             return True
-        chat_with_context_fn = getattr(aisvc, "gemini_chat_with_context", None) if use_gemini else getattr(aisvc, "chat_with_context", None)
-        chat_fn = getattr(aisvc, "gemini_chat", None) if use_gemini else getattr(aisvc, "chat", None)
+        if use_gemini:
+            if restricted_cli:
+                chat_with_context_fn = getattr(aisvc, "restricted_gemini_chat_with_context", None)
+                chat_fn = getattr(aisvc, "restricted_gemini_chat", None)
+            else:
+                chat_with_context_fn = getattr(aisvc, "gemini_chat_with_context", None)
+                chat_fn = getattr(aisvc, "gemini_chat", None)
+        else:
+            chat_with_context_fn = getattr(aisvc, "chat_with_context", None)
+            chat_fn = getattr(aisvc, "chat", None)
         if not callable(chat_fn):
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
@@ -3730,7 +3753,7 @@ async def _handle_ai_chat_trigger(
         except Exception as e:
             try:
                 logsvc.log.warning(
-                    f"AI chat failed: backend={backend} "
+                    f"AI chat failed: backend={route_backend} "
                     f"session={(session_key or '')[:80]} err={e}"
                 )
             except Exception:
@@ -4029,11 +4052,12 @@ async def _handle_explicit_command(
             "",
             "AI聊天（默认 DeepSeek）：",
             "群聊：@Cooper_bot + 内容",
-            "群聊（antigravity Gemini）：@Cooper_bot g内容（g/G 后面可不加空格）",
-            "群聊（antigravity Claude）：@Cooper_bot c内容（c/C 后面可不加空格）",
+            "群聊（联网搜索 Gemini）：@Cooper_bot g内容（g/G 后面可不加空格）",
+            "群聊（联网搜索 Claude）：@Cooper_bot c内容（c/C 后面可不加空格）",
             "私聊：直接发送文本内容",
-            "私聊（antigravity Gemini）：g内容（g/G 后面可不加空格）",
-            "私聊（antigravity Claude）：c内容（c/C 后面可不加空格）",
+            "私聊（联网搜索 Gemini）：g内容（g/G 后面可不加空格）",
+            "私聊（联网搜索 Claude）：c内容（c/C 后面可不加空格）",
+            "提示：2级及以下仅开放联网搜索问答；3级管理员保留完整 CLI 能力。",
         ])
         if ctx.level >= 2:
             lines.extend([
