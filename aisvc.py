@@ -343,17 +343,42 @@ class AIService:
             out = out[-max_messages:]
         return out
 
+    def _format_gemini_cli_history(self, history: List[Dict[str, str]]) -> str:
+        lines: List[str] = []
+        for item in self._trim_gemini_history(history):
+            normalized = self._normalize_chat_history_item(item)
+            if normalized is None:
+                continue
+            content = str(normalized.get("content") or "").strip()
+            if not content:
+                continue
+            role = str(normalized.get("role") or "")
+            label = "User" if role == "user" else "Assistant"
+            lines.append(f"{label}:\n{content}")
+        return "\n\n".join(lines).strip()
+
     def _build_gemini_cli_prompt(
         self,
         system_prompt: str,
         history: List[Dict[str, str]],
         user_input: str,
     ) -> str:
-        _ = system_prompt, history
         content = str(user_input or "").strip()
         if not content:
             return ""
-        return "Use google_web_search before answering this exact user request:\n\n" + content
+        sections: List[str] = []
+        sys_prompt = str(system_prompt or "").strip()
+        if sys_prompt:
+            sections.append("System instructions:\n" + sys_prompt)
+        history_text = self._format_gemini_cli_history(history)
+        if history_text:
+            sections.append(
+                "Conversation history, oldest to newest. Use it only as context; answer the latest user request:\n"
+                + history_text
+            )
+        sections.append("Use google_web_search before answering the latest user request.")
+        sections.append("Latest user request:\n" + content)
+        return "\n\n".join(sections).strip()
 
     def _build_restricted_gemini_cli_prompt(
         self,
@@ -361,19 +386,18 @@ class AIService:
         history: List[Dict[str, str]],
         user_input: str,
     ) -> str:
-        _ = system_prompt, history
         content = str(user_input or "").strip()
         if not content:
             return ""
-        return (
+        base = (
             "Security policy for this QQ bot request:\n"
             "- You may answer the user and, when current/public information is needed, use google_web_search only.\n"
             "- Do not use any local-computer capability: no read_file, read_many_files, list_directory, glob, grep_search, write_file, replace, run_shell_command, ask_user, save_memory, activate_skill, or MCP/local tools.\n"
             "- Do not inspect, modify, execute, or summarize files, folders, processes, environment variables, shell output, browser state, or credentials on this computer.\n"
             "- If the request cannot be answered with normal model knowledge plus public web search, say you can only help with联网搜索获取信息.\n\n"
-            "Use google_web_search before answering this exact user request:\n\n"
-            + content
         )
+        prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
+        return base + prompt
 
     @staticmethod
     def _normalize_gemini_cli_output(raw: str) -> str:
@@ -2746,10 +2770,11 @@ class AIService:
         if not content:
             return "鎯宠亰鐐瑰暐锛熷彂鎴戜竴鍙ヨ瘽灏辫銆?"
 
+        system_prompt = self._append_chat_automation_boundary(self.system_prompt)
         if restricted:
-            prompt = self._build_restricted_gemini_cli_prompt(self.system_prompt, [], content)
+            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, [], content)
             return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
-        prompt = self._build_gemini_cli_prompt(self.system_prompt, [], content)
+        prompt = self._build_gemini_cli_prompt(system_prompt, [], content)
         return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
     def _chat_with_context_sync(self, session_key: str, user_input: str) -> str:
@@ -2796,8 +2821,36 @@ class AIService:
         model_key: Optional[str] = None,
         restricted: bool = False,
     ) -> str:
-        _ = session_key
-        return self._gemini_chat_sync(user_input, model_key, restricted)
+        if not self.gemini_chat_ready:
+            raise RuntimeError("gemini chat not ready")
+
+        content = str(user_input or "").strip()
+        if not content:
+            return self._gemini_chat_sync(content, model_key, restricted)
+
+        key = str(session_key or "").strip()
+        if not key:
+            return self._gemini_chat_sync(content, model_key, restricted)
+
+        try:
+            history = self._load_active_chat_history(key)
+        except Exception as e:
+            self.log.warning(f"AI chat context read failed, fallback to stateless gemini: session={key[:80]} err={e}")
+            history = []
+
+        system_prompt = self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
+        if restricted:
+            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, history, content)
+            text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
+        else:
+            prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
+            text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
+
+        try:
+            self._save_chat_turn(key, content, text)
+        except Exception as e:
+            self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
+        return text
 
     @staticmethod
     def _normalize_chat_history_item(item: object) -> Optional[Dict[str, str]]:

@@ -22,7 +22,7 @@ from router import build_ctx, get_text
 from onebot import OneBotAPI
 from filesvc import FileService
 from logsvc import LogService
-from commands import dispatch, BotState, conv_key
+from commands import dispatch, BotState, conv_key, notify_admin_error
 from permsvc import PermService
 from handinsvc import HandinService
 from aisvc import AIService
@@ -195,6 +195,7 @@ async def run_forever():
                                 await dispatch(api, ctx, data, text, filesvc, logsvc, state, handin, perm, aisvc)
                             except Exception as e:
                                 log.exception(f"dispatch 异常: {e}")
+                                await notify_admin_error(api, ctx, "dispatch", e, logsvc)
                             finally:
                                 conv_lock_last_used[key] = time.time()
 

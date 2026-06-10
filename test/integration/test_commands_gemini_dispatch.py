@@ -231,9 +231,15 @@ async def test_ai_fallback_private_when_group_send_unconfirmed() -> None:
 
     assert handled is True
     api.send_group_msg.assert_awaited_once()
-    api.send_private_msg.assert_awaited_once()
-    assert api.send_private_msg.await_args.args[0] == ctx.user_id
-    assert api.send_private_msg.await_args.args[1] == aisvc.fallback_error_reply
+    assert api.send_private_msg.await_count == 2
+    assert api.send_private_msg.await_args_list[0].args[0] == ctx.user_id
+    assert api.send_private_msg.await_args_list[0].args[1] == aisvc.fallback_error_reply
+    admin_notice_args = api.send_private_msg.await_args_list[1].args
+    assert admin_notice_args[0] == next(iter(commands.ADMIN_USERS))
+    assert "机器人报错提醒" in admin_notice_args[1]
+    assert "聊天：群聊 group_id=20001 group_name=group" in admin_notice_args[1]
+    assert "环节：aichat/claude" in admin_notice_args[1]
+    assert "错误：RuntimeError: agy failed" in admin_notice_args[1]
 
 
 @pytest.mark.asyncio

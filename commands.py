@@ -660,6 +660,78 @@ def conv_key(ctx) -> str:
     return f"p:{ctx.user_id}:{ctx.scene}"
 
 
+def _compact_admin_notice_text(value: object, max_chars: int = 500) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) > max_chars:
+        return text[:max_chars] + "...(truncated)"
+    return text
+
+
+def _format_admin_error_chat(ctx) -> str:
+    if ctx is None:
+        return "未知聊天"
+
+    scene = str(getattr(ctx, "scene", "") or "").strip() or "unknown"
+    user_id = getattr(ctx, "user_id", None)
+    nickname = _compact_admin_notice_text(getattr(ctx, "nickname", ""), 80)
+    card = _compact_admin_notice_text(getattr(ctx, "card", ""), 80)
+    if scene == "group":
+        group_id = getattr(ctx, "group_id", None)
+        group_name = _compact_admin_notice_text(getattr(ctx, "group_name", ""), 80)
+        group_part = f"群聊 group_id={group_id}"
+        if group_name:
+            group_part += f" group_name={group_name}"
+        sender_part = f"发言人 user_id={user_id}"
+        if nickname:
+            sender_part += f" nickname={nickname}"
+        if card and card != nickname:
+            sender_part += f" card={card}"
+        return f"{group_part}；{sender_part}"
+
+    user_part = f"私聊 scene={scene} user_id={user_id}"
+    if nickname:
+        user_part += f" nickname={nickname}"
+    return user_part
+
+
+async def notify_admin_error(api, ctx, stage: str, err: object, logsvc: Optional[LogService] = None) -> None:
+    send_private = getattr(api, "send_private_msg", None)
+    if not callable(send_private):
+        return
+
+    admin_ids: List[int] = []
+    for uid in (ADMIN_USERS or ()):
+        try:
+            admin_ids.append(int(uid))
+        except Exception:
+            continue
+    if not admin_ids:
+        return
+
+    err_type = type(err).__name__
+    err_text = _compact_admin_notice_text(err)
+    text = "\n".join(
+        [
+            "机器人报错提醒",
+            f"聊天：{_format_admin_error_chat(ctx)}",
+            f"环节：{_compact_admin_notice_text(stage, 120)}",
+            f"错误：{err_type}: {err_text}",
+        ]
+    )
+    for admin_uid in sorted(set(admin_ids)):
+        try:
+            await send_private(admin_uid, text)
+        except Exception as send_err:
+            try:
+                if logsvc is not None:
+                    logsvc.log.warning(
+                        f"admin error notify failed: admin={admin_uid} "
+                        f"stage={_compact_admin_notice_text(stage, 80)} err={send_err}"
+                    )
+            except Exception:
+                pass
+
+
 def _claim_group_notice_key(state: BotState, key: str, ttl_seconds: float = _GROUP_NOTICE_DEDUP_SECONDS) -> bool:
     now = time.time()
     cache = state.recent_group_notice_keys
@@ -3762,6 +3834,7 @@ async def _handle_ai_chat_trigger(
             fallback_sent = await reply(api, ctx, fallback_text, logsvc)
             if fallback_sent is False and ctx.scene == "group":
                 await reply(api, ctx, fallback_text, logsvc, force_private_user_id=ctx.user_id)
+            await notify_admin_error(api, ctx, f"aichat/{route_backend}", e, logsvc)
         return True
     return False
 

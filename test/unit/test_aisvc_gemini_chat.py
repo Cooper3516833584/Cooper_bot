@@ -30,23 +30,27 @@ def _new_service(work_root) -> AIService:
     return svc
 
 
-def test_gemini_chat_with_context_ignores_history_and_prompts(monkeypatch, tmp_project_root) -> None:
+def test_gemini_chat_with_context_uses_history_and_prompts(monkeypatch, tmp_project_root) -> None:
     svc = _new_service(tmp_project_root)
     prompts: list[str] = []
     models: list[str] = []
+    restricted_flags: list[bool] = []
     seq = {"n": 0}
 
-    def _fake_run(prompt: str, model_name: str | None = None) -> str:
+    def _fake_run(prompt: str, model_name: str | None = None, restricted: bool = False) -> str:
         seq["n"] += 1
         prompts.append(prompt)
         models.append(str(model_name or ""))
+        restricted_flags.append(bool(restricted))
         return f"reply-{seq['n']}"
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "gemini")
     monkeypatch.setattr(svc, "_run_gemini_cli_sync", _fake_run)
-    monkeypatch.setattr(svc, "_load_active_chat_history", lambda _session_key: (_ for _ in ()).throw(AssertionError("no history")))
-    monkeypatch.setattr(svc, "_select_chat_system_prompt", lambda _session_key: (_ for _ in ()).throw(AssertionError("no prompt")))
-    monkeypatch.setattr(svc, "_save_chat_turn", lambda *_args: (_ for _ in ()).throw(AssertionError("no context save")))
+    monkeypatch.setattr(
+        svc,
+        "_load_group_chat_prompt_config",
+        lambda: {"default": "", "groups": {"20001": "group-special"}},
+    )
 
     first = svc._gemini_chat_with_context_sync("group:20001", "hello")
     assert first == "reply-1"
@@ -57,14 +61,41 @@ def test_gemini_chat_with_context_ignores_history_and_prompts(monkeypatch, tmp_p
     third = svc._gemini_chat_with_context_sync("group:20001", "claude follow-up", "claude")
     assert third == "reply-3"
 
-    assert len(prompts) == 3
-    assert models == ["Gemini Test Model", "Gemini Test Model", "Claude Opus 4.6 (Thinking)"]
+    fourth = svc._gemini_chat_with_context_sync("group:20001", "restricted follow-up", "gemini", True)
+    assert fourth == "reply-4"
+
+    assert len(prompts) == 4
+    assert models == [
+        "Gemini Test Model",
+        "Gemini Test Model",
+        "Claude Opus 4.6 (Thinking)",
+        "Gemini Test Model",
+    ]
+    assert restricted_flags == [False, False, False, True]
     assert "google_web_search" in prompts[0]
-    assert prompts[0].endswith("hello")
-    assert "system-prompt" not in prompts[0]
-    assert "Assistant:" not in prompts[1]
-    assert prompts[1].endswith("follow-up")
-    assert prompts[2].endswith("claude follow-up")
+    assert "System instructions:\ngroup-special" in prompts[0]
+    assert "Latest user request:\nhello" in prompts[0]
+    assert "Conversation history" in prompts[1]
+    assert "User:\nhello" in prompts[1]
+    assert "Assistant:\nreply-1" in prompts[1]
+    assert "Latest user request:\nfollow-up" in prompts[1]
+    assert "Assistant:\nreply-2" in prompts[2]
+    assert "Latest user request:\nclaude follow-up" in prompts[2]
+    assert "Security policy for this QQ bot request" in prompts[3]
+    assert "Assistant:\nreply-3" in prompts[3]
+    assert "Latest user request:\nrestricted follow-up" in prompts[3]
+
+    history = svc._load_active_chat_history("group:20001")
+    assert [m["content"] for m in history] == [
+        "hello",
+        "reply-1",
+        "follow-up",
+        "reply-2",
+        "claude follow-up",
+        "reply-3",
+        "restricted follow-up",
+        "reply-4",
+    ]
 
 
 def test_restricted_gemini_prompt_blocks_local_tools(tmp_project_root) -> None:
