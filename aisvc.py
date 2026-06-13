@@ -2768,7 +2768,7 @@ class AIService:
 
         content = str(user_input or "").strip()
         if not content:
-            return "鎯宠亰鐐瑰暐锛熷彂鎴戜竴鍙ヨ瘽灏辫銆?"
+            return "想聊点啥？发我一句话就行。"
 
         system_prompt = self._append_chat_automation_boundary(self.system_prompt)
         if restricted:
