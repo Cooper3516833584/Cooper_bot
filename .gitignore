@@ -33,5 +33,22 @@ ocr_test_results*.json
 
 # local runtime cache
 ai_semantic_store.sqlite3
+ai_semantic_store.sqlite3-*
 ai_material_state_cache.json
 ai_material_scan_marks.json
+
+# local agent settings
+.claude/settings.local.json
+
+# local chat/history dumps
+history*.json
+
+# local OCR/test images
+ocr/
+
+# wiki upload local artifacts
+wiki/url_and_token.txt
+wiki/*.log
+wiki/1037wiki_upload_plan.*
+wiki/*_upload_state.json
+wiki/*_upload_summary.*
