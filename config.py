@@ -143,6 +143,11 @@ ROSTER_XLSX_PATH = DATA_DIR / "friend" / "班级名册.xlsx"
 # 时区（用于解析提醒/截止时间）
 TIMEZONE = "Asia/Shanghai"
 
+# ===== 每日重要日提醒 =====
+# 配置与运行状态分离：配置可由管理员编辑，联网事实、年度放假安排和发送记录都写入 data/。
+DAILY_CALENDAR_CONFIG_PATH = BASE_DIR / "daily_calendar_config.json"
+DAILY_CALENDAR_DATA_DIR = DATA_DIR / "daily_calendar"
+
 # NapCat 本地缓存 temp 映射（用于私聊文件提交：不走网络下载，直接拷贝缓存文件）
 NAPCAT_TEMP_CONTAINER_DIR = "/app/.config/QQ/NapCat/temp"
 NAPCAT_TEMP_HOST_DIR = _get_env_path(

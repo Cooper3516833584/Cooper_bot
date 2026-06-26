@@ -223,3 +223,24 @@ def test_extract_ai_chat_input_group_requires_mention() -> None:
     }
     out = commands._extract_ai_chat_input(ctx, evt=evt, text="你好", bot_nick="Cooper_bot")
     assert out == "你好"
+
+
+def test_extract_ai_chat_input_group_keeps_other_at_segment() -> None:
+    ctx = SimpleNamespace(scene="group")
+    evt = {
+        "self_id": "42",
+        "message": [
+            {"type": "at", "data": {"qq": "42"}},
+            {"type": "text", "data": {"text": " ask "}},
+            {"type": "at", "data": {"qq": "10001"}},
+            {"type": "text", "data": {"text": " about ta"}},
+        ],
+        "raw_message": "[CQ:at,qq=42] ask [CQ:at,qq=10001] about ta",
+    }
+    out = commands._extract_ai_chat_input(
+        ctx,
+        evt=evt,
+        text="[CQ:at,qq=42] ask [CQ:at,qq=10001] about ta",
+        bot_nick="Cooper_bot",
+    )
+    assert out == "ask @10001 about ta"

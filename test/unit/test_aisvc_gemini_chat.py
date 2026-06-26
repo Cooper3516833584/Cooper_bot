@@ -109,6 +109,30 @@ def test_restricted_gemini_prompt_blocks_local_tools(tmp_project_root) -> None:
     assert "Do not inspect, modify, execute" in prompt
 
 
+def test_restricted_calendar_chat_is_stateless_and_uses_its_own_timeout(monkeypatch, tmp_project_root) -> None:
+    svc = _new_service(tmp_project_root)
+    captured: dict[str, object] = {}
+
+    def _fake_run(prompt: str, model_name: str | None = None, restricted: bool = False, timeout_seconds=None) -> str:
+        captured["prompt"] = prompt
+        captured["model"] = model_name
+        captured["restricted"] = restricted
+        captured["timeout"] = timeout_seconds
+        return '{"date":"2026-06-26","events":[]}'
+
+    monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
+    monkeypatch.setattr(svc, "_run_gemini_cli_sync", _fake_run)
+
+    out = svc._restricted_gemini_calendar_chat_sync("只返回 JSON", "claude", 45)
+
+    assert out == '{"date":"2026-06-26","events":[]}'
+    assert captured["model"] == "Claude Opus 4.6 (Thinking)"
+    assert captured["restricted"] is True
+    assert captured["timeout"] == 45
+    assert "Security policy for this QQ bot request" in str(captured["prompt"])
+    assert "Latest user request:\n只返回 JSON" in str(captured["prompt"])
+
+
 def test_run_gemini_cli_sync_parses_json_response(monkeypatch, tmp_project_root) -> None:
     svc = _new_service(tmp_project_root)
     captured: dict[str, object] = {}

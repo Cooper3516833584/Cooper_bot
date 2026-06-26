@@ -26,6 +26,7 @@ from commands import dispatch, BotState, conv_key, notify_admin_error
 from permsvc import PermService
 from handinsvc import HandinService
 from aisvc import AIService
+from daily_calendar import DailyCalendarService
 
 log = Logger("bot", "INFO")
 
@@ -86,6 +87,7 @@ async def run_forever():
     perm = PermService(PERM_DB_PATH)
     handin = HandinService(log)
     aisvc = AIService(log)
+    calendar_service = DailyCalendarService(log, aisvc)
 
     if REBUILD_MATERIAL_SCAN_MARKS_ON_STARTUP:
         try:
@@ -192,7 +194,19 @@ async def run_forever():
                         async with lock:
                             conv_lock_last_used[key] = time.time()
                             try:
-                                await dispatch(api, ctx, data, text, filesvc, logsvc, state, handin, perm, aisvc)
+                                await dispatch(
+                                    api,
+                                    ctx,
+                                    data,
+                                    text,
+                                    filesvc,
+                                    logsvc,
+                                    state,
+                                    handin,
+                                    perm,
+                                    aisvc,
+                                    calendar_service,
+                                )
                             except Exception as e:
                                 log.exception(f"dispatch 异常: {e}")
                                 await notify_admin_error(api, ctx, "dispatch", e, logsvc)
@@ -202,6 +216,7 @@ async def run_forever():
                 log.info("已连接至服务器")
                 cleanup_task = asyncio.create_task(logsvc.cleanup_loop())
                 scheduler_task = asyncio.create_task(handin.scheduler_loop(api))
+                calendar_task = asyncio.create_task(calendar_service.scheduler_loop(api))
 
                 try:
                     async for message in ws:
@@ -267,9 +282,9 @@ async def run_forever():
                             )
                             continue
                 finally:
-                    for t in (cleanup_task, scheduler_task):
+                    for t in (cleanup_task, scheduler_task, calendar_task):
                         t.cancel()
-                    await asyncio.gather(cleanup_task, scheduler_task, return_exceptions=True)
+                    await asyncio.gather(cleanup_task, scheduler_task, calendar_task, return_exceptions=True)
 
                     # 连接断开时尽量回收在途任务，避免跨连接残留。
                     pending = list(inflight)

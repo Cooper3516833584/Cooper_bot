@@ -90,8 +90,8 @@ class AIService:
     _ALLOWED_SUFFIXES = {".pdf", ".doc", ".docx", ".ppt", ".pptx"}
     _EBOOK_SUFFIXES = {".epub", ".mobi"}
     _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
-    _CHAT_CONTEXT_MAX_MESSAGES = 100
-    _GEMINI_CHAT_CONTEXT_MAX_MESSAGES = 20
+    _CHAT_CONTEXT_MAX_MESSAGES = 300
+    _GEMINI_CHAT_CONTEXT_MAX_MESSAGES = 100
     _CHAT_TEMPERATURE = 0.65
     _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
     _AUTO_ORGANIZE_EBOOK_SUBJECT = "课外书"
@@ -293,6 +293,20 @@ class AIService:
 
     async def restricted_gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
         return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, True)
+
+    async def restricted_gemini_calendar_chat(
+        self,
+        user_input: str,
+        model_key: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
+        """Run a stateless, web-search-only Antigravity request with an isolated timeout."""
+        return await asyncio.to_thread(
+            self._restricted_gemini_calendar_chat_sync,
+            user_input,
+            model_key,
+            timeout_seconds,
+        )
 
     def remember_user_message(self, session_key: str, message_text: str) -> None:
         self._remember_chat_message(session_key, "user", message_text)
@@ -515,7 +529,13 @@ class AIService:
                 return out[-1], log_text
         return "", log_text
 
-    def _run_gemini_cli_sync(self, prompt: str, model_name: Optional[str] = None, restricted: bool = False) -> str:
+    def _run_gemini_cli_sync(
+        self,
+        prompt: str,
+        model_name: Optional[str] = None,
+        restricted: bool = False,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
         base_cmd = self._build_gemini_cli_base_command()
         if not base_cmd:
             raise RuntimeError("gemini cli not found")
@@ -546,6 +566,8 @@ class AIService:
         run_creationflags = 0
         if agy_log_path is not None and os.name == "nt":
             run_creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+        run_timeout = float(self.gemini_timeout_seconds if timeout_seconds is None else timeout_seconds)
+        run_timeout = max(10.0, min(run_timeout, 600.0))
 
         try:
             proc = subprocess.run(
@@ -553,13 +575,13 @@ class AIService:
                 cwd=str(workdir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=float(self.gemini_timeout_seconds),
+                timeout=run_timeout,
                 check=False,
                 env=run_env,
                 creationflags=run_creationflags,
             )
         except subprocess.TimeoutExpired as e:
-            raise RuntimeError(f"gemini cli timeout after {int(self.gemini_timeout_seconds)}s") from e
+            raise RuntimeError(f"gemini cli timeout after {int(run_timeout)}s") from e
         except Exception as e:
             raise RuntimeError(f"gemini cli launch failed: {e}") from e
 
@@ -2761,6 +2783,25 @@ class AIService:
         if not text:
             raise RuntimeError("empty chat response")
         return text
+
+    def _restricted_gemini_calendar_chat_sync(
+        self,
+        user_input: str,
+        model_key: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
+        if not self.gemini_chat_ready:
+            raise RuntimeError("gemini chat not ready")
+        content = str(user_input or "").strip()
+        if not content:
+            raise RuntimeError("calendar web request is empty")
+        prompt = self._build_restricted_gemini_cli_prompt("", [], content)
+        return self._run_gemini_cli_sync(
+            prompt,
+            self._resolve_gemini_cli_model(model_key),
+            restricted=True,
+            timeout_seconds=timeout_seconds,
+        )
 
     def _gemini_chat_sync(self, user_input: str, model_key: Optional[str] = None, restricted: bool = False) -> str:
         if not self.gemini_chat_ready:

@@ -1,0 +1,19 @@
+{
+  "_help": [
+    "每日重要日提醒仅按 groups 中配置的群启用。",
+    "联网检索优先使用 Gemini；仅在临时服务错误时尝试 Claude。",
+    "dry_run 为 true 时只生成并缓存结果，不向群发送。"
+  ],
+  "groups": {
+    "1087250737": {
+      "enabled": true,
+      "send_time": "09:00",
+      "send_when_empty": true,
+      "send_catch_up_until": "12:00",
+      "primary_web_model": "gemini",
+      "secondary_web_model": "claude",
+      "web_timeout_seconds": 45,
+      "dry_run": true
+    }
+  }
+}

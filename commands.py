@@ -27,6 +27,7 @@ from handinsvc import (
 from command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query, run_list_dir_query
 from router import get_files
 from ziputil import open_fast_zip, write_path as zip_write_path
+from daily_calendar import parse_calendar_date
 from config import (
     ADMIN_USERS,
     DATA_DIR,
@@ -80,6 +81,7 @@ _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _CQ_SEG_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,[^\]]*)?\]")
+_CQ_AT_RE = re.compile(r"\[CQ:at,([^\]]*)\]", flags=re.IGNORECASE)
 _CQ_IMAGE_RE = re.compile(r"\[CQ:image,([^\]]+)\]", flags=re.IGNORECASE)
 _SIGNIN_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 _COUNT_NAME_SPLIT_RE = re.compile(r"[\s,，、;；/|]+")
@@ -91,6 +93,7 @@ _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方�
 _EXPLICIT_COMMAND_NAMES = {
     "autoat",
     "chandin",
+    "calendartest",
     "count",
     "countlist",
     "countremove",
@@ -1871,6 +1874,66 @@ def _build_find_guidance_message(query: str = "", no_result: bool = False) -> st
     )
 
 
+def _format_ai_chat_at_text(data: dict) -> str:
+    if not isinstance(data, dict):
+        data = {}
+    qq = str(data.get("qq") or data.get("user_id") or "").strip()
+    label = str(data.get("name") or data.get("nickname") or data.get("card") or qq).strip()
+    if not label:
+        return "@"
+    if label.startswith("@"):
+        return label
+    return f"@{label}"
+
+
+def _normalize_ai_chat_segment_text(text: str) -> str:
+    return re.sub(r"[ \t\r\f\v]+", " ", str(text or "")).strip()
+
+
+def _render_group_ai_chat_message(evt: dict) -> Optional[str]:
+    self_id = str(evt.get("self_id") or "").strip()
+    msg = evt.get("message")
+    if isinstance(msg, list):
+        parts: List[str] = []
+        for seg in msg:
+            if not isinstance(seg, dict):
+                continue
+            tp = str(seg.get("type") or "").strip().lower()
+            data = seg.get("data") or {}
+            if not isinstance(data, dict):
+                data = {}
+            if tp == "text":
+                parts.append(str(data.get("text") or ""))
+                continue
+            if tp == "at":
+                qq = str(data.get("qq") or data.get("user_id") or "").strip()
+                if self_id and qq == self_id:
+                    parts.append(" ")
+                else:
+                    parts.append(f" {_format_ai_chat_at_text(data)} ")
+                continue
+            if tp in _TEXT_COMPANION_EMOJI_SEG_TYPES or tp == "reply":
+                parts.append(" ")
+        rendered = _normalize_ai_chat_segment_text("".join(parts))
+        return rendered or None
+
+    raw = str(evt.get("raw_message") or "")
+    if not raw:
+        return None
+
+    def _replace_at(match: re.Match) -> str:
+        data = _parse_cq_kvs(match.group(1))
+        qq = str(data.get("qq") or data.get("user_id") or "").strip()
+        if self_id and qq == self_id:
+            return " "
+        return f" {_format_ai_chat_at_text(data)} "
+
+    rendered = _CQ_AT_RE.sub(_replace_at, raw)
+    rendered = _strip_text_companion_cq_segments(rendered)
+    rendered = _normalize_ai_chat_segment_text(rendered)
+    return rendered or None
+
+
 def _evt_mentions_me(evt: dict) -> bool:
     self_id = str(evt.get("self_id") or "").strip()
     msg = evt.get("message")
@@ -1896,6 +1959,9 @@ def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional
         return None
     msg = _strip_text_companion_cq_segments(msg)
     if scene == "group":
+        segment_msg = _render_group_ai_chat_message(evt)
+        if segment_msg is not None:
+            msg = segment_msg
         nick_aliases = [x for x in {str(bot_nick or "").strip(), "Cooper_bot", "Cooepr_bot"} if x]
         has_nick_mention = False
         for nick in nick_aliases:
@@ -3891,6 +3957,7 @@ async def _handle_explicit_command(
     handin: HandinService,
     perm=None,
     aisvc: Optional["AIService"] = None,
+    calendar_service=None,
 ):
     t = t[1:].strip()  # 去掉 /
     if not t:
@@ -3904,6 +3971,34 @@ async def _handle_explicit_command(
     if cmd in ("whoami",):
         g = ctx.group_id if ctx.group_id is not None else "None"
         await reply(api, ctx, f"scene={ctx.scene}, user={ctx.nickname}-{ctx.user_id}, group={g}, level={ctx.level}", logsvc)
+        return
+    if cmd == "calendartest":
+        if ctx.level < 3:
+            await reply(api, ctx, "权限不足：/calendartest 仅管理员可用。", logsvc)
+            return
+        target_date = parse_calendar_date(rest)
+        if target_date is None:
+            await reply(api, ctx, "用法：/calendartest YYYY.M.D\n例如：/calendartest 2026.6.26", logsvc)
+            return
+        if calendar_service is None:
+            await reply(api, ctx, "日历服务暂不可用。", logsvc)
+            return
+        try:
+            calendar_cfg = calendar_service.get_group_config(1087250737)
+            result = await calendar_service.generate_for_date(
+                target_date,
+                cfg=calendar_cfg,
+                force_refresh=True,
+                refresh_holiday_schedule=True,
+            )
+        except Exception as e:
+            try:
+                logsvc.log.warning(f"/calendartest failed: date={target_date.isoformat()} err={e}")
+            except Exception:
+                pass
+            await reply(api, ctx, "日历测试生成失败，请稍后重试。", logsvc)
+            return
+        await reply(api, ctx, result.message if result.special and result.message else "非特殊日期", logsvc)
         return
     if cmd == "level":
         if ctx.level < 3:
@@ -4107,6 +4202,7 @@ async def _handle_explicit_command(
                 "管理功能：",
                 "/level list",
                 "/level QQ号 等级",
+                "/calendartest YYYY.M.D  测试生成指定日期的重要日提醒",
             ])
         if ctx.level >= 1:
             lines.extend([
@@ -4647,6 +4743,7 @@ async def dispatch(
     handin: HandinService,
     perm=None,
     aisvc: Optional["AIService"] = None,
+    calendar_service=None,
 ):
     try:
         setattr(ctx, "_ai_chat_context_aisvc", aisvc)
@@ -4673,7 +4770,7 @@ async def dispatch(
     if t.startswith(("/", "／")):
         if _is_known_explicit_command(t) or int(getattr(ctx, "level", 0) or 0) < 1:
             _remember_non_ai_once()
-            await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc)
+            await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc, calendar_service)
             return
         if await _handle_ai_chat_trigger(api, ctx, evt, t, logsvc, aisvc, forced_ai_input=t):
             return
