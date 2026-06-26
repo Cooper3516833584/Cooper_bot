@@ -4226,7 +4226,6 @@ async def _handle_explicit_command(
             "私聊：直接发送文本内容",
             "私聊（联网搜索 Gemini）：g内容（g/G 后面可不加空格）",
             "私聊（联网搜索 Claude）：c内容（c/C 后面可不加空格）",
-            "提示：2级及以下仅开放联网搜索问答；3级管理员保留完整 CLI 能力。",
         ])
         if ctx.level >= 2:
             lines.extend([

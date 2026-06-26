@@ -8,7 +8,7 @@
     "1087250737": {
       "enabled": true,
       "send_time": "09:00",
-      "send_when_empty": true,
+      "send_when_empty": false,
       "send_catch_up_until": "12:00",
       "primary_web_model": "gemini",
       "secondary_web_model": "claude",
