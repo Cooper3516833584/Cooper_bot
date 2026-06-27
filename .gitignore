@@ -6,6 +6,7 @@ api_key.txt
 # runtime folders (不上传这些目录)
 __pycache__/
 data/
+data/daily_calendar/
 logs/
 napcat_config/
 napcat_qq/

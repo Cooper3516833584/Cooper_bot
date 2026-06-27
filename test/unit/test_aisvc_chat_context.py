@@ -106,19 +106,21 @@ def test_chat_context_expires_after_30_minutes(monkeypatch, controlled_time) -> 
     assert second_messages[-1]["content"] == "second"
 
 
-def test_chat_context_trims_to_latest_100_messages(controlled_time) -> None:
+def test_chat_context_trims_to_latest_max_messages(controlled_time) -> None:
     svc = _new_service()
     session = "group:30001"
+    max_messages = svc._CHAT_CONTEXT_MAX_MESSAGES
+    all_messages: list[dict[str, str]] = []
 
-    for i in range(70):
+    for i in range(max_messages + 10):
         svc._save_chat_turn(session, f"q{i}", f"a{i}")
+        all_messages.append({"role": "user", "content": f"q{i}"})
+        all_messages.append({"role": "assistant", "content": f"a{i}"})
         controlled_time.advance(1)
 
     history = svc._load_active_chat_history(session)
-    assert len(history) == 100
-    assert history[0] == {"role": "user", "content": "q20"}
-    assert history[1] == {"role": "assistant", "content": "a20"}
-    assert history[-1] == {"role": "assistant", "content": "a69"}
+    assert len(history) == max_messages
+    assert history == all_messages[-max_messages:]
 
 
 def test_chat_context_keeps_non_aichat_user_messages(controlled_time) -> None:

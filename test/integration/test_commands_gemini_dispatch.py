@@ -291,4 +291,3 @@ async def test_command_help_mentions_gemini_usage(dispatch_harness) -> None:
     assert any("群聊（联网搜索 Claude）：@Cooper_bot c内容" in one["text"] for one in dispatch_harness.messages)
     assert any("私聊（联网搜索 Gemini）：g内容" in one["text"] for one in dispatch_harness.messages)
     assert any("私聊（联网搜索 Claude）：c内容" in one["text"] for one in dispatch_harness.messages)
-    assert any("2级及以下仅开放联网搜索问答" in one["text"] for one in dispatch_harness.messages)

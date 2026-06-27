@@ -58,10 +58,13 @@ class _FakeAIService:
     def __init__(self) -> None:
         self.bot_nick = "Cooper_bot"
         self.chat_ready = True
+        self.gemini_chat_ready = True
         self.semantic_ready = False
         self.fallback_error_reply = "fallback"
         self.chat_with_context = AsyncMock(return_value="smoke-ai-reply")
         self.chat = AsyncMock(return_value="smoke-ai-reply")
+        self.restricted_gemini_chat_with_context = AsyncMock(return_value="smoke-ai-reply")
+        self.restricted_gemini_chat = AsyncMock(return_value="smoke-ai-reply")
         self.semantic_find_paths = AsyncMock(return_value=[])
 
 
@@ -149,7 +152,10 @@ async def test_core_routes_smoke_find_aichat_handin_admin(
         perm=Mock(),
         aisvc=aisvc,
     )
-    aisvc.chat_with_context.assert_awaited()
+    aisvc.restricted_gemini_chat_with_context.assert_awaited_once()
+    assert aisvc.restricted_gemini_chat_with_context.await_args.args[0] == "private:10001"
+    assert aisvc.restricted_gemini_chat_with_context.await_args.args[2] == "claude"
+    aisvc.chat_with_context.assert_not_awaited()
 
     monkeypatch.setattr(commands, "parse_mmdd_hhmm", lambda _s, _now: 1700000000.0)
     await commands.dispatch(
