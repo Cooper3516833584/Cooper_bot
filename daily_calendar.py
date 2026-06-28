@@ -25,6 +25,23 @@ _CQ_RE = re.compile(r"\[CQ:[^\]]+\]", flags=re.IGNORECASE)
 _DATE_RE = re.compile(r"^(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})$")
 _RETRYABLE_WEB_ERROR_MARKERS = ("busy", "capacity", "503", "429", "temporarily", "timeout", "unavailable")
 _VALID_WEB_CATEGORIES = {"traditional", "solar_term", "official", "national_memorial"}
+_DAILY_CACHE_VERSION = 2
+_FIXED_SOLAR_EVENTS: dict[tuple[int, int], list[dict[str, str]]] = {
+    (7, 1): [
+        {
+            "name": "中国共产党成立纪念日（建党节）",
+            "category": "national_memorial",
+            "fact": "1921年中国共产党成立，7月1日为中国共产党成立纪念日。",
+            "tone": "light",
+        },
+        {
+            "name": "香港回归纪念日",
+            "category": "national_memorial",
+            "fact": "1997年7月1日香港回归祖国，香港特别行政区成立。",
+            "tone": "light",
+        },
+    ],
+}
 
 
 @dataclass
@@ -148,7 +165,13 @@ class DailyCalendarService:
 
     @staticmethod
     def _event_key(name: Any) -> str:
-        return re.sub(r"[\s·•，,。.!！?？()（）\[\]【】]", "", str(name or "").strip()).casefold()
+        raw = str(name or "").strip()
+        key = re.sub(r"[\s·•，,。.!！?？()（）\[\]【】]", "", raw).casefold()
+        if "建党" in raw or ("中国共产党" in raw and ("成立" in raw or "诞生" in raw)):
+            return "cpc_founding_day"
+        if "香港" in raw and ("回归" in raw or "特别行政区成立" in raw or "恢复对香港行使主权" in raw):
+            return "hong_kong_handover_day"
+        return key
 
     @staticmethod
     def _is_official_source(url: Any) -> bool:
@@ -214,6 +237,14 @@ class DailyCalendarService:
         if snapshot.get("holiday_status") == "holiday":
             name = str(snapshot.get("holiday_name") or "法定休息日").strip()
             events.append({"name": name, "category": "official", "fact": "当年法定节假日安排", "tone": "light", "source": "local"})
+        try:
+            month, day = (int(part) for part in str(snapshot.get("date") or "").split("-")[1:3])
+        except Exception:
+            month, day = 0, 0
+        for event in _FIXED_SOLAR_EVENTS.get((month, day), []):
+            local_event = dict(event)
+            local_event["source"] = "local"
+            events.append(local_event)
         for name in self._as_string_list(snapshot.get("lunar_festivals")):
             events.append({"name": name, "category": "traditional", "fact": "农历传统节日", "tone": "light", "source": "local"})
         for name in self._as_string_list(snapshot.get("solar_festivals")):
@@ -243,7 +274,7 @@ class DailyCalendarService:
             "3. 只选择传统节日、二十四节气、国家级/官方纪念日或法定节假日；不要营销节日、人物生日、冷门网传纪念日。\n"
             "4. 法定节假日和国家级/官方纪念日必须给出权威公开来源，优先 gov.cn 域名。\n"
             "5. 传统节日、节气只能在名称与本地上下文匹配时列出；不匹配就不要猜。\n"
-            "6. 最多列出 2 项；无可靠事项时 events 必须是空数组。\n"
+            "6. 最多列出 3 项；无可靠事项时 events 必须是空数组。\n"
             "7. 只输出一个 JSON 对象，不要 Markdown、代码块或额外说明。\n\n"
             "JSON 格式：\n"
             '{"date":"YYYY-MM-DD","events":[{"name":"名称","category":"traditional|solar_term|official|national_memorial","fact":"不超过60字的可核验说明","tone":"light|solemn","source_title":"来源标题或空字符串","source_url":"https://... 或空字符串"}]}'
@@ -356,7 +387,7 @@ class DailyCalendarService:
                     "source_url": source_url,
                 }
             )
-            if len(out) >= 2:
+            if len(out) >= 3:
                 break
         return out
 
@@ -407,8 +438,6 @@ class DailyCalendarService:
 
     async def _render_message(self, target_date: date, snapshot: dict[str, Any], events: list[dict[str, Any]]) -> str:
         base = self._base_message(target_date, snapshot, events)
-        if any(str(event.get("tone") or "") == "solemn" for event in events):
-            return base + "\n铭记历史，珍视和平。"
         if self.aisvc is None or not bool(getattr(self.aisvc, "chat_ready", False)):
             return base
         chat = getattr(self.aisvc, "chat", None)
@@ -418,7 +447,7 @@ class DailyCalendarService:
         prompt = (
             "请为 QQ 群每日重要日提醒写一句轻松自然的补充文案。\n"
             "只能根据下列已经核验的事实写作，不得添加任何日期、节日、人物、历史事件或放假结论；"
-            "不得输出链接、CQ 码、@全体成员；不超过60字。\n"
+            "不得输出链接、CQ 码、@全体成员；如果事件偏庄重，语气克制，不要使用固定口号或套话；不超过60字。\n"
             f"日期：{target_date.isoformat()}，日历：{json.dumps(snapshot, ensure_ascii=False)}，事实：{json.dumps(factual_events, ensure_ascii=False)}"
         )
         try:
@@ -431,6 +460,8 @@ class DailyCalendarService:
     def _result_from_cache(self, target_date: date) -> Optional[CalendarResult]:
         raw = self._json_load(self._daily_cache_path(target_date), {})
         if not isinstance(raw, dict) or str(raw.get("date") or "") != target_date.isoformat():
+            return None
+        if self._safe_int(raw.get("cache_version"), 0) != _DAILY_CACHE_VERSION:
             return None
         snapshot = raw.get("snapshot")
         events = raw.get("events")
@@ -449,6 +480,7 @@ class DailyCalendarService:
         self._json_save(
             self._daily_cache_path(result.target_date),
             {
+                "cache_version": _DAILY_CACHE_VERSION,
                 "date": result.target_date.isoformat(),
                 "snapshot": result.snapshot,
                 "events": result.events,

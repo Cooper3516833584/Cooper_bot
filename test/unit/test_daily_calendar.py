@@ -165,6 +165,88 @@ def test_merge_events_enriches_holiday_and_keeps_solar_festival_and_term(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_generate_july_first_keeps_fixed_local_events_without_web(tmp_path) -> None:
+    service = _service(tmp_path)
+
+    result = await service.generate_for_date(date(2026, 7, 1), force_refresh=True)
+
+    names = [str(event.get("name") or "") for event in result.events]
+    assert len([name for name in names if "建党" in name or "中国共产党" in name]) == 1
+    assert any("香港回归" in name for name in names)
+    assert "铭记历史，珍视和平" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_generate_ignores_old_daily_cache_without_version(tmp_path) -> None:
+    service = _service(tmp_path)
+    target = date(2026, 7, 1)
+    service._json_save(
+        service._daily_cache_path(target),
+        {
+            "date": "2026-07-01",
+            "snapshot": {"date": "2026-07-01", "weekday": "三"},
+            "events": [{"name": "建党节", "category": "solar_festival"}],
+            "message": "旧缓存",
+            "special": True,
+        },
+    )
+
+    result = await service.generate_for_date(target)
+
+    assert result.message != "旧缓存"
+    assert any("香港回归" in str(event.get("name") or "") for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_generate_july_first_deduplicates_web_aliases_and_keeps_hong_kong(tmp_path) -> None:
+    ai = _CalendarAI(
+        json.dumps(
+            {
+                "date": "2026-07-01",
+                "events": [
+                    {
+                        "name": "中国共产党成立纪念日",
+                        "category": "national_memorial",
+                        "fact": "7月1日是中国共产党成立纪念日。",
+                        "tone": "solemn",
+                        "source_title": "中国政府网示例",
+                        "source_url": "https://www.gov.cn/example",
+                    },
+                    {
+                        "name": "建党节",
+                        "category": "national_memorial",
+                        "fact": "同一纪念日的常用简称。",
+                        "tone": "solemn",
+                        "source_title": "中国政府网示例",
+                        "source_url": "https://www.gov.cn/example",
+                    },
+                    {
+                        "name": "香港特别行政区成立纪念日",
+                        "category": "national_memorial",
+                        "fact": "1997年7月1日香港回归祖国，香港特别行政区成立。",
+                        "tone": "solemn",
+                        "source_title": "中国政府网示例",
+                        "source_url": "https://www.gov.cn/example",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+    )
+    service = _service(tmp_path, ai)
+
+    result = await service.generate_for_date(date(2026, 7, 1), cfg=service.get_group_config(1087250737), force_refresh=True)
+
+    names = [str(event.get("name") or "") for event in result.events]
+    assert len([name for name in names if "建党" in name or "中国共产党" in name]) == 1
+    assert any(
+        "香港回归" in str(event.get("name") or "") or "香港特别行政区" in str(event.get("fact") or "")
+        for event in result.events
+    )
+    assert "铭记历史，珍视和平" not in result.message
+
+
+@pytest.mark.asyncio
 async def test_calendartest_returns_exact_non_special_text(monkeypatch) -> None:
     replies: list[str] = []
 
