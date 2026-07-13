@@ -1,0 +1,4 @@
+action,operation,src,dst,status,size_bytes,src_sha256,dst_sha256,final_dst,note
+second_alias_merge,move_dir,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\马原,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\马克思主义基本原理\马原,ok,435697115,,,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\马克思主义基本原理\马原,files=203
+second_alias_merge,move_dir,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\四级真题,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\四六级\四级真题,ok,316441121,,,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\四六级\四级真题,files=7
+second_alias_merge,move_dir,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\六级真题,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\四六级\六级真题,ok,338821867,,,C:\Users\Cooper\Desktop\Cooper_bot\data\public\textbook_and_material\四六级\六级真题,files=7

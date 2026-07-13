@@ -13,7 +13,7 @@
       "primary_web_model": "gemini",
       "secondary_web_model": "claude",
       "web_timeout_seconds": 45,
-      "dry_run": true
+      "dry_run": false
     }
   }
 }

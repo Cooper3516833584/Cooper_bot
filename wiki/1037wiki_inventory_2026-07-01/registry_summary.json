@@ -1,0 +1,66 @@
+{
+  "generated_at": "2026-07-01T23:23:28+0800",
+  "batch_id": "1037wiki_download_2026-07-01_assumed_archived",
+  "assumption": "用户确认文件已归档；本清单按之前 manifest/download_state 记录把本批 1037wiki 下载资料整体视作已下载完成。",
+  "sources": {
+    "download_manifest": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\TBD\\_1037_download_tmp\\manifest.json",
+    "download_state": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\TBD\\_1037_download_tmp\\download_state.json",
+    "upload_plan": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\wiki\\1037wiki_upload_plan.json",
+    "upload_state": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\wiki\\1037wiki_upload_state.json",
+    "upload_summary": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\wiki\\1037wiki_upload_summary.json"
+  },
+  "download": {
+    "excluded_creators": [
+      "cooper_bot"
+    ],
+    "excluded_pages": 100,
+    "excluded_bytes": 3162833230,
+    "excluded_gib": 2.946,
+    "manifest_pages": 490,
+    "manifest_file_entries": 4029,
+    "unique_file_ids": 3872,
+    "manifest_bytes_by_entries": 26212084867,
+    "manifest_gib_by_entries": 24.412,
+    "manifest_selected_bytes": 26212084867,
+    "manifest_selected_gib": 24.412,
+    "assumed_downloaded_unique_files": 3872,
+    "pending_retry_unique_files": 0,
+    "original_state_counts_for_manifest_unique_files": {
+      "done": 3744,
+      "failed": 126,
+      "done_and_failed": 2
+    },
+    "download_state_done_total": 3746,
+    "download_state_failed_total": 128,
+    "state_done_ids_not_in_manifest": 0,
+    "state_failed_ids_not_in_manifest": 0
+  },
+  "upload": {
+    "plan_pages": 138,
+    "plan_indexed_files": 1829,
+    "uploaded_unique_titles": 100,
+    "uploaded_file_records": 828,
+    "active_errors": 0,
+    "plan_status_counts": {
+      "skipped_by_default_policy": 37,
+      "uploaded": 101
+    },
+    "duplicate_titles_in_plan": [
+      "马原课程资料"
+    ],
+    "skipped_by_default_policy_count": 37,
+    "pending_non_risk_count": 0
+  },
+  "overlap": {
+    "download_upload_title_overlap_rows": 3
+  },
+  "files": {
+    "download_files": "download_files.csv",
+    "download_pages": "download_pages.csv",
+    "download_pending_retry": "download_pending_retry.csv",
+    "uploaded_files": "uploaded_files.csv",
+    "uploaded_pages": "uploaded_pages.csv",
+    "upload_plan_pages": "upload_plan_pages.csv",
+    "download_upload_title_overlap": "download_upload_title_overlap.csv"
+  }
+}

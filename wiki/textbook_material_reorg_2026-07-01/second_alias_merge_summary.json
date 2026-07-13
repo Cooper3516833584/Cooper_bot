@@ -1,0 +1,33 @@
+{
+  "executed_at": "2026-07-01T23:41:05",
+  "root": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material",
+  "planned": [
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马克思主义基本原理\\马原",
+      "src_exists": true
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\四级真题",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\四六级\\四级真题",
+      "src_exists": true
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\六级真题",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\四六级\\六级真题",
+      "src_exists": true
+    }
+  ],
+  "before_files": 5586,
+  "after_files": 5586,
+  "before_size_bytes": 32119945043,
+  "after_size_bytes": 32119945043,
+  "file_count_delta": 0,
+  "size_delta_bytes": 0,
+  "actions": {
+    "move_dir": 3
+  },
+  "protected_dirs": [
+    "c:\\users\\cooper\\desktop\\cooper_bot\\data\\public\\textbook_and_material\\tbd"
+  ]
+}

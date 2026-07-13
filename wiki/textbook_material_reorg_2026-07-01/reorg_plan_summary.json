@@ -1,0 +1,12 @@
+{
+  "root": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material",
+  "plan_rows": 32,
+  "total_files_planned": 334,
+  "total_size_bytes_planned": 2420101934,
+  "actions": {
+    "move_dir_under_subject": 16,
+    "flatten_same_name_child": 14,
+    "move_top_file_to_subject": 2
+  },
+  "unsafe_rows": []
+}

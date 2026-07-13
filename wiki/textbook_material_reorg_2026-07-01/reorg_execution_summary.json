@@ -1,0 +1,17 @@
+{
+  "executed_at": "2026-07-01T23:36:18",
+  "root": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material",
+  "planned_rows": 32,
+  "executed_rows": 31,
+  "skipped_rows": 1,
+  "log_rows": 107,
+  "before_files": 5598,
+  "after_files": 5598,
+  "before_size_bytes": 32142812039,
+  "after_size_bytes": 32142812039,
+  "file_count_delta": 0,
+  "size_delta_bytes": 0,
+  "skipped_due_to_collision_rows": [
+    30
+  ]
+}

@@ -1,0 +1,79 @@
+{
+  "rows": 32,
+  "planned_file_destinations": 334,
+  "issues": [
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\2021-2022年A.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\2021-2022年A.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\2024年概论.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\2024年概论.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\华科《马原》题库.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\华科《马原》题库.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\选择题题库.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\选择题题库.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马克思主义基本原理习题集.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马克思主义基本原理习题集.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原复习提纲(1).pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原复习提纲(1).pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原思维导图.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原思维导图.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原真题_2020秋_含选择答案.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原真题_2020秋_含选择答案.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原真题_2021秋(A卷)_含选择答案.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原真题_2021秋(A卷)_含选择答案.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原真题集_部分答案.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原真题集_部分答案.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原试卷.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原试卷.pdf"
+    },
+    {
+      "row": 30,
+      "type": "existing_file_collision",
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马提纲.pdf",
+      "dst": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马提纲.pdf"
+    }
+  ],
+  "issue_count": 12
+}

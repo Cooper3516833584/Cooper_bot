@@ -1,0 +1,98 @@
+{
+  "executed_at": "2026-07-01T23:37:55",
+  "root": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material",
+  "subject_dir": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原",
+  "child_dir": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原",
+  "before_root_files": 5598,
+  "after_root_files": 5586,
+  "before_root_size_bytes": 32142812039,
+  "after_root_size_bytes": 32119945043,
+  "root_file_count_delta": -12,
+  "root_size_delta_bytes": -22866996,
+  "before_child_files": 27,
+  "after_child_files": 0,
+  "before_child_size_bytes": 78385492,
+  "after_child_size_bytes": 0,
+  "actions": {
+    "delete_duplicate_source": 12,
+    "move_no_conflict": 15
+  },
+  "deleted_duplicate_files": [
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\2021-2022年A.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\2021-2022年A.pdf",
+      "sha256": "252f921fe6612cf2403ddcc04734e4e41e8f6248433d1408bd148af91baed8fb",
+      "size": 1565383
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\2024年概论.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\2024年概论.pdf",
+      "sha256": "ae54f87e7beee8abd2cb883a4b68ca2cba10df97ef2b4812eba330bf9ebac119",
+      "size": 2209816
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\华科《马原》题库.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\华科《马原》题库.pdf",
+      "sha256": "8d42477e51e3588cebcf9e3e40a3a9aba60e73c163b2fc5e5ff4e28729a69f10",
+      "size": 422042
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\选择题题库.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\选择题题库.pdf",
+      "sha256": "1be1032560eabd57cbba4ab06aeafbdb316f231625cce6fded2ec1fefbb85566",
+      "size": 5631584
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马克思主义基本原理习题集.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马克思主义基本原理习题集.pdf",
+      "sha256": "bc3abcd8613257a3f8f77b139e5cc677d712b0af45be39263c51083ed2e2494a",
+      "size": 394926
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原复习提纲(1).pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原复习提纲(1).pdf",
+      "sha256": "b55a9838c7a05e345f177632e273ede01ae6812c23b904d4e3d9e3a95394b01b",
+      "size": 261012
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原思维导图.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原思维导图.pdf",
+      "sha256": "c7f9548aa06bcf243846d95628c73c5976eea23f13842c9b43a01c7eb39a8661",
+      "size": 2560507
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原真题_2020秋_含选择答案.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原真题_2020秋_含选择答案.pdf",
+      "sha256": "c8bb36f5af6b6c2efde441b3d97b200fa3b51c878a884828490e41106cb62b42",
+      "size": 381732
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原真题_2021秋(A卷)_含选择答案.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原真题_2021秋(A卷)_含选择答案.pdf",
+      "sha256": "6d2433875109863e74419757662120cc42f9ce8619f6d005da859b5fdcaeeba0",
+      "size": 1663225
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原真题集_部分答案.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原真题集_部分答案.pdf",
+      "sha256": "fa9ae692c17d208da89fbb4b95710fe0e1c579478d1756e32392a90ab6e7361a",
+      "size": 484843
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马原试卷.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原试卷.pdf",
+      "sha256": "32b0c6014e69eb0a29946ea342537929c91eb3787aa243ae2daf11789661bcb9",
+      "size": 7046777
+    },
+    {
+      "src": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原\\马提纲.pdf",
+      "kept": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马提纲.pdf",
+      "sha256": "4a653f18d4d447d3dde612c5aeaaae73cef91a5eb7dcaa253d329540407533ad",
+      "size": 245149
+    }
+  ],
+  "moved_different_hash_files": [],
+  "removed_empty_dirs": [
+    "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\马原\\马原"
+  ]
+}

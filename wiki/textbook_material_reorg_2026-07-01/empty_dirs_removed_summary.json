@@ -1,0 +1,23 @@
+{
+  "executed_at": "2026-07-01T23:38:52",
+  "root": "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material",
+  "candidate_empty_dirs": 3,
+  "removed_empty_dirs": 3,
+  "kept_empty_dirs": 0,
+  "before_files": 5586,
+  "after_files": 5586,
+  "before_size_bytes": 32119945043,
+  "after_size_bytes": 32119945043,
+  "file_count_delta": 0,
+  "size_delta_bytes": 0,
+  "remaining_empty_dirs": [
+    "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\TBD"
+  ],
+  "updated_at": "2026-07-01T23:40:14",
+  "restored_empty_dirs": [
+    "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\TBD"
+  ],
+  "protected_empty_dirs": [
+    "C:\\Users\\Cooper\\Desktop\\Cooper_bot\\data\\public\\textbook_and_material\\TBD"
+  ]
+}
