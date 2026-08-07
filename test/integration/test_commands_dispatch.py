@@ -341,9 +341,11 @@ async def test_command_aichat_dispatch(dispatch_harness) -> None:
 
 
 @pytest.mark.asyncio
-async def test_command_fixed_answer_precedes_private_aichat(dispatch_harness) -> None:
+async def test_command_fixed_answer_precedes_private_aichat(dispatch_harness, monkeypatch) -> None:
     ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
     aisvc = _FakeAIService()
+    # 固定答案数据（answer.txt）可能被编辑/注释，测试专注分派优先级，不依赖具体数据内容
+    monkeypatch.setattr(commands, "_lookup_fixed_answers", lambda _text: ["fixed-answer-reply"])
 
     await commands.dispatch(
         api=SimpleNamespace(),
@@ -359,7 +361,7 @@ async def test_command_fixed_answer_precedes_private_aichat(dispatch_harness) ->
     )
 
     aisvc.chat_with_context.assert_not_awaited()
-    assert any("我是Cooper_bot" in one["text"] for one in dispatch_harness.messages)
+    assert any("fixed-answer-reply" in one["text"] for one in dispatch_harness.messages)
 
 
 @pytest.mark.asyncio
@@ -440,7 +442,7 @@ async def test_dispatch_unknown_private_slash_command_reaches_aichat(dispatch_ha
         aisvc=aisvc,
     )
 
-    aisvc.chat_with_context.assert_awaited_once_with(f"private:{ctx.user_id}", "/fnd 高数")
+    aisvc.chat_with_context.assert_awaited_once_with(f"private:{ctx.user_id}", "/fnd 高数", [])
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
     assert not any("未知命令" in one["text"] for one in dispatch_harness.messages)
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 import aisvc
 import config
@@ -202,3 +205,147 @@ def test_reason_notice_uses_v4_flash_thinking_mode(monkeypatch) -> None:
     assert completion_calls[0]["model"] == "deepseek-v4-flash"
     assert completion_calls[0]["reasoning_effort"] == "high"
     assert completion_calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
+def test_parse_web_search_marker() -> None:
+    svc = _new_service()
+    assert svc._parse_web_search_marker("[WEB_SEARCH]今天北京天气") == "今天北京天气"
+    assert svc._parse_web_search_marker("  [WEB_SEARCH]  今天北京天气  ") == "今天北京天气"
+    assert svc._parse_web_search_marker("先解释一下\n[WEB_SEARCH]查一下股票行情") == "查一下股票行情"
+    assert svc._parse_web_search_marker("[WEB_SEARCH]") is None
+    assert svc._parse_web_search_marker("你好呀") is None
+    assert svc._parse_web_search_marker("") is None
+
+
+def test_extract_responses_search_sources() -> None:
+    resp = {
+        "output": [
+            {"type": "web_search_call", "status": "completed"},
+            {
+                "type": "function_call",
+                "name": "web_search",
+                "arguments": json.dumps(
+                    {"search_results": [{"title": "标题A", "url": "https://a.example", "content": "内容A"}]},
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+    }
+    out = AIService._extract_responses_search_sources(resp)
+    assert "标题A" in out
+    assert "https://a.example" in out
+    assert "内容A" in out
+
+    resp2 = {
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "搜索摘要"}]}]
+    }
+    out2 = AIService._extract_responses_search_sources(resp2)
+    assert "搜索摘要" in out2
+
+    assert AIService._extract_responses_search_sources({}) == ""
+    assert AIService._extract_responses_search_sources({"output": []}) == ""
+
+
+def test_append_web_search_judge_respects_switch() -> None:
+    svc = _new_service()
+    svc.web_search_enabled = True
+    out = svc._append_web_search_judge("base-prompt")
+    assert out.startswith("base-prompt")
+    assert "联网需求判定" in out
+
+    svc.web_search_enabled = False
+    assert svc._append_web_search_judge("base-prompt") == "base-prompt"
+
+
+def test_chat_sync_no_marker_single_call(monkeypatch) -> None:
+    svc = _new_service()
+    payloads = _install_fake_chat_backend(monkeypatch, svc)
+
+    out = svc._chat_sync("hello")
+    assert out == "reply-1"
+    assert len(payloads) == 1
+    assert "联网需求判定" in str(payloads[0]["messages"][0]["content"])
+
+
+def test_chat_with_context_web_search_flow(monkeypatch, controlled_time) -> None:
+    svc = _new_service()
+    calls: list[dict[str, Any]] = []
+
+    def _fake_post_json(url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = timeout
+        calls.append({"url": url, "payload": payload})
+        if url.endswith("/responses"):
+            return {
+                "output": [
+                    {"type": "web_search_call", "status": "completed"},
+                    {
+                        "type": "function_call",
+                        "name": "web_search",
+                        "arguments": json.dumps(
+                            {"search_results": [{"title": "天气报道", "url": "https://example.com/w", "content": "今日晴"}]},
+                            ensure_ascii=False,
+                        ),
+                    },
+                ]
+            }
+        chat_count = len([c for c in calls if c["url"].endswith("/chat/completions")])
+        if chat_count == 1:
+            return {"choices": [{"message": {"content": "[WEB_SEARCH]北京今天天气"}}]}
+        return {"choices": [{"message": {"content": "整合后的天气回答"}}]}
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+
+    out = svc._chat_with_context_sync("private:10001", "今天北京天气怎么样？")
+    assert out == "整合后的天气回答"
+
+    responses_calls = [c for c in calls if c["url"].endswith("/responses")]
+    assert len(responses_calls) == 1
+    assert responses_calls[0]["payload"]["model"] == "deepseek-v4-flash"
+    assert responses_calls[0]["payload"]["tools"] == [{"type": "web_search"}]
+    assert responses_calls[0]["payload"]["tool_choice"] == {"type": "web_search"}
+
+    chat_calls = [c for c in calls if c["url"].endswith("/chat/completions")]
+    assert len(chat_calls) == 2
+    # 判定调用：system prompt 含联网判定指令，且输出带标记
+    assert "联网需求判定" in str(chat_calls[0]["payload"]["messages"][0]["content"])
+    # 整合调用：把原始问题与搜索素材传给 v4-pro
+    assert "今天北京天气怎么样？" in str(chat_calls[1]["payload"]["messages"][1]["content"])
+    assert "今日晴" in str(chat_calls[1]["payload"]["messages"][1]["content"])
+
+    history = svc._load_active_chat_history("private:10001")
+    assert history[-1] == {"role": "assistant", "content": "整合后的天气回答"}
+
+
+def test_chat_with_context_web_search_disabled(monkeypatch, controlled_time) -> None:
+    svc = _new_service()
+    svc.web_search_enabled = False
+    payloads: list[dict[str, Any]] = []
+
+    def _fake_post_json(_url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = timeout
+        payloads.append(payload)
+        return {"choices": [{"message": {"content": "[WEB_SEARCH]不应触发的查询"}}]}
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+
+    out = svc._chat_with_context_sync("private:10002", "查一下新闻")
+    assert out == "[WEB_SEARCH]不应触发的查询"
+    assert len(payloads) == 1
+
+
+def test_chat_with_context_web_search_no_sources_raises(monkeypatch, controlled_time) -> None:
+    svc = _new_service()
+    calls: list[str] = []
+
+    def _fake_post_json(url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = payload, timeout
+        calls.append(url)
+        if url.endswith("/responses"):
+            return {"output": [{"type": "web_search_call", "status": "completed"}]}
+        return {"choices": [{"message": {"content": "[WEB_SEARCH]某查询"}}]}
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+
+    with pytest.raises(RuntimeError, match="web search returned no usable sources"):
+        svc._chat_with_context_sync("private:10003", "查新闻")
+    assert len(calls) == 2

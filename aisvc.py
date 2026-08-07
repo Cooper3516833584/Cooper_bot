@@ -39,6 +39,12 @@ from config import (
     AI_SEARCH_MIN_SIMILARITY,
     AI_SYSTEM_PROMPT,
     AI_VECTORS_PATH,
+    AI_VISION_CACHE_DIR,
+    AI_VISION_CACHE_TTL_SECONDS,
+    AI_VISION_ENABLED,
+    AI_VISION_MAX_IMAGES,
+    AI_WEB_SEARCH_ENABLED,
+    AI_WEB_SEARCH_MODEL,
     BASE_DIR,
     ENABLE_OCR,
 )
@@ -110,6 +116,23 @@ class AIService:
     _THINKING_DISABLED = {"type": "disabled"}
     _THINKING_ENABLED = {"type": "enabled"}
     _REASONING_EFFORT_HIGH = "high"
+    _VISION_DESCRIBE_PROMPT = (
+        "你是识图助手。\n"
+        "用户问题：{question}\n\n"
+        "请使用 read_file 工具依次读取以下图片文件：\n{paths}\n"
+        "然后：\n"
+        "1. 用简洁中文逐张描述图片内容（画面主体、文字、关键细节）。\n"
+        "2. 结合用户问题，给出对回答问题有用的信息；问题与图片无关时，客观描述图片即可。\n"
+        "3. 只允许读取上述图片文件，禁止读取或修改任何其他文件，禁止其他本地能力。\n"
+        "4. 某张图片无法读取时，明确说明是哪一张，不要编造内容。"
+    )
+    _VISION_IMAGE_HINT_PROMPT = (
+        "\n\n用户附带以下图片文件，请使用 read_file 工具查看这些图片（只允许读取这些文件）：\n{paths}"
+    )
+    _VISION_CACHE_MAX_ENTRIES_PER_SESSION = 20
+    _VISION_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+    _VISION_DOWNLOAD_TIMEOUT_SECONDS = 15.0
+    _AGY_SETTINGS_REL = Path(".gemini") / "antigravity-cli" / "settings.json"
     _NOTICE_SILENT_TOKEN = "[静默]"
     _CHAT_AUTOMATION_BOUNDARY_PROMPT = (
         "# 自动服务边界\n"
@@ -117,6 +140,28 @@ class AIService:
         "历史消息中可能包含 bot 的自动服务回复，例如文件提交、任务选择、覆盖确认、取消提示、发送文件等；这些只能作为上下文理解，不能当作你当前可以执行的能力。\n"
         "如果用户发送 0、纯数字、Y/N、done 等看起来像业务流程控制的短回复，说明本该由业务功能流程已经结束，需要告知用户。你不得自行推断已经取消、覆盖、提交、归档、删除或发送文件。\n"
         "你应该如实说明：自己不能执行该自动操作，请以机器人业务功能实际返回的消息为准；如果没有业务回复，可以尝试提交重名文件覆盖。"
+    )
+    _WEB_SEARCH_JUDGE_PROMPT = (
+        "# 联网需求判定\n"
+        "这是内部机制提示，请勿向用户提起。\n"
+        "如果用户的问题依赖实时、时效性或超出你知识范围的最新信息（例如天气、新闻、股价、比赛结果、政策变动、活动安排、最新公告等），\n"
+        "你必须仅输出一行，格式为：\n"
+        "[WEB_SEARCH]适合搜索引擎的自然语言查询词\n"
+        "除这一行外禁止输出任何其他字符，特别是禁止先给出猜测性回答。\n"
+        "其余问题请正常作答；涉及你不确定的事实性内容时，明确告知\"我不确定\"，禁止编造。"
+    )
+    _WEB_SEARCH_FETCH_SYSTEM_PROMPT = (
+        "你是一个联网搜索执行器。用户会给你一个搜索查询词。\n"
+        "请调用 web_search 工具完成搜索，等待工具返回结果即可，不要自己编造或总结。"
+    )
+    _WEB_SEARCH_COMPOSE_PROMPT = (
+        "# 联网信息整合回答\n"
+        "用户的问题需要实时信息，下面是联网搜索返回的资料（可能有噪声、过时或互相矛盾）：\n"
+        "请基于这些资料回答用户的问题。必须遵守：\n"
+        "1. 只使用资料中明确出现的信息，禁止编造资料中没有的事实、数字、日期、人名或来源。\n"
+        "2. 资料不足或互相矛盾时，如实说明\"搜索到的信息有限/存在矛盾\"，不要强行下结论。\n"
+        "3. 如能确定来源，用 (来源：标题或域名) 形式注明。\n"
+        "4. 用简洁自然的中文回答，适合 QQ 聊天场景；不要提及搜索流程等内部机制。"
     )
 
     def __init__(self, log):
@@ -135,6 +180,14 @@ class AIService:
 
         self.bot_nick = str(AI_BOT_NICK or "Cooper_bot")
         self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_PRO_MODEL)
+        self.web_search_enabled = bool(AI_WEB_SEARCH_ENABLED)
+        self.web_search_model = str(AI_WEB_SEARCH_MODEL or self._DEEPSEEK_V4_FLASH_MODEL)
+        self.vision_enabled = bool(AI_VISION_ENABLED)
+        self.vision_cache_dir = Path(AI_VISION_CACHE_DIR)
+        self.vision_max_images = max(1, int(AI_VISION_MAX_IMAGES))
+        self.vision_cache_ttl = max(30.0, float(AI_VISION_CACHE_TTL_SECONDS))
+        self._recent_images_lock = threading.RLock()
+        self._recent_images: Dict[str, List[dict]] = {}
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
         self.gemini_cli_path = str(AI_GEMINI_CLI_PATH or "").strip()
         self.gemini_model = str(AI_GEMINI_MODEL or "").strip()
@@ -279,20 +332,32 @@ class AIService:
     async def chat(self, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_sync, user_input)
 
-    async def chat_with_context(self, session_key: str, user_input: str) -> str:
-        return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
+    async def chat_with_context(self, session_key: str, user_input: str, image_paths: Optional[List[str]] = None) -> str:
+        return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input, image_paths)
 
     async def gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
         return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key)
 
-    async def gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
-        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key)
+    async def gemini_chat_with_context(
+        self,
+        session_key: str,
+        user_input: str,
+        model_key: Optional[str] = None,
+        image_paths: Optional[List[str]] = None,
+    ) -> str:
+        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, image_paths)
 
     async def restricted_gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
         return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key, True)
 
-    async def restricted_gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
-        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, True)
+    async def restricted_gemini_chat_with_context(
+        self,
+        session_key: str,
+        user_input: str,
+        model_key: Optional[str] = None,
+        image_paths: Optional[List[str]] = None,
+    ) -> str:
+        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, True, image_paths)
 
     async def restricted_gemini_calendar_chat(
         self,
@@ -376,6 +441,7 @@ class AIService:
         system_prompt: str,
         history: List[Dict[str, str]],
         user_input: str,
+        image_paths: Optional[List[str]] = None,
     ) -> str:
         content = str(user_input or "").strip()
         if not content:
@@ -392,25 +458,37 @@ class AIService:
             )
         sections.append("Use google_web_search before answering the latest user request.")
         sections.append("Latest user request:\n" + content)
-        return "\n\n".join(sections).strip()
+        prompt = "\n\n".join(sections).strip()
+        return self._append_vision_image_hint(prompt, image_paths)
 
     def _build_restricted_gemini_cli_prompt(
         self,
         system_prompt: str,
         history: List[Dict[str, str]],
         user_input: str,
+        image_paths: Optional[List[str]] = None,
     ) -> str:
         content = str(user_input or "").strip()
         if not content:
             return ""
+        has_images = bool(image_paths)
         base = (
             "Security policy for this QQ bot request:\n"
             "- You may answer the user and, when current/public information is needed, use google_web_search only.\n"
-            "- Do not use any local-computer capability: no read_file, read_many_files, list_directory, glob, grep_search, write_file, replace, run_shell_command, ask_user, save_memory, activate_skill, or MCP/local tools.\n"
-            "- Do not inspect, modify, execute, or summarize files, folders, processes, environment variables, shell output, browser state, or credentials on this computer.\n"
-            "- If the request cannot be answered with normal model knowledge plus public web search, say you can only help with联网搜索获取信息.\n\n"
+            + (
+                "- You may additionally use read_file ONLY for the user-provided image files listed below.\n"
+                if has_images
+                else ""
+            )
+            + (
+                "- Do not use any local-computer capability: no read_file, read_many_files, list_directory, glob, grep_search, write_file, replace, run_shell_command, ask_user, save_memory, activate_skill, or MCP/local tools.\n"
+                if not has_images
+                else "- Do not use any other local-computer capability: no read_many_files, list_directory, glob, grep_search, write_file, replace, run_shell_command, ask_user, save_memory, activate_skill, or MCP/local tools.\n"
+            )
+            + "- Do not inspect, modify, execute, or summarize files, folders, processes, environment variables, shell output, browser state, or credentials on this computer.\n"
+            + "- If the request cannot be answered with normal model knowledge plus public web search, say you can only help with联网搜索获取信息.\n\n"
         )
-        prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
+        prompt = self._build_gemini_cli_prompt(system_prompt, history, content, image_paths)
         return base + prompt
 
     @staticmethod
@@ -538,10 +616,10 @@ class AIService:
     ) -> str:
         base_cmd = self._build_gemini_cli_base_command()
         if not base_cmd:
-            raise RuntimeError("gemini cli not found")
+            raise RuntimeError("antigravity cli not found")
         policy_path = Path(self.gemini_policy_path)
         if not policy_path.is_file():
-            raise RuntimeError("gemini policy file not found")
+            raise RuntimeError("antigravity policy file not found")
         workdir = Path(self.gemini_restricted_workdir if restricted else self.gemini_workdir)
         workdir.mkdir(parents=True, exist_ok=True)
 
@@ -554,7 +632,7 @@ class AIService:
                 cmd.append("--sandbox")
         elif restricted:
             raise RuntimeError("restricted gemini chat requires antigravity cli")
-        cli_label = "antigravity cli" if agy_log_path is not None else "gemini cli"
+        cli_label = "antigravity cli"
         cmd.extend(["-p", str(prompt or "")])
         cli_model = str(model_name if model_name is not None else self.gemini_model or "").strip()
         if cli_model:
@@ -581,9 +659,9 @@ class AIService:
                 creationflags=run_creationflags,
             )
         except subprocess.TimeoutExpired as e:
-            raise RuntimeError(f"gemini cli timeout after {int(run_timeout)}s") from e
+            raise RuntimeError(f"antigravity cli timeout after {int(run_timeout)}s") from e
         except Exception as e:
-            raise RuntimeError(f"gemini cli launch failed: {e}") from e
+            raise RuntimeError(f"antigravity cli launch failed: {e}") from e
 
         raw_bytes = proc.stdout or b""
         raw = raw_bytes.decode("utf-8", errors="replace")
@@ -2336,6 +2414,7 @@ class AIService:
     def _bootstrap_quick_sync_sync(self) -> None:
         self.material_dir.mkdir(parents=True, exist_ok=True)
         self._load_api_config()
+        self._ensure_agy_vision_allow_rule()
 
         self.log.info("AI 启动阶段：加载缓存索引/元数据/向量")
         index_by_rel, metadata_by_rel, vector_by_rel = self._load_incremental_store_maps()
@@ -2771,7 +2850,10 @@ class AIService:
 
         payload = self._build_chat_payload(
             [
-                {"role": "system", "content": self._append_chat_automation_boundary(self.system_prompt)},
+                {
+                    "role": "system",
+                    "content": self._append_web_search_judge(self._append_chat_automation_boundary(self.system_prompt)),
+                },
                 {"role": "user", "content": content},
             ],
             self._CHAT_TEMPERATURE,
@@ -2780,6 +2862,15 @@ class AIService:
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
         text = self._extract_chat_text(data)
+        if self.web_search_enabled:
+            query = self._parse_web_search_marker(text)
+            if query:
+                material = self._web_search_fetch_sources_sync(query)
+                text = self._web_search_compose_final_sync(
+                    self._append_web_search_judge(self._append_chat_automation_boundary(self.system_prompt)),
+                    content,
+                    material,
+                )
         if not text:
             raise RuntimeError("empty chat response")
         return text
@@ -2818,7 +2909,7 @@ class AIService:
         prompt = self._build_gemini_cli_prompt(system_prompt, [], content)
         return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
-    def _chat_with_context_sync(self, session_key: str, user_input: str) -> str:
+    def _chat_with_context_sync(self, session_key: str, user_input: str, image_paths: Optional[List[str]] = None) -> str:
         if not self.chat_ready:
             raise RuntimeError("chat not ready")
 
@@ -2830,6 +2921,15 @@ class AIService:
         if not key:
             return self._chat_sync(content)
 
+        raw_content = content
+        if self.vision_enabled and image_paths:
+            try:
+                desc = self._describe_images_via_gemini_sync(image_paths, raw_content)
+                if desc:
+                    content = f"【附带图片描述】\n{desc}\n\n用户问题：{raw_content}"
+            except Exception as e:
+                self.log.warning(f"AI vision describe failed, chat without image context: err={e}")
+
         history: List[Dict[str, str]] = []
         try:
             history = self._load_active_chat_history(key)
@@ -2837,7 +2937,9 @@ class AIService:
             self.log.warning(f"AI chat context read failed, fallback to stateless: session={key[:80]} err={e}")
             history = []
 
-        system_prompt = self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
+        system_prompt = self._append_web_search_judge(
+            self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
+        )
         payload = self._build_chat_payload(
             [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
             self._CHAT_TEMPERATURE,
@@ -2846,14 +2948,271 @@ class AIService:
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
         text = self._extract_chat_text(data)
+        if self.web_search_enabled:
+            query = self._parse_web_search_marker(text)
+            if query:
+                material = self._web_search_fetch_sources_sync(query)
+                text = self._web_search_compose_final_sync(system_prompt, raw_content, material)
         if not text:
             raise RuntimeError("empty chat response")
 
         try:
-            self._save_chat_turn(key, content, text)
+            self._save_chat_turn(key, raw_content, text)
         except Exception as e:
             self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
         return text
+
+    def _append_web_search_judge(self, system_prompt: str) -> str:
+        """联网开关开启时在 system prompt 后追加联网判定指令；关闭时原样返回。"""
+        prompt = str(system_prompt or "").strip()
+        if not self.web_search_enabled:
+            return prompt
+        judge = self._WEB_SEARCH_JUDGE_PROMPT.strip()
+        if not prompt:
+            return judge
+        if judge in prompt:
+            return prompt
+        return f"{prompt}\n\n{judge}"
+
+    @staticmethod
+    def _parse_web_search_marker(text: str) -> Optional[str]:
+        """解析回复文本中的 [WEB_SEARCH] 标记，返回标记后的查询词；无标记返回 None。"""
+        raw = str(text or "")
+        idx = raw.find("[WEB_SEARCH]")
+        if idx < 0:
+            return None
+        query = raw[idx + len("[WEB_SEARCH]"):].strip()
+        return query or None
+
+    def _web_search_fetch_sources_sync(self, query: str) -> str:
+        """调用 v4-flash（Responses API + web_search）执行联网搜索，返回搜索素材文本。"""
+        if not self.deepseek_api_key:
+            raise RuntimeError("deepseek api key not ready")
+        q = str(query or "").strip()
+        if not q:
+            raise RuntimeError("empty web search query")
+        payload = {
+            "model": str(self.web_search_model or self._DEEPSEEK_V4_FLASH_MODEL),
+            "input": [
+                {"role": "system", "content": self._WEB_SEARCH_FETCH_SYSTEM_PROMPT},
+                {"role": "user", "content": q},
+            ],
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"},
+        }
+        url = self._join_url(self.deepseek_base_url, "responses")
+        data = self._post_json(url, payload, self.deepseek_api_key, timeout=60.0)
+        material = self._extract_responses_search_sources(data)
+        if not material:
+            raise RuntimeError("web search returned no usable sources")
+        return material
+
+    @staticmethod
+    def _extract_responses_search_sources(resp: dict) -> str:
+        """从 DeepSeek Responses API 响应中提取搜索素材文本；无素材返回空串。"""
+        output = (resp or {}).get("output")
+        if not isinstance(output, list):
+            return ""
+        parts: List[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "function_call":
+                args = str(item.get("arguments") or "")
+                try:
+                    obj = json.loads(args)
+                except Exception:
+                    obj = {}
+                if not isinstance(obj, dict):
+                    continue
+                results = obj.get("search_results")
+                if not isinstance(results, list):
+                    continue
+                for r in results:
+                    if not isinstance(r, dict):
+                        continue
+                    block = []
+                    title = str(r.get("title") or "").strip()
+                    url = str(r.get("url") or "").strip()
+                    content = str(r.get("content") or "").strip()
+                    if title:
+                        block.append(f"标题：{title}")
+                    if url:
+                        block.append(f"来源：{url}")
+                    if content:
+                        block.append(content)
+                    if block:
+                        parts.append("\n".join(block))
+            elif itype == "message":
+                content_items = item.get("content")
+                if not isinstance(content_items, list):
+                    continue
+                texts = []
+                for c in content_items:
+                    if isinstance(c, dict) and c.get("type") == "output_text":
+                        t = str(c.get("text") or "").strip()
+                        if t:
+                            texts.append(t)
+                if texts:
+                    parts.append("【搜索结果摘要】\n" + "\n".join(texts))
+        return "\n\n".join(parts).strip()
+
+    def _web_search_compose_final_sync(self, system_prompt: str, user_content: str, material: str) -> str:
+        """将原始问题与搜索素材交给 v4-pro 整合，返回最终回答文本。"""
+        compose_system = f"{str(system_prompt or '').strip()}\n\n{self._WEB_SEARCH_COMPOSE_PROMPT.strip()}"
+        prompt = f"用户问题：{user_content}\n\n【联网搜索结果】\n{material}"
+        payload = self._build_chat_payload(
+            [
+                {"role": "system", "content": compose_system},
+                {"role": "user", "content": prompt},
+            ],
+            self._CHAT_TEMPERATURE,
+            enable_thinking=True,
+        )
+        url = self._join_url(self.deepseek_base_url, "chat/completions")
+        data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
+        text = self._extract_chat_text(data)
+        if not text:
+            raise RuntimeError("empty web search final response")
+        return text
+
+    def record_recent_images(self, session_key: str, images: List[dict]) -> None:
+        """按会话缓存最近消息里的图片（事件驱动，供后续 aichat 识图使用）。"""
+        key = str(session_key or "").strip()
+        if not key or not images:
+            return
+        now_ts = float(time.time())
+        cutoff = now_ts - float(self.vision_cache_ttl)
+        with self._recent_images_lock:
+            cached = self._recent_images.get(key) or []
+            cached = [x for x in cached if isinstance(x, dict) and float(x.get("ts") or 0.0) >= cutoff]
+            for img in images:
+                cached.append(
+                    {
+                        "ts": now_ts,
+                        "file": str(img.get("file") or "").strip(),
+                        "url": str(img.get("url") or "").strip(),
+                    }
+                )
+            cached = cached[-int(self._VISION_CACHE_MAX_ENTRIES_PER_SESSION):]
+            self._recent_images[key] = cached
+
+    def _load_recent_images(self, session_key: str, now_ts: Optional[float] = None) -> List[dict]:
+        """读取会话最近缓存图片（TTL 过滤，返回 {file,url} 列表）。"""
+        key = str(session_key or "").strip()
+        if not key:
+            return []
+        use_ts = float(now_ts if now_ts is not None else time.time())
+        cutoff = use_ts - float(self.vision_cache_ttl)
+        with self._recent_images_lock:
+            cached = self._recent_images.get(key) or []
+        out: List[dict] = []
+        for x in cached:
+            if not isinstance(x, dict):
+                continue
+            try:
+                ts = float(x.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts < cutoff:
+                continue
+            out.append({"file": str(x.get("file") or "").strip(), "url": str(x.get("url") or "").strip()})
+        return out
+
+    def _agy_settings_path(self) -> Path:
+        return Path.home() / self._AGY_SETTINGS_REL
+
+    def _ensure_agy_vision_allow_rule(self) -> bool:
+        """幂等写入 agy settings.json 的 permissions.allow 规则：read_file(<vision_cache_dir>/**)。"""
+        if not self.vision_enabled:
+            return False
+        try:
+            self.vision_cache_dir.mkdir(parents=True, exist_ok=True)
+            settings_path = self._agy_settings_path()
+            if not settings_path.is_file():
+                self.log.warning("AI vision: agy settings.json 不存在，跳过识图权限配置")
+                return False
+            try:
+                obj = json.loads(settings_path.read_text(encoding="utf-8"))
+            except Exception:
+                obj = {}
+            if not isinstance(obj, dict):
+                obj = {}
+            rule = "read_file({})".format(str(self.vision_cache_dir.resolve() / "**"))
+            perms = obj.get("permissions")
+            if not isinstance(perms, dict):
+                perms = {}
+                obj["permissions"] = perms
+            allow = perms.get("allow")
+            if not isinstance(allow, list):
+                allow = []
+                perms["allow"] = allow
+            if rule in allow:
+                return True
+            allow.append(rule)
+            settings_path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.log.info(f"AI vision: 已写入 agy 识图允许规则 {rule}")
+            return True
+        except Exception as e:
+            self.log.warning(f"AI vision: settings.json 权限写入失败: {e}")
+            return False
+
+    def _vision_cache_save_path(self, url: str, file_id: str) -> Path:
+        self.vision_cache_dir.mkdir(parents=True, exist_ok=True)
+        seed = str(url or "") or str(file_id or "")
+        digest = hashlib.md5(seed.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        ext = ""
+        m = re.search(r"\.(jpg|jpeg|png|gif|webp|bmp)(?:\?|$)", str(url or "").lower())
+        if m:
+            ext = f".{m.group(1)}"
+        return self.vision_cache_dir / f"{int(time.time() * 1000)}_{digest}{ext or '.img'}"
+
+    def _download_image_sync(
+        self,
+        url: str,
+        save_path: Path,
+        max_bytes: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """下载图片到本地；失败或超限返回 False。"""
+        u = str(url or "").strip()
+        if not u:
+            return False
+        limit = int(max_bytes if max_bytes is not None else self._VISION_IMAGE_MAX_BYTES)
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=float(timeout if timeout is not None else self._VISION_DOWNLOAD_TIMEOUT_SECONDS)) as resp:
+                data = resp.read(limit + 1)
+            if len(data) > limit:
+                return False
+            if not data:
+                return False
+            Path(save_path).write_bytes(data)
+            return True
+        except Exception:
+            return False
+
+    def _build_vision_describe_prompt(self, image_paths: List[str], user_question: str) -> str:
+        paths_txt = "\n".join(f"- {p}" for p in image_paths)
+        return self._VISION_DESCRIBE_PROMPT.format(question=str(user_question or "").strip(), paths=paths_txt)
+
+    def _describe_images_via_gemini_sync(self, image_paths: List[str], user_question: str) -> str:
+        """用 agy（Gemini 模型）读取图片并输出文本描述，供 DeepSeek 等纯文本模型使用。"""
+        paths = [str(p) for p in (image_paths or []) if str(p).strip()]
+        if not paths:
+            return ""
+        if not self.gemini_chat_ready:
+            raise RuntimeError("gemini chat not ready")
+        prompt = self._build_vision_describe_prompt(paths, user_question)
+        return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(None), restricted=True)
+
+    def _append_vision_image_hint(self, prompt: str, image_paths: List[str]) -> str:
+        paths = [str(p) for p in (image_paths or []) if str(p).strip()]
+        if not paths:
+            return str(prompt or "")
+        paths_txt = "\n".join(f"- {p}" for p in paths)
+        return f"{str(prompt or '').strip()}\n{self._VISION_IMAGE_HINT_PROMPT.format(paths=paths_txt)}"
 
     def _gemini_chat_with_context_sync(
         self,
@@ -2861,6 +3220,7 @@ class AIService:
         user_input: str,
         model_key: Optional[str] = None,
         restricted: bool = False,
+        image_paths: Optional[List[str]] = None,
     ) -> str:
         if not self.gemini_chat_ready:
             raise RuntimeError("gemini chat not ready")
@@ -2881,10 +3241,10 @@ class AIService:
 
         system_prompt = self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
         if restricted:
-            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, history, content)
+            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, history, content, image_paths)
             text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
         else:
-            prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
+            prompt = self._build_gemini_cli_prompt(system_prompt, history, content, image_paths)
             text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
         try:

@@ -1952,6 +1952,30 @@ def _evt_mentions_me(evt: dict) -> bool:
     if self_id and raw and (f"qq={self_id}" in raw):
         return True
     return False
+
+
+def _extract_evt_images(evt: dict) -> List[dict]:
+    """从 OneBot 消息事件的 message 段提取图片（含表情包 sticker，同为 image 段）。"""
+    msg = evt.get("message")
+    if not isinstance(msg, list):
+        return []
+    out: List[dict] = []
+    for seg in msg:
+        if not isinstance(seg, dict):
+            continue
+        if str(seg.get("type") or "").strip().lower() != "image":
+            continue
+        data = seg.get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        file_id = str(data.get("file") or "").strip()
+        url = str(data.get("url") or "").strip()
+        if not file_id and not url:
+            continue
+        out.append({"file": file_id, "url": url})
+    return out
+
+
 def _extract_ai_chat_input(ctx, evt: dict, text: str, bot_nick: str) -> Optional[str]:
     msg = str(text or "").strip()
     scene = str(getattr(ctx, "scene", "") or "")
@@ -3809,6 +3833,55 @@ async def _handle_pre_dispatch_state(
     # ========== 原有文字命令体系 ==========
     return False
 
+async def _collect_vision_image_files(api, ctx, evt: dict, aisvc) -> List[str]:
+    """收集当前消息与最近缓存的图片并落盘，返回本地路径列表（最多 vision_max_images 张）。"""
+    if aisvc is None or not bool(getattr(aisvc, "vision_enabled", False)):
+        return []
+    try:
+        max_n = max(1, int(getattr(aisvc, "vision_max_images", 3) or 3))
+        cache_dir = Path(str(getattr(aisvc, "vision_cache_dir") or "")).resolve()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return []
+
+    candidates: List[dict] = list(_extract_evt_images(evt))
+    session_key = _ai_chat_session_key(ctx)
+    if session_key:
+        try:
+            recent = aisvc._load_recent_images(session_key)
+        except Exception:
+            recent = []
+        seen = {f"{str(x.get('file') or '')}|{str(x.get('url') or '')}" for x in candidates}
+        for img in recent:
+            dup = f"{str(img.get('file') or '')}|{str(img.get('url') or '')}"
+            if dup in seen:
+                continue
+            seen.add(dup)
+            candidates.append(img)
+
+    paths: List[str] = []
+    for img in candidates[:max_n]:
+        url = str(img.get("url") or "").strip()
+        file_id = str(img.get("file") or "").strip()
+        if not url and file_id and api is not None:
+            try:
+                info = await api.get_file(file_id, timeout=30.0)
+                data = (info or {}).get("data") or {}
+                url = str(data.get("url") or "").strip()
+            except Exception:
+                url = ""
+        if not url:
+            continue
+        try:
+            save_path = aisvc._vision_cache_save_path(url, file_id)
+            ok = await asyncio.to_thread(aisvc._download_image_sync, url, save_path)
+        except Exception:
+            ok = False
+        if ok:
+            paths.append(str(save_path))
+    return paths
+
+
 async def _handle_ai_chat_trigger(
     api,
     ctx,
@@ -3859,12 +3932,21 @@ async def _handle_ai_chat_trigger(
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
         try:
+            vision_paths: List[str] = []
+            try:
+                vision_paths = await _collect_vision_image_files(api, ctx, evt, aisvc)
+            except Exception as e:
+                try:
+                    logsvc.log.warning(f"AI vision collect failed: {e}")
+                except Exception:
+                    pass
+                vision_paths = []
             session_key = _ai_chat_session_key(ctx)
             if session_key and callable(chat_with_context_fn):
                 if use_gemini:
-                    out = (await chat_with_context_fn(session_key, ai_input, model_key)).strip()
+                    out = (await chat_with_context_fn(session_key, ai_input, model_key, vision_paths)).strip()
                 else:
-                    out = (await chat_with_context_fn(session_key, ai_input)).strip()
+                    out = (await chat_with_context_fn(session_key, ai_input, vision_paths)).strip()
                 try:
                     setattr(ctx, "_skip_reply_context_once", True)
                 except Exception:
@@ -4752,6 +4834,16 @@ async def dispatch(
     await _ensure_group_context_and_schedule_digest(api, ctx, evt, text, logsvc, state, handin, aisvc)
     if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc, aisvc):
         return
+    # 记录最近图片，供后续 aichat 识图使用（无图消息内部快速跳过）
+    if aisvc is not None and getattr(aisvc, "vision_enabled", False):
+        try:
+            imgs = _extract_evt_images(evt)
+            if imgs:
+                sess = _ai_chat_session_key(ctx)
+                if sess:
+                    aisvc.record_recent_images(sess, imgs)
+        except Exception:
+            pass
     t = (text or "").strip()
     if not t:
         return

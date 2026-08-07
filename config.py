@@ -209,6 +209,12 @@ AI_METADATA_PATH = AI_MATERIAL_DIR / "file_metadata.json"
 AI_VECTORS_PATH = AI_MATERIAL_DIR / "file_vectors.npy"
 
 AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-pro")
+AI_WEB_SEARCH_ENABLED = _get_env("AI_WEB_SEARCH_ENABLED", "1") == "1"
+AI_WEB_SEARCH_MODEL = _get_env("AI_WEB_SEARCH_MODEL", "")
+AI_VISION_ENABLED = _get_env("AI_VISION_ENABLED", "0") == "1"
+AI_VISION_CACHE_DIR = _get_env_path("AI_VISION_CACHE_DIR", DATA_DIR / "_gemini_vision_cache")
+AI_VISION_MAX_IMAGES = int(_get_env("AI_VISION_MAX_IMAGES", "3") or "3")
+AI_VISION_CACHE_TTL_SECONDS = float(_get_env("AI_VISION_CACHE_TTL_SECONDS", "600") or "600")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
 AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "agy")
