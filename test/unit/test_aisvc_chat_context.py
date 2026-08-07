@@ -316,6 +316,26 @@ def test_chat_with_context_web_search_flow(monkeypatch, controlled_time) -> None
     assert history[-1] == {"role": "assistant", "content": "整合后的天气回答"}
 
 
+def test_web_search_compose_does_not_reapply_search_judge(monkeypatch) -> None:
+    svc = _new_service()
+    payloads: list[dict[str, Any]] = []
+
+    def _fake_post_json(_url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = timeout
+        payloads.append(payload)
+        return {"choices": [{"message": {"content": "整合回答"}}]}
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+    system = svc._append_web_search_judge("基础提示")
+
+    out = svc._web_search_compose_final_sync(system, "图片中的商品多少钱？", "搜索素材")
+
+    assert out == "整合回答"
+    compose_system = payloads[0]["messages"][0]["content"]
+    assert "基础提示" in compose_system
+    assert svc._WEB_SEARCH_JUDGE_PROMPT not in compose_system
+
+
 def test_chat_with_context_web_search_disabled(monkeypatch, controlled_time) -> None:
     svc = _new_service()
     svc.web_search_enabled = False

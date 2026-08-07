@@ -155,7 +155,6 @@ class AIService:
         "3. 如能确定来源，用 (来源：标题或域名) 形式注明。\n"
         "4. 用简洁自然的中文回答，适合 QQ 聊天场景；不要提及搜索流程等内部机制。"
     )
-
     def __init__(self, log):
         self.log = log
         self.api_key_path = Path(AI_API_KEY_PATH)
@@ -3125,7 +3124,11 @@ class AIService:
         history: Optional[List[dict]] = None,
     ) -> str:
         """将原始问题（含当前视觉渲染）与搜索素材交给 v4-pro 整合，返回最终回答文本。"""
-        compose_system = f"{str(system_prompt or '').strip()}\n\n{self._WEB_SEARCH_COMPOSE_PROMPT.strip()}"
+        # The search-decision prompt is only for the first pass. Keeping it in
+        # the compose pass makes the model emit the internal marker again,
+        # which can leak to the user instead of producing the final answer.
+        base_system = self._without_web_search_judge(system_prompt)
+        compose_system = f"{base_system}\n\n{self._WEB_SEARCH_COMPOSE_PROMPT.strip()}"
         prompt = f"用户当前问题：\n{str(user_content or '').strip()}\n\n【联网搜索结果】\n{str(material or '').strip()}"
         messages: List[dict] = [{"role": "system", "content": compose_system}]
         for message in history or []:
@@ -3143,9 +3146,18 @@ class AIService:
         url = self._join_url(self.deepseek_base_url, "chat/completions")
         data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
         text = self._extract_chat_text(data)
+        text = self._strip_web_search_marker(text)
         if not text:
             raise RuntimeError("empty web search final response")
         return text
+
+    def _without_web_search_judge(self, system_prompt: str) -> str:
+        """Remove the internal search-decision instructions for final composing."""
+        prompt = str(system_prompt or '').strip()
+        judge = self._WEB_SEARCH_JUDGE_PROMPT.strip()
+        if judge:
+            prompt = prompt.replace(judge, '').strip()
+        return prompt
 
     @staticmethod
     def _strip_web_search_marker(text: str) -> str:

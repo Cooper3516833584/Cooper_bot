@@ -206,6 +206,7 @@ async def test_resolve_image_ready() -> None:
     assert resolutions[0].slot_id == "A:1"
     assert resolutions[0].status == "ready"
     assert "一只猫" in resolutions[0].description
+    assert client.chat.completions.calls[0]["max_tokens"] == 800
 
 
 @pytest.mark.asyncio

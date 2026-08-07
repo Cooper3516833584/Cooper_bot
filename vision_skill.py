@@ -157,6 +157,7 @@ QQ_FACE_NAMES = {
 }
 
 _VISION_PROMPT_VERSION = "v1"
+_VISION_MAX_OUTPUT_TOKENS = 1600
 
 _VISION_SYSTEM_PROMPT = """你是聊天图片描述器。
 
@@ -285,7 +286,7 @@ class VisionSkill:
         self.max_images_per_message = max(1, int(VISION_MAX_IMAGES_PER_MESSAGE or 3))
         self.max_image_bytes = max(64 * 1024, int(VISION_MAX_IMAGE_BYTES or 8 * 1024 * 1024))
         self.max_edge = max(64, int(VISION_MAX_EDGE or 1024))
-        self.description_max_chars = max(20, int(VISION_DESCRIPTION_MAX_CHARS or 240))
+        self.description_max_chars = 2400
         self.max_concurrency = max(1, int(VISION_MAX_CONCURRENCY or 4))
         self.cache_max_entries = max(0, int(VISION_CACHE_MAX_ENTRIES or 0))
         self.cache_ttl = max(0.0, float(VISION_CACHE_TTL_SECONDS or 21600.0))
@@ -931,7 +932,7 @@ class VisionSkill:
             "model": self.model,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": 220,
+            "max_tokens": _VISION_MAX_OUTPUT_TOKENS,
         }
         try:
             completion = await client.chat.completions.create(**kwargs)
