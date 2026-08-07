@@ -697,3 +697,145 @@ async def test_dispatch_group_mention_image_resolves_history_slots(dispatch_harn
     }
     assert "old:1" in resolved_slot_ids
     aisvc.apply_vision_resolutions.assert_called_once()
+
+
+# ============ 剩余问题 regression tests ============
+
+
+def test_deepseek_web_search_keeps_current_vision(monkeypatch) -> None:
+    svc = _new_aisvc()
+    svc.web_search_enabled = True
+    payloads: list[dict[str, Any]] = []
+
+    def _fake_post_json(_url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = timeout
+        payloads.append(payload)
+        if len(payloads) == 1:
+            return {"choices": [{"message": {"content": "[WEB_SEARCH]某显卡最新价格"}}]}
+        return {"choices": [{"message": {"content": "整合回答"}}]}
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+    monkeypatch.setattr(svc, "_web_search_fetch_sources_sync", lambda _q: "搜索素材")
+    slots = [
+        {"slot_id": "1:1", "index": 1, "segment_type": "image", "status": "ready", "description": "类型：产品照片；画面：RTX 5090"}
+    ]
+
+    out = svc._chat_with_context_sync("private:10001", "多少钱？", msg_id="1", vision_slots=slots)
+    assert out == "整合回答"
+    assert len(payloads) == 2
+    # 联网整合阶段 user content 必须包含当前图片描述
+    second_user = payloads[1]["messages"][-1]["content"]
+    assert "多少钱？" in second_user
+    assert "[视觉内容1] 类型：产品照片；画面：RTX 5090" in second_user
+    # 历史保存仍为基础文本
+    history = svc._load_active_chat_history("private:10001")
+    assert history[0]["content"] == "多少钱？"
+    assert "[视觉内容1]" not in history[0]["content"]
+
+
+def test_deepseek_web_search_fallback_keeps_current_vision(monkeypatch) -> None:
+    svc = _new_aisvc()
+    svc.web_search_enabled = True
+    payloads: list[dict[str, Any]] = []
+
+    def _fake_post_json(_url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = timeout
+        payloads.append(payload)
+        if len(payloads) == 1:
+            return {"choices": [{"message": {"content": "[WEB_SEARCH]查询"}}]}
+        return {"choices": [{"message": {"content": "回退回答"}}]}
+
+    def _boom(_q: str) -> str:
+        raise RuntimeError("search failed")
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+    monkeypatch.setattr(svc, "_web_search_fetch_sources_sync", _boom)
+    slots = [
+        {"slot_id": "1:1", "index": 1, "segment_type": "image", "status": "ready", "description": "类型：产品照片；画面：RTX 5090"}
+    ]
+
+    out = svc._chat_with_context_sync("private:10001", "多少钱？", msg_id="1", vision_slots=slots)
+    assert out == "回退回答"
+    fallback_user = payloads[1]["messages"][-1]["content"]
+    assert "[视觉内容1] 类型：产品照片；画面：RTX 5090" in fallback_user
+
+
+@pytest.mark.asyncio
+async def test_capture_false_slash_fallback_keeps_current_image(dispatch_harness) -> None:
+    ctx = _make_ctx(scene="private_friend", group_id=None)
+    aisvc = _FakeAIService()
+    vision = _FakeVisionSkill(capture_context_images=False)
+    evt = {
+        "post_type": "message",
+        "message_type": "private",
+        "sub_type": "friend",
+        "self_id": "1622236011",
+        "message_id": "500",
+        "message": [
+            {"type": "image", "data": {"url": "https://a/1.png"}},
+            {"type": "text", "data": {"text": "/fnd 看这个"}},
+        ],
+        "raw_message": "",
+    }
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt=evt,
+        text="/fnd 看这个",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+        vision_skill=vision,
+    )
+
+    # capture=false 不能影响 slash fallback 的当前图片
+    aisvc.chat_with_context.assert_awaited_once()
+    kwargs = aisvc.chat_with_context.await_args.kwargs
+    assert kwargs["vision_slots"]
+    assert kwargs["vision_slots"][0].status == "ready"
+
+
+def test_group_pure_image_context_keeps_sender_metadata() -> None:
+    ctx = _make_ctx(scene="group")
+    aisvc = _FakeAIService()
+    slot = VisionSlot(slot_id="1:1", index=1, segment_type="image", url="https://a/1.png")
+    commands._remember_non_ai_chat_message(
+        ctx, "", _DummyLogService(), aisvc, msg_id="1", vision_slots=[slot]
+    )
+    aisvc.remember_user_message.assert_called_once()
+    content = aisvc.remember_user_message.call_args.args[1]
+    assert "发言人QQ:10001" in content
+    assert "发言人昵称:tester" in content
+    assert "群号:20001" in content
+    assert aisvc.remember_user_message.call_args.kwargs["vision_slots"]
+
+
+@pytest.mark.asyncio
+async def test_group_mention_pure_image_ai_input_has_sender(dispatch_harness) -> None:
+    ctx = _make_ctx(scene="group")
+    aisvc = _FakeAIService()
+    vision = _FakeVisionSkill()
+
+    await commands.dispatch(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt=_image_evt(group=True, mention=True),
+        text="",
+        filesvc=_make_filesvc_stub(),
+        logsvc=_DummyLogService(),
+        state=commands.BotState(),
+        handin=Mock(),
+        perm=Mock(),
+        aisvc=aisvc,
+        vision_skill=vision,
+    )
+
+    aisvc.chat_with_context.assert_awaited_once()
+    ai_input = aisvc.chat_with_context.await_args.args[1]
+    assert "发言人QQ:10001" in ai_input
+    assert "发言人昵称:tester" in ai_input
+    assert "群号:20001" in ai_input

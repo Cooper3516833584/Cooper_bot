@@ -2993,7 +2993,12 @@ class AIService:
             if query:
                 try:
                     material = self._web_search_fetch_sources_sync(query)
-                    text = self._web_search_compose_final_sync(system_prompt, raw_content, material)
+                    text = self._web_search_compose_final_sync(
+                        system_prompt,
+                        current_rendered,
+                        material,
+                        history=model_history,
+                    )
                 except Exception as e:
                     self.log.warning(f"AI web search failed, fallback to plain chat: err={e}")
                     plain_system = self._append_chat_automation_boundary(
@@ -3003,7 +3008,7 @@ class AIService:
                         [
                             {"role": "system", "content": plain_system},
                             *model_history,
-                            {"role": "user", "content": raw_content},
+                            {"role": "user", "content": current_rendered},
                         ]
                     )
         if not text:
@@ -3111,15 +3116,27 @@ class AIService:
                     parts.append("【搜索结果摘要】\n" + "\n".join(texts))
         return "\n\n".join(parts).strip()
 
-    def _web_search_compose_final_sync(self, system_prompt: str, user_content: str, material: str) -> str:
-        """将原始问题与搜索素材交给 v4-pro 整合，返回最终回答文本。"""
+    def _web_search_compose_final_sync(
+        self,
+        system_prompt: str,
+        user_content: str,
+        material: str,
+        *,
+        history: Optional[List[dict]] = None,
+    ) -> str:
+        """将原始问题（含当前视觉渲染）与搜索素材交给 v4-pro 整合，返回最终回答文本。"""
         compose_system = f"{str(system_prompt or '').strip()}\n\n{self._WEB_SEARCH_COMPOSE_PROMPT.strip()}"
-        prompt = f"用户问题：{user_content}\n\n【联网搜索结果】\n{material}"
+        prompt = f"用户当前问题：\n{str(user_content or '').strip()}\n\n【联网搜索结果】\n{str(material or '').strip()}"
+        messages: List[dict] = [{"role": "system", "content": compose_system}]
+        for message in history or []:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip()
+            if role in ("user", "assistant"):
+                messages.append({"role": role, "content": str(message.get("content") or "")})
+        messages.append({"role": "user", "content": prompt})
         payload = self._build_chat_payload(
-            [
-                {"role": "system", "content": compose_system},
-                {"role": "user", "content": prompt},
-            ],
+            messages,
             self._CHAT_TEMPERATURE,
             enable_thinking=True,
         )

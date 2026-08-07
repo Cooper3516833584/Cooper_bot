@@ -2112,12 +2112,17 @@ def _compact_ai_sender_text(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
-def _format_group_ai_user_message(ctx, message_text: str) -> str:
+def _format_group_ai_user_message(
+    ctx,
+    message_text: str,
+    *,
+    include_sender_for_empty: bool = False,
+) -> str:
     msg = str(message_text or "").strip()
-    if not msg:
-        return msg
     scene = str(getattr(ctx, "scene", "") or "").strip().lower()
     if scene != "group":
+        return msg
+    if not msg and not include_sender_for_empty:
         return msg
     try:
         uid = int(getattr(ctx, "user_id"))
@@ -2135,15 +2140,14 @@ def _format_group_ai_user_message(ctx, message_text: str) -> str:
     gid = getattr(ctx, "group_id", None)
     if gid is not None:
         lines.append(f"群号:{gid}")
-    lines.append(msg)
+    if msg:
+        lines.append(msg)
     return "\n".join(lines)
 
 
-def _augment_ai_input_with_sender(ctx, ai_input: str) -> str:
+def _augment_ai_input_with_sender(ctx, ai_input: str, *, has_visual: bool = False) -> str:
     msg = str(ai_input or "").strip()
-    if not msg:
-        return msg
-    return _format_group_ai_user_message(ctx, msg)
+    return _format_group_ai_user_message(ctx, msg, include_sender_for_empty=has_visual)
 
 
 def _remember_non_ai_chat_message(
@@ -2166,7 +2170,7 @@ def _remember_non_ai_chat_message(
     try:
         remember_fn(
             session_key,
-            _format_group_ai_user_message(ctx, text),
+            _format_group_ai_user_message(ctx, text, include_sender_for_empty=bool(vision_slots)),
             msg_id=msg_id,
             vision_slots=vision_slots,
         )
@@ -3940,7 +3944,7 @@ async def _handle_ai_chat_trigger(
                     logsvc.log.warning(f"vision resolve failed: {type(e).__name__}: {e}")
                 except Exception:
                     pass
-    ai_input = _augment_ai_input_with_sender(ctx, clean_trigger_text)
+    ai_input = _augment_ai_input_with_sender(ctx, clean_trigger_text, has_visual=bool(current_slots))
     if ai_input is not None:
         if not ai_input and not current_slots:
             await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊直接发送文本就行。", logsvc)
@@ -4921,23 +4925,8 @@ async def dispatch(
                         reply_slots = []
                 current_slots = list(current_slots) + list(reply_slots)
     has_visual = bool(current_slots)
-    # AI 触发判断（提前）：当前请求图片不受 capture 开关影响
-    ai_triggered = False
-    if not raw_text.startswith(("/", "／")):
-        ai_triggered = (
-            extract_ai_chat_trigger_text(
-                ctx,
-                evt,
-                raw_text,
-                has_visual=has_visual,
-                bot_nick=(aisvc.bot_nick if aisvc else AI_BOT_NICK),
-            )
-            is not None
-        )
-    # VISION_CAPTURE_CONTEXT_IMAGES=false：普通非 AI 消息的视觉内容不保存
-    if (not ai_triggered) and vision_skill is not None and (not vision_skill.capture_context_images):
-        current_slots = []
-        has_visual = False
+    # 注意：不要在此处因 capture=false 清空 current_slots——
+    # slash fallback 等 AI 路径仍可能使用当前图片。capture 只在 remember 时判断。
     enriched_text = raw_text
     if not enriched_text and not has_visual:
         return
@@ -4949,14 +4938,18 @@ async def dispatch(
         nonlocal non_ai_remembered
         if non_ai_remembered:
             return
-        if enriched_text or current_slots:
+        # VISION_CAPTURE_CONTEXT_IMAGES=false：仅普通非 AI 上下文消息不保存图片
+        remember_slots = list(current_slots or [])
+        if vision_skill is not None and not bool(getattr(vision_skill, "capture_context_images", True)):
+            remember_slots = []
+        if enriched_text or remember_slots:
             _remember_non_ai_chat_message(
                 ctx,
                 enriched_text,
                 logsvc,
                 aisvc,
                 msg_id=message_id,
-                vision_slots=current_slots,
+                vision_slots=remember_slots,
             )
         non_ai_remembered = True
 

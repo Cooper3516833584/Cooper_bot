@@ -355,3 +355,65 @@ def test_slot_to_dict_roundtrip() -> None:
     d = slot.to_dict()
     assert d["slot_id"] == "x:1"
     assert d["status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_resolve_concurrent_peak_gt_one() -> None:
+    client = _FakeClient()
+    svc = _make_skill(downloader=_distinct_png_downloader())
+    svc._client = client
+    svc.max_concurrency = 2
+    # 6 张不同 content 的图片，必须真正并发（peak > 1）且不超过上限
+    slots = [_image_slot(f"s{i}:1", url=f"https://a/{i}.png") for i in range(6)]
+    resolutions = await svc.resolve_slots(_FakeAPI(), slots)
+    assert len([r for r in resolutions if r.status == "ready"]) == 6
+    assert 1 < client.chat.completions.peak <= 2
+
+
+@pytest.mark.asyncio
+async def test_image_too_large_is_permanent() -> None:
+    svc = _make_skill(downloader=lambda url: b"x" * 2048)
+    svc.max_image_bytes = 1024
+    slot = _image_slot("big:1", url="https://a/1.png")
+    resolutions = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert resolutions[0].status == "permanent_error"
+    # permanent 后不再重复解析
+    slot.status = "permanent_error"
+    resolutions2 = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert resolutions2 == []
+
+
+@pytest.mark.asyncio
+async def test_retry_after_uses_configured_negative_ttl() -> None:
+    client = _FakeClient()
+    now = {"ts": 1000.0}
+    svc = _make_skill(clock=lambda: now["ts"])
+    svc._client = client
+    svc.negative_cache_ttl = 10.0
+
+    def _boom(_url: str) -> bytes:
+        raise RuntimeError("network down")
+
+    svc._downloader = _boom
+    slot = _image_slot("r:1", url="https://a/1.png")
+    resolutions = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert resolutions[0].status == "retryable_error"
+    assert resolutions[0].retry_after_ts == 1010.0  # 使用配置值，而不是写死 60
+
+
+@pytest.mark.asyncio
+async def test_negative_ttl_zero_allows_immediate_retry() -> None:
+    client = _FakeClient()
+    now = {"ts": 1000.0}
+    svc = _make_skill(clock=lambda: now["ts"])
+    svc._client = client
+    svc.negative_cache_ttl = 0.0
+
+    def _boom(_url: str) -> bytes:
+        raise RuntimeError("network down")
+
+    svc._downloader = _boom
+    slot = _image_slot("r:1", url="https://a/1.png")
+    resolutions = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert resolutions[0].status == "retryable_error"
+    assert resolutions[0].retry_after_ts <= 1000.0  # 立即重试

@@ -567,7 +567,7 @@ class VisionSkill:
                     VisionResolution(
                         slot_id=slot.slot_id,
                         status=_VISION_STATUS_RETRYABLE,
-                        retry_after_ts=now + 60.0,
+                        retry_after_ts=now + self.negative_cache_ttl,
                         source_key=sk,
                     )
                 )
@@ -581,22 +581,53 @@ class VisionSkill:
             key = build_source_key(slot) or f"slot:{slot.slot_id}"
             groups.setdefault(key, []).append(slot)
 
-        for group in groups.values():
+        async def _resolve_group(group: list[VisionSlot]) -> list[VisionResolution]:
             rep = group[0]
             rep_res = await self._resolve_one(api, rep)
+            out: list[VisionResolution] = []
             for slot in group:
                 if slot is rep:
-                    resolutions.append(rep_res)
+                    out.append(rep_res)
                 else:
-                    resolutions.append(_copy_resolution(rep_res, slot.slot_id))
+                    out.append(_copy_resolution(rep_res, slot.slot_id))
+            return out
+
+        # 不同 source group 真正并发处理；视觉 API 并发由 semaphore 限制
+        group_results = await asyncio.gather(
+            *[_resolve_group(group) for group in groups.values()],
+            return_exceptions=True,
+        )
+        for group, result in zip(groups.values(), group_results):
+            if isinstance(result, Exception):
+                # 防御：group 任务异常不拖垮整批
+                for slot in group:
+                    resolutions.append(
+                        VisionResolution(
+                            slot_id=slot.slot_id,
+                            status=_VISION_STATUS_RETRYABLE,
+                            description=_RETRYABLE_DESCRIPTION,
+                            source_key=build_source_key(slot),
+                            retry_after_ts=now + self.negative_cache_ttl,
+                        )
+                    )
+                continue
+            resolutions.extend(result)
+
+        # 保持输入顺序输出（不依赖 gather 顺序）
+        resolution_map = {r.slot_id: r for r in resolutions}
+        ordered: list[VisionResolution] = []
+        for slot in normalized:
+            result = resolution_map.get(slot.slot_id)
+            if result is not None:
+                ordered.append(result)
 
         self.log.info(
             f"vision resolve complete: targets={len(normalized)} "
-            f"resolved={sum(1 for r in resolutions if r.status == _VISION_STATUS_READY)} "
-            f"retryable={sum(1 for r in resolutions if r.status == _VISION_STATUS_RETRYABLE)} "
-            f"permanent={sum(1 for r in resolutions if r.status == _VISION_STATUS_PERMANENT)}"
+            f"resolved={sum(1 for r in ordered if r.status == _VISION_STATUS_READY)} "
+            f"retryable={sum(1 for r in ordered if r.status == _VISION_STATUS_RETRYABLE)} "
+            f"permanent={sum(1 for r in ordered if r.status == _VISION_STATUS_PERMANENT)}"
         )
-        return resolutions
+        return ordered
 
     async def _resolve_one(self, api, slot: VisionSlot) -> VisionResolution:
         source_key = build_source_key(slot)
@@ -643,7 +674,7 @@ class VisionSkill:
                 status=_VISION_STATUS_RETRYABLE,
                 description=_RETRYABLE_DESCRIPTION,
                 source_key=source_key,
-                retry_after_ts=float(self.clock()) + 60.0,
+                retry_after_ts=float(self.clock()) + self.negative_cache_ttl,
             )
 
     def apply_resolutions_to_slots(
@@ -738,7 +769,7 @@ class VisionSkill:
         if not raw:
             raise _VisionDownloadError("empty image")
         if len(raw) > self.max_image_bytes:
-            raise _VisionDownloadError("image too large")
+            raise _PermanentVisionError("image too large")
 
         # Pillow 预处理是同步 CPU 操作，丢到线程池避免阻塞事件循环
         return await asyncio.to_thread(self._normalize_image_bytes, raw)
@@ -752,7 +783,10 @@ class VisionSkill:
                 data = result
             if not data:
                 raise _VisionDownloadError("empty download")
-            return bytes(data)
+            raw = bytes(data)
+            if len(raw) > self.max_image_bytes:
+                raise _PermanentVisionError("image too large")
+            return raw
         if aiohttp is None:
             return await asyncio.to_thread(self._fetch_bytes_urllib_sync, url)
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*"}
@@ -762,13 +796,13 @@ class VisionSkill:
                     raise _VisionDownloadError(f"http {resp.status}")
                 content_length = resp.content_length
                 if content_length is not None and int(content_length) > self.max_image_bytes:
-                    raise _VisionDownloadError("image too large")
+                    raise _PermanentVisionError("image too large")
                 chunks: list[bytes] = []
                 total = 0
                 async for chunk in resp.content.iter_chunked(64 * 1024):
                     total += len(chunk)
                     if total > self.max_image_bytes:
-                        raise _VisionDownloadError("image too large")
+                        raise _PermanentVisionError("image too large")
                     chunks.append(chunk)
                 if not chunks:
                     raise _VisionDownloadError("empty body")
@@ -779,7 +813,10 @@ class VisionSkill:
 
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "image/*"})
         with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-            return resp.read(self.max_image_bytes + 1)
+            data = resp.read(self.max_image_bytes + 1)
+        if len(data) > self.max_image_bytes:
+            raise _PermanentVisionError("image too large")
+        return data
 
     def _read_allowed_local_file(self, path: Path) -> bytes:
         resolved = Path(path).resolve()
