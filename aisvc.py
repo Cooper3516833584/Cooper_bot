@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from vision_skill import VisionSlot
+
 from config import (
     AI_API_KEY_PATH,
     AI_BOT_NICK,
@@ -131,7 +133,6 @@ class AIService:
         "gemini": 100,
         "claude": 100,
     }
-    _VISION_PENDING_PLACEHOLDER = "[图片待识别]"
     _WEB_SEARCH_JUDGE_PROMPT = (
         "# 联网需求判定\n"
         "这是内部机制提示，请勿向用户提起。\n"
@@ -196,10 +197,6 @@ class AIService:
         self._lock = threading.RLock()
         self._chat_sessions_lock = threading.RLock()
         self._chat_sessions: Dict[str, Dict[str, object]] = {}
-        self._pending_vision_lock = threading.RLock()
-        self._pending_vision: Dict[str, List[dict]] = {}
-        self._msg_images_lock = threading.RLock()
-        self._msg_images: Dict[str, dict] = {}
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
         self._semantic_entry_by_rel: Dict[str, Tuple[dict, np.ndarray]] = {}
@@ -326,20 +323,60 @@ class AIService:
     async def chat(self, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_sync, user_input)
 
-    async def chat_with_context(self, session_key: str, user_input: str) -> str:
-        return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
+    async def chat_with_context(
+        self,
+        session_key: str,
+        user_input: str,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
+    ) -> str:
+        return await asyncio.to_thread(
+            self._chat_with_context_sync, session_key, user_input, msg_id=msg_id, vision_slots=vision_slots
+        )
 
     async def gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
         return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key)
 
-    async def gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
-        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key)
+    async def gemini_chat_with_context(
+        self,
+        session_key: str,
+        user_input: str,
+        model_key: Optional[str] = None,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
+    ) -> str:
+        return await asyncio.to_thread(
+            self._gemini_chat_with_context_sync,
+            session_key,
+            user_input,
+            model_key,
+            msg_id=msg_id,
+            vision_slots=vision_slots,
+        )
 
     async def restricted_gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
         return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key, True)
 
-    async def restricted_gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
-        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, True)
+    async def restricted_gemini_chat_with_context(
+        self,
+        session_key: str,
+        user_input: str,
+        model_key: Optional[str] = None,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
+    ) -> str:
+        return await asyncio.to_thread(
+            self._gemini_chat_with_context_sync,
+            session_key,
+            user_input,
+            model_key,
+            True,
+            msg_id=msg_id,
+            vision_slots=vision_slots,
+        )
 
     async def restricted_gemini_calendar_chat(
         self,
@@ -355,8 +392,15 @@ class AIService:
             timeout_seconds,
         )
 
-    def remember_user_message(self, session_key: str, message_text: str) -> None:
-        self._remember_chat_message(session_key, "user", message_text)
+    def remember_user_message(
+        self,
+        session_key: str,
+        message_text: str,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
+    ) -> None:
+        self._remember_chat_message(session_key, "user", message_text, msg_id=msg_id, vision_slots=vision_slots)
 
     def remember_assistant_message(self, session_key: str, message_text: str) -> None:
         self._remember_chat_message(session_key, "assistant", message_text)
@@ -2895,12 +2939,20 @@ class AIService:
         prompt = self._build_gemini_cli_prompt(system_prompt, [], content)
         return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
-    def _chat_with_context_sync(self, session_key: str, user_input: str) -> str:
+    def _chat_with_context_sync(
+        self,
+        session_key: str,
+        user_input: str,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
+    ) -> str:
         if not self.chat_ready:
             raise RuntimeError("chat not ready")
 
         content = str(user_input or "").strip()
-        if not content:
+        slots = self._normalize_vision_slots(vision_slots)
+        if not content and not slots:
             return self._chat_sync(content)
 
         key = str(session_key or "").strip()
@@ -2913,15 +2965,23 @@ class AIService:
         try:
             history = self._load_active_chat_history(key)
             history = self._select_history_for_backend(history, "deepseek")
+            model_history = self._materialize_history_for_model(history)
         except Exception as e:
             self.log.warning(f"AI chat context read failed, fallback to stateless: session={key[:80]} err={e}")
             history = []
+            model_history = []
 
         system_prompt = self._append_web_search_judge(
             self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
         )
+        # 当前消息：基础文字 + 视觉 slots 渲染为发给模型的文本
+        current_message = {"role": "user", "content": content}
+        if slots:
+            current_message["_vision"] = slots
+        current_rendered = self._render_chat_message_content(current_message)
+
         payload = self._build_chat_payload(
-            [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": content}],
+            [{"role": "system", "content": system_prompt}, *model_history, {"role": "user", "content": current_rendered}],
             self._CHAT_TEMPERATURE,
             enable_thinking=True,
         )
@@ -2942,7 +3002,7 @@ class AIService:
                     text = self._web_search_fallback_chat_sync(
                         [
                             {"role": "system", "content": plain_system},
-                            *history,
+                            *model_history,
                             {"role": "user", "content": raw_content},
                         ]
                     )
@@ -2950,7 +3010,7 @@ class AIService:
             raise RuntimeError("empty chat response")
 
         try:
-            self._save_chat_turn(key, raw_content, text)
+            self._save_chat_turn(key, raw_content, text, msg_id=msg_id, vision_slots=slots)
         except Exception as e:
             self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
         return text
@@ -3100,12 +3160,16 @@ class AIService:
         user_input: str,
         model_key: Optional[str] = None,
         restricted: bool = False,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
     ) -> str:
         if not self.gemini_chat_ready:
             raise RuntimeError("gemini chat not ready")
 
         content = str(user_input or "").strip()
-        if not content:
+        slots = self._normalize_vision_slots(vision_slots)
+        if not content and not slots:
             return self._gemini_chat_sync(content, model_key, restricted)
 
         key = str(session_key or "").strip()
@@ -3121,33 +3185,90 @@ class AIService:
                 else "gemini"
             )
             history = self._select_history_for_backend(history, backend_key)
+            model_history = self._materialize_history_for_model(history)
         except Exception as e:
             self.log.warning(f"AI chat context read failed, fallback to stateless gemini: session={key[:80]} err={e}")
             history = []
+            model_history = []
+
+        # 当前消息：基础文字 + 视觉 slots 渲染
+        current_message = {"role": "user", "content": content}
+        if slots:
+            current_message["_vision"] = slots
+        current_rendered = self._render_chat_message_content(current_message)
 
         system_prompt = self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
         if restricted:
-            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, history, content)
+            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, model_history, current_rendered)
             text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
         else:
-            prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
+            prompt = self._build_gemini_cli_prompt(system_prompt, model_history, current_rendered)
             text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
         try:
-            self._save_chat_turn(key, content, text)
+            self._save_chat_turn(key, content, text, msg_id=msg_id, vision_slots=slots)
         except Exception as e:
             self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
         return text
 
-    @staticmethod
-    def _normalize_chat_history_item(item: object) -> Optional[Dict[str, str]]:
+    def _normalize_chat_history_item(self, item: object) -> Optional[Dict[str, str]]:
         if not isinstance(item, dict):
             return None
         role = str(item.get("role") or "").strip().lower()
         if role not in ("user", "assistant"):
             return None
         content = str(item.get("content") or "")
-        return {"role": role, "content": content}
+        out: Dict[str, str] = {"role": role, "content": content}
+        if role == "user":
+            msg_id = str(item.get("_msg_id") or "").strip()
+            if msg_id:
+                out["_msg_id"] = msg_id
+            vision = self._normalize_vision_slots(item.get("_vision"))
+            if vision:
+                out["_vision"] = vision
+        return out
+
+    @staticmethod
+    def _normalize_vision_slots(raw: object) -> List[dict]:
+        """严格过滤 _vision 字段类型，只保留合法 slot 字典（兼容 VisionSlot 对象）。"""
+        if not isinstance(raw, list):
+            return []
+        out: List[dict] = []
+        for item in raw:
+            if isinstance(item, VisionSlot):
+                item = item.to_dict()
+            if not isinstance(item, dict):
+                continue
+            slot_id = str(item.get("slot_id") or "").strip()
+            if not slot_id:
+                continue
+            try:
+                index = int(item.get("index") or 1)
+            except Exception:
+                index = 1
+            status = str(item.get("status") or "unresolved").strip()
+            if status not in {"unresolved", "ready", "retryable_error", "permanent_error"}:
+                status = "unresolved"
+            slot: dict = {
+                "slot_id": slot_id,
+                "index": max(1, index),
+                "segment_type": str(item.get("segment_type") or "image").strip() or "image",
+                "status": status,
+                "url": str(item.get("url") or ""),
+                "file": str(item.get("file") or ""),
+                "file_id": str(item.get("file_id") or ""),
+                "path": str(item.get("path") or ""),
+                "name": str(item.get("name") or ""),
+                "summary": str(item.get("summary") or ""),
+                "face_id": str(item.get("face_id") or ""),
+                "source_key": str(item.get("source_key") or ""),
+                "content_hash": str(item.get("content_hash") or ""),
+                "description": str(item.get("description") or ""),
+                "retry_after_ts": float(item.get("retry_after_ts") or 0.0),
+                "source_kind": str(item.get("source_kind") or "message"),
+            }
+            out.append(slot)
+        return out
 
     def _validate_and_trim_chat_history(self, messages: List[Dict[str, str]]) -> Optional[List[Dict[str, str]]]:
         if not isinstance(messages, list):
@@ -3214,11 +3335,27 @@ class AIService:
             self._chat_sessions[session_key] = {"messages": checked, "last_active_ts": last_active_ts}
         return checked
 
-    def _remember_chat_message(self, session_key: str, role: str, content: str) -> None:
+    def _remember_chat_message(
+        self,
+        session_key: str,
+        role: str,
+        content: str,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
+    ) -> None:
         key = str(session_key or "").strip()
         if not key:
             return
-        msg = self._normalize_chat_history_item({"role": role, "content": content})
+        raw: dict = {"role": role, "content": str(content or "")}
+        if role == "user":
+            mid = str(msg_id or "").strip()
+            if mid:
+                raw["_msg_id"] = mid
+            slots = self._normalize_vision_slots(vision_slots)
+            if slots:
+                raw["_vision"] = slots
+        msg = self._normalize_chat_history_item(raw)
         if msg is None:
             return
         now_ts = float(time.time())
@@ -3231,12 +3368,27 @@ class AIService:
                 self.log.warning(f"AI chat context invalid after append, reset to current message: session={key[:80]}")
             self._chat_sessions[key] = {"messages": checked, "last_active_ts": now_ts}
 
-    def _save_chat_turn(self, session_key: str, user_input: str, assistant_output: str) -> None:
+    def _save_chat_turn(
+        self,
+        session_key: str,
+        user_input: str,
+        assistant_output: str,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
+    ) -> None:
         key = str(session_key or "").strip()
         if not key:
             return
         now_ts = float(time.time())
-        user_msg = {"role": "user", "content": str(user_input or "")}
+        user_raw: dict = {"role": "user", "content": str(user_input or "")}
+        mid = str(msg_id or "").strip()
+        if mid:
+            user_raw["_msg_id"] = mid
+        slots = self._normalize_vision_slots(vision_slots)
+        if slots:
+            user_raw["_vision"] = slots
+        user_msg = self._normalize_chat_history_item(user_raw) or {"role": "user", "content": str(user_input or "")}
         assistant_msg = {"role": "assistant", "content": str(assistant_output or "")}
         with self._chat_sessions_lock:
             history = self._load_active_chat_history_locked(key, now_ts)
@@ -3248,146 +3400,152 @@ class AIService:
                 self.log.warning(f"AI chat context invalid after append, reset to current turn: session={key[:80]}")
             self._chat_sessions[key] = {"messages": checked, "last_active_ts": now_ts}
 
-    def record_pending_vision(self, session_key: str, images: List[dict]) -> None:
-        """记录会话内待识别的图片源（不调视觉 API），供回复时统一解析。
+    # ---------- 视觉 slot 接口 ----------
 
-        队列只按 TTL（与聊天上下文一致）过期清理，不设条数上限——实际有多少图就记多少。
-        """
-        key = str(session_key or "").strip()
-        if not key or not images:
-            return
-        now_ts = float(time.time())
-        cutoff = now_ts - float(self._CHAT_CONTEXT_TTL_SECONDS)
-        with self._pending_vision_lock:
-            cached = self._pending_vision.get(key) or []
-            cached = [x for x in cached if isinstance(x, dict) and float(x.get("ts") or 0.0) >= cutoff]
-            for img in images:
-                cached.append(
-                    {
-                        "ts": now_ts,
-                        "url": str(img.get("url") or "").strip(),
-                        "file_id": str(img.get("file_id") or "").strip(),
-                    }
-                )
-            self._pending_vision[key] = cached
-
-    def _load_pending_vision(self, session_key: str, now_ts: Optional[float] = None) -> List[dict]:
-        """读取会话内待识别图片（TTL 过滤，返回 {url,file_id} 列表）。"""
-        key = str(session_key or "").strip()
-        if not key:
-            return []
-        use_ts = float(now_ts if now_ts is not None else time.time())
-        cutoff = use_ts - float(self._CHAT_CONTEXT_TTL_SECONDS)
-        with self._pending_vision_lock:
-            cached = self._pending_vision.get(key) or []
-        out: List[dict] = []
-        for x in cached:
-            if not isinstance(x, dict):
+    @staticmethod
+    def _render_chat_message_content(message: dict) -> str:
+        """把内部 message（含 _vision slots）渲染成发送给模型的文本。"""
+        text = str(message.get("content") or "").strip()
+        slots = message.get("_vision")
+        if not isinstance(slots, list):
+            return text
+        visual_lines: List[str] = []
+        for slot in slots:
+            if not isinstance(slot, dict):
                 continue
             try:
-                ts = float(x.get("ts") or 0.0)
+                index = int(slot.get("index") or 1)
             except Exception:
-                ts = 0.0
-            if ts < cutoff:
+                index = 1
+            status = str(slot.get("status") or "")
+            desc = str(slot.get("description") or "").strip()
+            if status == "ready":
+                if desc:
+                    visual_lines.append(f"[视觉内容{index}] {desc}")
+            elif status == "retryable_error":
+                visual_lines.append(f"[视觉内容{index}] 图片暂时无法识别。")
+            elif status == "permanent_error":
+                visual_lines.append(f"[视觉内容{index}] 图片识别失败，无法确认具体内容。")
+            else:
+                visual_lines.append(f"[视觉内容{index}] 图片尚未完成识别。")
+        if not visual_lines:
+            return text
+        parts = [text] if text else []
+        parts.append("\n".join(visual_lines))
+        return "\n\n".join(parts).strip()
+
+    def _materialize_history_for_model(self, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """历史消息渲染为纯文本消息（去掉 _msg_id/_vision 等内部字段）。"""
+        out: List[Dict[str, str]] = []
+        for message in history:
+            if not isinstance(message, dict):
                 continue
-            out.append({"url": str(x.get("url") or "").strip(), "file_id": str(x.get("file_id") or "").strip()})
+            role = str(message.get("role") or "").strip()
+            content = self._render_chat_message_content(message)
+            out.append({"role": role, "content": content})
         return out
 
-    def clear_pending_vision(self, session_key: str) -> None:
-        key = str(session_key or "").strip()
-        if not key:
-            return
-        with self._pending_vision_lock:
-            self._pending_vision.pop(key, None)
+    def collect_unresolved_vision_slots(self, session_key: str, backend: str) -> List[dict]:
+        """收集后端可见窗口内所有需要补解析的视觉 slot（深拷贝）。
 
-    def record_msg_images(self, msg_id: str, images: List[dict]) -> None:
-        """按消息 id 记录图片，供后续引用（reply）该消息时提取图片。"""
-        key = str(msg_id or "").strip()
-        if not key or not images:
-            return
-        now_ts = float(time.time())
-        with self._msg_images_lock:
-            self._msg_images[key] = {
-                "ts": now_ts,
-                "images": [
-                    {"url": str(img.get("url") or "").strip(), "file_id": str(img.get("file_id") or "").strip()}
-                    for img in images
-                ],
-            }
-            cutoff = now_ts - float(self._CHAT_CONTEXT_TTL_SECONDS)
-            stale = [k for k, v in self._msg_images.items() if not isinstance(v, dict) or float(v.get("ts") or 0.0) < cutoff]
-            for k in stale:
-                self._msg_images.pop(k, None)
-            # 防御性上限：远超正常聊天量时才淘汰最旧
-            while len(self._msg_images) > 500:
-                oldest = min(self._msg_images, key=lambda k: float(self._msg_images[k].get("ts") or 0.0))
-                self._msg_images.pop(oldest, None)
-
-    def _lookup_msg_images(self, msg_id: str, now_ts: Optional[float] = None) -> List[dict]:
-        """按消息 id 查图片（TTL 过滤），返回 {url,file_id} 列表。"""
-        key = str(msg_id or "").strip()
-        if not key:
-            return []
-        use_ts = float(now_ts if now_ts is not None else time.time())
-        cutoff = use_ts - float(self._CHAT_CONTEXT_TTL_SECONDS)
-        with self._msg_images_lock:
-            entry = self._msg_images.get(key)
-            if not isinstance(entry, dict):
-                return []
-            try:
-                ts = float(entry.get("ts") or 0.0)
-            except Exception:
-                ts = 0.0
-            if ts < cutoff:
-                self._msg_images.pop(key, None)
-                return []
-            images = entry.get("images")
-            if not isinstance(images, list):
-                return []
-            return [
-                {"url": str(x.get("url") or "").strip(), "file_id": str(x.get("file_id") or "").strip()}
-                for x in images
-                if isinstance(x, dict)
-            ]
-
-    def apply_vision_descriptions_to_history(
-        self,
-        session_key: str,
-        descriptions: List[str],
-    ) -> int:
-        """把会话历史消息中的 [图片待识别] 占位按顺序替换为 [视觉内容N] 描述。
-
-        返回未被消费（历史中无占位可填）的描述数量。
+        这是"本次有哪些历史图片需要补解析"的唯一来源。
         """
-        key = str(session_key or "").strip()
-        descs = [str(d or "").strip() for d in (descriptions or []) if str(d or "").strip()]
-        if not key or not descs:
-            return len(descs)
-        placeholder = self._VISION_PENDING_PLACEHOLDER
-        consumed = 0
+        try:
+            history = self._load_active_chat_history(session_key)
+            history = self._select_history_for_backend(history, backend)
+        except Exception:
+            return []
+        now_ts = float(time.time())
+        out: List[dict] = []
+        for message in history:
+            slots = message.get("_vision") if isinstance(message, dict) else None
+            if not isinstance(slots, list):
+                continue
+            for slot in slots:
+                if not isinstance(slot, dict):
+                    continue
+                status = str(slot.get("status") or "")
+                if status == "ready":
+                    continue
+                if status == "permanent_error":
+                    continue
+                if status == "retryable_error":
+                    try:
+                        retry_after = float(slot.get("retry_after_ts") or 0.0)
+                    except Exception:
+                        retry_after = 0.0
+                    if now_ts < retry_after:
+                        continue
+                import copy as _copy
+
+                out.append(_copy.deepcopy(slot))
+        return out
+
+    def apply_vision_resolutions(self, session_key: str, resolutions: list) -> int:
+        """按 slot_id 精确把解析结果写回历史消息中的 slot。返回更新的 slot 数。"""
+        result_map = {str(r.slot_id): r for r in (resolutions or [])}
+        if not result_map:
+            return 0
+        updated = 0
         with self._chat_sessions_lock:
-            entry = self._chat_sessions.get(key)
-            if isinstance(entry, dict):
-                messages = entry.get("messages")
-                if isinstance(messages, list):
-                    new_messages: List[Dict[str, str]] = []
-                    for m in messages:
-                        if not isinstance(m, dict):
-                            new_messages.append(m)
-                            continue
-                        content = str(m.get("content") or "")
-                        if consumed < len(descs) and placeholder in content:
-                            content = content.replace(
-                                placeholder,
-                                f"[视觉内容{consumed + 1}] {descs[consumed]}",
-                                1,
-                            )
-                            consumed += 1
-                            new_messages.append({**m, "content": content})
-                            continue
-                        new_messages.append(m)
-                    entry["messages"] = new_messages
-        return max(0, len(descs) - consumed)
+            entry = self._chat_sessions.get(session_key)
+            if not isinstance(entry, dict):
+                return 0
+            messages = entry.get("messages")
+            if not isinstance(messages, list):
+                return 0
+            for message in messages:
+                slots = message.get("_vision") if isinstance(message, dict) else None
+                if not isinstance(slots, list):
+                    continue
+                changed = False
+                for slot in slots:
+                    if not isinstance(slot, dict):
+                        continue
+                    result = result_map.get(str(slot.get("slot_id") or ""))
+                    if result is None:
+                        continue
+                    self._apply_resolution_to_slot_dict(slot, result)
+                    updated += 1
+                    changed = True
+                if changed:
+                    message["_vision"] = self._normalize_vision_slots(slots)
+        return updated
+
+    @staticmethod
+    def _apply_resolution_to_slot_dict(slot: dict, resolution) -> None:
+        """把解析结果应用到历史中的 slot dict；成功后清空临时图片 source。"""
+        slot["status"] = str(getattr(resolution, "status", "") or "")
+        if getattr(resolution, "description", ""):
+            slot["description"] = str(resolution.description)
+        if getattr(resolution, "source_key", ""):
+            slot["source_key"] = str(resolution.source_key)
+        if getattr(resolution, "content_hash", ""):
+            slot["content_hash"] = str(resolution.content_hash)
+        if getattr(resolution, "retry_after_ts", 0.0):
+            slot["retry_after_ts"] = float(resolution.retry_after_ts)
+        if slot["status"] == "ready":
+            slot["url"] = ""
+            slot["file"] = ""
+            slot["file_id"] = ""
+            slot["path"] = ""
+
+    def find_chat_message_by_msg_id(self, session_key: str, msg_id: str) -> Optional[dict]:
+        """在当前会话历史中按消息 id 查找 user message；找不到返回 None。"""
+        key = str(session_key or "").strip()
+        target = str(msg_id or "").strip()
+        if not key or not target:
+            return None
+        try:
+            history = self._load_active_chat_history(key)
+        except Exception:
+            return None
+        for message in history:
+            if not isinstance(message, dict):
+                continue
+            if str(message.get("_msg_id") or "").strip() == target:
+                return message
+        return None
 
     def _extract_notice_file_head_sync(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         p = Path(path)

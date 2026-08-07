@@ -442,7 +442,7 @@ async def test_dispatch_unknown_private_slash_command_reaches_aichat(dispatch_ha
         aisvc=aisvc,
     )
 
-    aisvc.chat_with_context.assert_awaited_once_with(f"private:{ctx.user_id}", "/fnd 高数")
+    aisvc.chat_with_context.assert_awaited_once_with(f"private:{ctx.user_id}", "/fnd 高数", msg_id="", vision_slots=[])
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
     assert not any("未知命令" in one["text"] for one in dispatch_harness.messages)
 
@@ -721,6 +721,8 @@ async def test_non_aichat_message_is_remembered_for_context(dispatch_harness) ->
     aisvc.remember_user_message.assert_called_once_with(
         f"group:{ctx.group_id}",
         "发言人QQ:10002\n发言人昵称:tester\n群号:20001\n/find calculus",
+        msg_id="",
+        vision_slots=[],
     )
 
 

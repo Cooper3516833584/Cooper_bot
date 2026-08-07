@@ -1,19 +1,19 @@
-"""统一视觉描述 Skill。
+"""统一视觉描述 Skill（slot 架构）。
 
-对 OneBot 消息中的图片/表情段做一次统一识别，生成紧凑文本描述，
-供 DeepSeek / Gemini / Claude 等纯文本聊天模型复用。
-
-设计要点：
-- 视觉处理发生在 AI 后端选择之前，三个后端共用同一份描述。
-- 图片描述内联到对应 user message 写入共享聊天历史。
-- 原始图片识别完成后立即释放，不长期落盘。
-- 同图通过内存 LRU 缓存去重，避免重复调用视觉 API。
+架构原则：
+- 图片属于聊天消息，图片描述也属于同一条聊天消息。
+- 视觉元数据（VisionSlot）随 user message 保存在聊天历史中，不设独立队列。
+- 机器人需要 AI 回复时，按后端窗口扫描历史中 unresolved 的 slot 补解析。
+- 解析结果通过 slot_id 精确写回原消息，绝不按顺序错位回填。
+- 同一图片通过 source_key / content_hash / LRU / singleflight 去重，
+  尽量只调用一次视觉 API。
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import inspect
 import io
@@ -21,10 +21,11 @@ import json
 import re
 import tempfile
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Optional
 
 from PIL import Image, ImageDraw, UnidentifiedImageError
 
@@ -76,41 +77,69 @@ class VisualSegment:
 
 
 @dataclass
-class VisualDescription:
+class VisionSlot:
+    """一条视觉内容的持久状态，随 user message 保存在聊天历史中。"""
+
+    slot_id: str
     index: int
     segment_type: str
-    description: str
-    cache_key: str = ""
-    cache_hit: bool = False
+
+    status: str = "unresolved"
+
+    url: str = ""
+    file: str = ""
+    file_id: str = ""
+    path: str = ""
+
+    name: str = ""
+    summary: str = ""
+    face_id: str = ""
+
+    source_key: str = ""
+    content_hash: str = ""
+
+    description: str = ""
+
+    retry_after_ts: float = 0.0
+
+    source_kind: str = "message"  # message | reply_reference（仅内部调试用）
+
+    def to_dict(self) -> dict:
+        return {
+            "slot_id": self.slot_id,
+            "index": self.index,
+            "segment_type": self.segment_type,
+            "status": self.status,
+            "url": self.url,
+            "file": self.file,
+            "file_id": self.file_id,
+            "path": self.path,
+            "name": self.name,
+            "summary": self.summary,
+            "face_id": self.face_id,
+            "source_key": self.source_key,
+            "content_hash": self.content_hash,
+            "description": self.description,
+            "retry_after_ts": float(self.retry_after_ts or 0.0),
+            "source_kind": self.source_kind,
+        }
 
 
 @dataclass
-class VisionContext:
-    descriptions: list[VisualDescription] = field(default_factory=list)
-    failed_count: int = 0
-    skipped_count: int = 0
+class VisionResolution:
+    """一次视觉解析结果，按 slot_id 精确回填。"""
 
-    @property
-    def has_visual(self) -> bool:
-        return bool(self.descriptions or self.failed_count or self.skipped_count)
+    slot_id: str
+    status: str
 
-    @property
-    def has_valid_description(self) -> bool:
-        return bool(self.descriptions)
+    description: str = ""
 
-    def to_context_block(self) -> str:
-        lines: list[str] = []
+    source_key: str = ""
+    content_hash: str = ""
 
-        for item in sorted(self.descriptions, key=lambda x: x.index):
-            lines.append(f"[视觉内容{item.index}] {item.description}")
+    retry_after_ts: float = 0.0
 
-        for _ in range(self.failed_count):
-            lines.append("[视觉内容] 图片识别失败，无法确认具体内容。")
-
-        for _ in range(self.skipped_count):
-            lines.append("[视觉内容] 图片数量超过单条消息处理上限，未继续分析。")
-
-        return "\n".join(lines).strip()
+    cache_hit: bool = False
 
 
 # ============ 常量 ============
@@ -153,8 +182,6 @@ JSON 格式：
   "intent": "可能表达的聊天含义，没有则为空字符串"
 }"""
 
-_DYNAMIC_IMAGE_HINT = "这是动态图片的多个采样帧，请结合动作变化描述表情或含义。"
-
 MAX_IMAGE_PIXELS = 20_000_000
 _ANIMATED_SAMPLE_FRAMES = 3
 _JPEG_QUALITY = 82
@@ -166,6 +193,15 @@ _SENSITIVE_FILENAMES = {
     "key.txt",
     "token.txt",
 }
+
+_VISION_STATUS_READY = "ready"
+_VISION_STATUS_UNRESOLVED = "unresolved"
+_VISION_STATUS_RETRYABLE = "retryable_error"
+_VISION_STATUS_PERMANENT = "permanent_error"
+
+_PERMANENT_DESCRIPTION = "图片识别失败，无法确认具体内容。"
+_RETRYABLE_DESCRIPTION = "图片暂时无法识别。"
+_UNRESOLVED_DESCRIPTION = "图片尚未完成识别。"
 
 
 def is_direct_image_source(src: str) -> bool:
@@ -180,17 +216,32 @@ def is_direct_image_source(src: str) -> bool:
     return re.match(r"^[A-Za-z]:[\\/]", s) is not None
 
 
-def compose_ai_context_text(text: str, vision_context: VisionContext) -> str:
-    """原始文本 + 视觉描述块拼接为 AI 上下文文本。"""
-    text_part = str(text or "").strip()
-    visual_part = vision_context.to_context_block()
+def build_source_key(slot) -> str:
+    """构造视觉内容的 source key，用于第一级去重（同源不重复下载/解析）。"""
+    segment_type = str(getattr(slot, "segment_type", "") or "").strip().lower()
+    file_id = str(getattr(slot, "file_id", "") or "").strip()
+    face_id = str(getattr(slot, "face_id", "") or "").strip()
+    url = str(getattr(slot, "url", "") or "").strip()
+    file = str(getattr(slot, "file", "") or "").strip()
 
-    parts: list[str] = []
-    if text_part:
-        parts.append(text_part)
-    if visual_part:
-        parts.append(visual_part)
-    return "\n\n".join(parts).strip()
+    if segment_type == "face":
+        return f"face:{face_id}" if face_id else ""
+    if segment_type in {"mface", "market_face"}:
+        if file_id:
+            return f"mface:{file_id}"
+        if face_id:
+            return f"mface:{face_id}"
+        if url:
+            return f"mface:url:{_sha256(url)}"
+        return ""
+    # image
+    if file_id:
+        return f"image:fid:{file_id}"
+    if url:
+        return f"image:url:{_sha256(url)}"
+    if file:
+        return f"image:f:{_sha256(file)}"
+    return ""
 
 
 def _truncate_at_punctuation(text: str, max_chars: int) -> str:
@@ -235,7 +286,7 @@ class VisionSkill:
         self.max_image_bytes = max(64 * 1024, int(VISION_MAX_IMAGE_BYTES or 8 * 1024 * 1024))
         self.max_edge = max(64, int(VISION_MAX_EDGE or 1024))
         self.description_max_chars = max(20, int(VISION_DESCRIPTION_MAX_CHARS or 240))
-        self.max_concurrency = max(1, int(VISION_MAX_CONCURRENCY or 4))  # 预留：当前为全并发，未做限流
+        self.max_concurrency = max(1, int(VISION_MAX_CONCURRENCY or 4))
         self.cache_max_entries = max(0, int(VISION_CACHE_MAX_ENTRIES or 0))
         self.cache_ttl = max(0.0, float(VISION_CACHE_TTL_SECONDS or 21600.0))
         self.negative_cache_ttl = max(0.0, float(VISION_NEGATIVE_CACHE_TTL_SECONDS or 60.0))
@@ -245,10 +296,15 @@ class VisionSkill:
         self._client = client
         self._downloader = downloader
 
-        # 内存成本去重缓存：key -> (description, created_ts)
+        # 识图成本去重缓存：cache_key -> (description, created_ts)，与聊天上下文生命周期无关
         self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
-        # 负缓存：key -> 失败时间戳（短 TTL）
+        # 负缓存：source_key hash -> 失败时间戳（短 TTL）
         self._negative_cache: OrderedDict[str, float] = OrderedDict()
+        # singleflight：cache_key -> 进行中的 Task
+        self._inflight_lock = asyncio.Lock()
+        self._inflight: dict[str, asyncio.Task] = {}
+        # 并发限制（只包视觉 API 调用）
+        self._semaphore: Optional[asyncio.Semaphore] = None
 
     # ---------- ready ----------
 
@@ -272,75 +328,10 @@ class VisionSkill:
             )
         return self._client
 
-    # ---------- 对外入口 ----------
-
-    async def describe_event(
-        self,
-        api,
-        evt: dict,
-        segments: Optional[list[VisualSegment]] = None,
-        *,
-        limit: Optional[int] = None,
-    ) -> VisionContext:
-        if segments is None:
-            segments = self.extract_visual_segments(evt)
-        if not segments:
-            return VisionContext()
-        if limit is None:
-            # 单消息路径：受 max_images_per_message 限制
-            selected = segments[: self.max_images_per_message]
-            skipped = len(segments) - len(selected)
-        else:
-            # pending 路径：调用方已控制数量，全量解析
-            selected = segments[: max(0, int(limit))]
-            skipped = 0
-
-        # 全并发：有多少图就并发多少识别任务，各自独立失败互不影响
-        tasks = [self.describe_segment(api, seg) for seg in selected]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        descriptions: list[VisualDescription] = []
-        failed = 0
-        for seg, result in zip(selected, results):
-            if isinstance(result, VisualDescription):
-                descriptions.append(result)
-                continue
-            failed += 1
-            if isinstance(result, Exception):
-                self._record_negative(seg)
-
-        try:
-            session_hint = f"{(evt or {}).get('group_id') or (evt or {}).get('user_id') or ''}"
-        except Exception:
-            session_hint = ""
-        self.log.info(
-            "vision describe complete: "
-            f"session={session_hint} segments={len(segments)} "
-            f"success={len(descriptions)} failed={failed} "
-            f"cache_hit={sum(1 for d in descriptions if d.cache_hit)}"
-        )
-        return VisionContext(
-            descriptions=descriptions,
-            failed_count=failed,
-            skipped_count=max(0, skipped),
-        )
-
-    async def describe_pending(self, api, pending_images: list[dict]) -> VisionContext:
-        """解析会话内待识别图片列表（缓存命中自动跳过已解析图）。
-
-        pending_images: [{url, file_id}]，由 AIService.record_pending_vision 累积。
-        """
-        segments: list[VisualSegment] = []
-        for index, img in enumerate(pending_images or []):
-            segments.append(
-                VisualSegment(
-                    index=index,
-                    segment_type="image",
-                    url=str(img.get("url") or "").strip(),
-                    file_id=str(img.get("file_id") or "").strip(),
-                )
-            )
-        return await self.describe_event(api, None, segments=segments, limit=len(segments))
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrency)
+        return self._semaphore
 
     # ---------- 段提取 ----------
 
@@ -359,7 +350,6 @@ class VisionSkill:
             out.append(seg)
             index += 1
 
-        # OneBot 数组消息
         msg = evt.get("message")
         if isinstance(msg, list):
             for seg in msg:
@@ -378,7 +368,6 @@ class VisionSkill:
                 data = msg.get("data") or {}
                 _push(tp, data if isinstance(data, dict) else {})
 
-        # CQ fallback（raw_message）
         raw_values: list[str] = []
         raw = evt.get("raw_message")
         if isinstance(raw, str) and raw.strip():
@@ -414,18 +403,86 @@ class VisionSkill:
             face_id=face_id,
         )
 
+    # ---------- slot 创建 ----------
+
+    def _make_slot_id(self, message_id: str, display_index: int) -> str:
+        mid = str(message_id or "").strip()
+        if mid:
+            return f"{mid}:{int(display_index)}"
+        return f"local:{int(time.time() * 1000)}:{int(display_index)}:{uuid.uuid4().hex[:8]}"
+
+    def create_slots_from_event(
+        self,
+        evt: dict,
+        *,
+        message_id: str = "",
+        source_kind: str = "message",
+    ) -> list[VisionSlot]:
+        """从消息事件提取视觉段并创建 VisionSlot 列表（不调用视觉 API）。"""
+        if not message_id:
+            message_id = str(evt.get("message_id") or "").strip()
+        segments = self.extract_visual_segments(evt)
+        slots: list[VisionSlot] = []
+        for display_index, segment in enumerate(segments, start=1):
+            if display_index > self.max_images_per_message:
+                break
+            slot = VisionSlot(
+                slot_id=self._make_slot_id(message_id, display_index),
+                index=display_index,
+                segment_type=segment.segment_type,
+                url=segment.url,
+                file=segment.file,
+                file_id=segment.file_id,
+                path=segment.path,
+                name=segment.name,
+                summary=segment.summary,
+                face_id=segment.face_id,
+                source_kind=source_kind,
+            )
+            self._initialize_local_slot(slot)
+            slots.append(slot)
+        return slots
+
+    def _initialize_local_slot(self, slot: VisionSlot) -> None:
+        """face / 无图的 mface 本地直接完成，不调用视觉 API。"""
+        if slot.segment_type == "face":
+            face_id = str(slot.face_id or "").strip()
+            name = QQ_FACE_NAMES.get(face_id)
+            if name:
+                slot.description = f"[QQ表情：{name}]"
+            else:
+                slot.description = f"[QQ内置表情，ID：{face_id}]" if face_id else "[QQ内置表情]"
+            slot.status = _VISION_STATUS_READY
+            slot.source_key = build_source_key(slot)
+            return
+        if slot.segment_type in {"mface", "market_face"} and not self._slot_has_image_source(slot):
+            summary = str(slot.summary or "").strip()
+            if summary:
+                slot.description = f"[商城表情：{summary}]"
+            elif slot.face_id:
+                slot.description = f"[商城表情，ID：{slot.face_id}，具体画面不可用]"
+            else:
+                slot.description = "[商城表情，具体画面不可用]"
+            slot.status = _VISION_STATUS_READY
+            slot.source_key = build_source_key(slot)
+            return
+
+    @staticmethod
+    def _slot_has_image_source(slot) -> bool:
+        return bool(slot.url or slot.file or slot.file_id or slot.path)
+
     # ---------- 源解析 ----------
 
-    async def resolve_segment_source(self, api, segment: VisualSegment) -> str:
+    async def resolve_segment_source(self, api, slot) -> str:
         """按优先级解析图片源：url / path / file 直接源 → get_image → get_file。"""
         for key in ("url", "path", "file"):
-            src = _normalize_src(getattr(segment, key) or "")
+            src = _normalize_src(str(getattr(slot, key) or ""))
             if src and (key == "url" or is_direct_image_source(src)):
                 return src
 
         call = getattr(api, "call", None)
         tried: set[str] = set()
-        for token in (segment.file, segment.file_id):
+        for token in (slot.file, slot.file_id):
             t = str(token or "").strip()
             if not t or t in tried:
                 continue
@@ -440,7 +497,7 @@ class VisionSkill:
                     return src
 
         get_file = getattr(api, "get_file", None)
-        for token in (segment.file_id, segment.file):
+        for token in (slot.file_id, slot.file):
             t = str(token or "").strip()
             if not t or not callable(get_file):
                 continue
@@ -453,80 +510,216 @@ class VisionSkill:
                 return src
         return ""
 
-    # ---------- 单段识别 ----------
+    # ---------- 解析入口 ----------
 
-    async def describe_segment(self, api, segment: VisualSegment) -> Optional[VisualDescription]:
-        # face：QQ 内置表情，本地映射，不调视觉 API
-        if segment.segment_type == "face":
-            face_id = str(segment.face_id or "").strip()
-            name = QQ_FACE_NAMES.get(face_id)
-            if name:
-                desc = f"[QQ表情：{name}]"
-            else:
-                desc = f"[QQ内置表情，ID：{face_id}]" if face_id else "[QQ内置表情]"
-            return VisualDescription(segment.index, segment.segment_type, desc)
+    async def resolve_slots(
+        self,
+        api,
+        slots: list,
+    ) -> list[VisionResolution]:
+        """统一解析一批 slots（历史补解析 + 当前消息）。
 
-        # mface / market_face：无图但有 summary 时本地描述
-        if segment.segment_type in {"mface", "market_face"}:
-            if not (segment.url or segment.file or segment.file_id or segment.path):
-                summary = str(segment.summary or "").strip()
-                if summary:
-                    return VisualDescription(segment.index, segment.segment_type, f"[商城表情：{summary}]")
-                face_id = str(segment.face_id or "").strip()
-                if face_id:
-                    return VisualDescription(
-                        segment.index, segment.segment_type, f"[商城表情，ID：{face_id}，具体画面不可用]"
+        按 source_key 分组去重，每组只解析一个代表，结果复制给同组 slot。
+        """
+        normalized = [self._coerce_slot(s) for s in (slots or [])]
+        now = float(self.clock())
+
+        resolutions: list[VisionResolution] = []
+        work: list[VisionSlot] = []
+
+        for slot in normalized:
+            if slot.status == _VISION_STATUS_READY:
+                continue
+            if slot.status == _VISION_STATUS_PERMANENT:
+                continue
+            if slot.status == _VISION_STATUS_RETRYABLE and now < float(slot.retry_after_ts or 0.0):
+                continue
+            if slot.segment_type == "face":
+                self._initialize_local_slot(slot)
+                resolutions.append(
+                    VisionResolution(
+                        slot_id=slot.slot_id,
+                        status=_VISION_STATUS_READY,
+                        description=slot.description,
+                        source_key=slot.source_key,
                     )
-                return VisualDescription(
-                    segment.index, segment.segment_type, "[商城表情，具体画面不可用]"
+                )
+                continue
+            if slot.segment_type in {"mface", "market_face"} and not self._slot_has_image_source(slot):
+                self._initialize_local_slot(slot)
+                resolutions.append(
+                    VisionResolution(
+                        slot_id=slot.slot_id,
+                        status=_VISION_STATUS_READY,
+                        description=slot.description,
+                        source_key=slot.source_key,
+                    )
+                )
+                continue
+            work.append(slot)
+
+        # 负缓存过滤：source_key 命中短时负缓存 → 直接 retryable
+        still_work: list[VisionSlot] = []
+        for slot in work:
+            sk = build_source_key(slot)
+            if sk and self._is_negative_source(sk):
+                resolutions.append(
+                    VisionResolution(
+                        slot_id=slot.slot_id,
+                        status=_VISION_STATUS_RETRYABLE,
+                        retry_after_ts=now + 60.0,
+                        source_key=sk,
+                    )
+                )
+                continue
+            still_work.append(slot)
+        work = still_work
+
+        # source_key 分组（第一级去重：同源只解析一个代表）
+        groups: dict[str, list[VisionSlot]] = {}
+        for slot in work:
+            key = build_source_key(slot) or f"slot:{slot.slot_id}"
+            groups.setdefault(key, []).append(slot)
+
+        for group in groups.values():
+            rep = group[0]
+            rep_res = await self._resolve_one(api, rep)
+            for slot in group:
+                if slot is rep:
+                    resolutions.append(rep_res)
+                else:
+                    resolutions.append(_copy_resolution(rep_res, slot.slot_id))
+
+        self.log.info(
+            f"vision resolve complete: targets={len(normalized)} "
+            f"resolved={sum(1 for r in resolutions if r.status == _VISION_STATUS_READY)} "
+            f"retryable={sum(1 for r in resolutions if r.status == _VISION_STATUS_RETRYABLE)} "
+            f"permanent={sum(1 for r in resolutions if r.status == _VISION_STATUS_PERMANENT)}"
+        )
+        return resolutions
+
+    async def _resolve_one(self, api, slot: VisionSlot) -> VisionResolution:
+        source_key = build_source_key(slot)
+        try:
+            src = await self.resolve_segment_source(api, slot)
+            if not src:
+                raise _VisionDownloadError("no source")
+            data_url, norm_bytes = await self._download_and_normalize(src)
+            content_hash = hashlib.sha256(norm_bytes).hexdigest()
+            cache_key = self._cache_key_for_content(content_hash)
+
+            cached = self._get_cache(cache_key)
+            if cached is not None:
+                return VisionResolution(
+                    slot_id=slot.slot_id,
+                    status=_VISION_STATUS_READY,
+                    description=cached,
+                    source_key=source_key,
+                    content_hash=content_hash,
+                    cache_hit=True,
                 )
 
-        # image / 有资源的 mface：下载 → 规范化 → 调 API
-        if self._is_negative(segment):
-            return None
-
-        try:
-            src = await self.resolve_segment_source(api, segment)
+            desc, _hit = await self._describe_with_singleflight(cache_key, data_url)
+            if not desc:
+                raise RuntimeError("empty vision description")
+            return VisionResolution(
+                slot_id=slot.slot_id,
+                status=_VISION_STATUS_READY,
+                description=desc,
+                source_key=source_key,
+                content_hash=content_hash,
+            )
+        except _PermanentVisionError:
+            return VisionResolution(
+                slot_id=slot.slot_id,
+                status=_VISION_STATUS_PERMANENT,
+                description=_PERMANENT_DESCRIPTION,
+                source_key=source_key,
+            )
         except Exception:
-            src = ""
-        if not src:
-            self._record_negative(segment)
-            return None
-
-        try:
-            data_url, norm_bytes = await self._download_and_normalize(src)
-        except _VisionDownloadError:
-            self._record_negative(segment)
-            return None
-        except Exception:
-            self._record_negative(segment)
-            return None
-        if not data_url:
-            self._record_negative(segment)
-            return None
-
-        cache_key = self._cache_key(norm_bytes)
-        cached = self._get_cache(cache_key)
-        if cached is not None:
-            return VisualDescription(
-                segment.index, segment.segment_type, cached, cache_key=cache_key, cache_hit=True
+            self._record_negative_source(source_key)
+            return VisionResolution(
+                slot_id=slot.slot_id,
+                status=_VISION_STATUS_RETRYABLE,
+                description=_RETRYABLE_DESCRIPTION,
+                source_key=source_key,
+                retry_after_ts=float(self.clock()) + 60.0,
             )
 
-        try:
-            raw_text = await self._call_vision_api(data_url)
-        except Exception:
-            self._record_negative(segment)
-            return None
-        if not raw_text:
-            self._record_negative(segment)
-            return None
+    def apply_resolutions_to_slots(
+        self,
+        slots: list,
+        resolutions: list,
+    ) -> list[VisionSlot]:
+        """把解析结果应用到（当前消息的）slots，返回更新后的新列表。"""
+        result_map = {str(r.slot_id): r for r in (resolutions or [])}
+        out: list[VisionSlot] = []
+        for slot in slots:
+            slot = self._coerce_slot(slot)
+            r = result_map.get(slot.slot_id)
+            if r is not None:
+                _apply_resolution_to_slot(slot, r)
+            out.append(slot)
+        return out
 
-        desc = self._format_vision_text(raw_text)
-        if not desc:
-            self._record_negative(segment)
-            return None
-        self._put_cache(cache_key, desc)
-        return VisualDescription(segment.index, segment.segment_type, desc, cache_key=cache_key)
+    @staticmethod
+    def _coerce_slot(item) -> VisionSlot:
+        if isinstance(item, VisionSlot):
+            return item
+        if isinstance(item, dict):
+            return VisionSlot(
+                slot_id=str(item.get("slot_id") or ""),
+                index=int(item.get("index") or 1),
+                segment_type=str(item.get("segment_type") or "image"),
+                status=str(item.get("status") or _VISION_STATUS_UNRESOLVED),
+                url=str(item.get("url") or ""),
+                file=str(item.get("file") or ""),
+                file_id=str(item.get("file_id") or ""),
+                path=str(item.get("path") or ""),
+                name=str(item.get("name") or ""),
+                summary=str(item.get("summary") or ""),
+                face_id=str(item.get("face_id") or ""),
+                source_key=str(item.get("source_key") or ""),
+                content_hash=str(item.get("content_hash") or ""),
+                description=str(item.get("description") or ""),
+                retry_after_ts=float(item.get("retry_after_ts") or 0.0),
+                source_kind=str(item.get("source_kind") or "message"),
+            )
+        raise TypeError(f"unsupported slot type: {type(item).__name__}")
+
+    # ---------- singleflight + 并发限制 ----------
+
+    async def _describe_with_singleflight(self, cache_key: str, data_url: str) -> tuple[str, bool]:
+        cached = self._get_cache(cache_key)
+        if cached is not None:
+            return cached, True
+
+        async def _call_and_cache() -> str:
+            sem = self._get_semaphore()
+            async with sem:
+                raw = await self._call_vision_api(data_url)
+            desc = self._format_vision_text(raw)
+            if not desc:
+                raise RuntimeError("empty vision description")
+            self._put_cache(cache_key, desc)
+            return desc
+
+        desc = await self._get_or_create_inflight(cache_key, _call_and_cache)
+        return desc, False
+
+    async def _get_or_create_inflight(self, cache_key: str, factory) -> str:
+        async with self._inflight_lock:
+            task = self._inflight.get(cache_key)
+            if task is None:
+                task = asyncio.create_task(factory())
+                self._inflight[cache_key] = task
+        try:
+            return await task
+        finally:
+            if task.done():
+                async with self._inflight_lock:
+                    if self._inflight.get(cache_key) is task:
+                        self._inflight.pop(cache_key, None)
 
     # ---------- 下载与预处理 ----------
 
@@ -547,7 +740,7 @@ class VisionSkill:
         if len(raw) > self.max_image_bytes:
             raise _VisionDownloadError("image too large")
 
-        # Pillow 预处理是同步 CPU 操作，丢到线程池避免阻塞事件循环，保证多图真正并行
+        # Pillow 预处理是同步 CPU 操作，丢到线程池避免阻塞事件循环
         return await asyncio.to_thread(self._normalize_image_bytes, raw)
 
     async def _fetch_bytes(self, url: str) -> bytes:
@@ -561,17 +754,25 @@ class VisionSkill:
                 raise _VisionDownloadError("empty download")
             return bytes(data)
         if aiohttp is None:
-            # 回退 urllib（异步包装，避免阻塞事件循环）
             return await asyncio.to_thread(self._fetch_bytes_urllib_sync, url)
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "image/*"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout_seconds)) as session:
             async with session.get(url, headers=headers, allow_redirects=False) as resp:
                 if resp.status >= 400:
                     raise _VisionDownloadError(f"http {resp.status}")
-                body = await resp.read()
-                if not body:
+                content_length = resp.content_length
+                if content_length is not None and int(content_length) > self.max_image_bytes:
+                    raise _VisionDownloadError("image too large")
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    total += len(chunk)
+                    if total > self.max_image_bytes:
+                        raise _VisionDownloadError("image too large")
+                    chunks.append(chunk)
+                if not chunks:
                     raise _VisionDownloadError("empty body")
-                return body
+                return b"".join(chunks)
 
     def _fetch_bytes_urllib_sync(self, url: str) -> bytes:
         import urllib.request
@@ -583,7 +784,7 @@ class VisionSkill:
     def _read_allowed_local_file(self, path: Path) -> bytes:
         resolved = Path(path).resolve()
         if not self._is_allowed_local_path(resolved):
-            raise _VisionDownloadError("local path not allowed")
+            raise _PermanentVisionError("local path not allowed")
         try:
             data = resolved.read_bytes()
         except Exception:
@@ -635,15 +836,15 @@ class VisionSkill:
                 else:
                     data_url, norm_bytes = self._normalize_static(im)
         except (UnidentifiedImageError, OSError, ValueError):
-            raise _VisionDownloadError("invalid image")
+            raise _PermanentVisionError("invalid image")
         except Image.DecompressionBombError:
-            raise _VisionDownloadError("decompression bomb")
+            raise _PermanentVisionError("decompression bomb")
         return data_url, norm_bytes
 
     def _normalize_static(self, im: Image.Image) -> tuple[str, bytes]:
         width, height = im.size
         if int(width) * int(height) > MAX_IMAGE_PIXELS:
-            raise _VisionDownloadError("too many pixels")
+            raise _PermanentVisionError("too many pixels")
         frame = im.convert("RGB")
         frame.thumbnail((self.max_edge, self.max_edge), Image.LANCZOS)
         buf = io.BytesIO()
@@ -664,7 +865,7 @@ class VisionSkill:
             frame.thumbnail((self.max_edge // _ANIMATED_SAMPLE_FRAMES, self.max_edge), Image.LANCZOS)
             frames.append(frame)
         if not frames:
-            raise _VisionDownloadError("no frames")
+            raise _PermanentVisionError("no frames")
         frame_w, frame_h = frames[0].size
         sheet = Image.new("RGB", (frame_w * len(frames), frame_h), (255, 255, 255))
         draw = ImageDraw.Draw(sheet)
@@ -730,10 +931,12 @@ class VisionSkill:
 
     # ---------- 缓存 ----------
 
-    def _cache_key(self, normalized_bytes: bytes) -> str:
+    def _cache_key_for_content(self, content_hash: str) -> str:
         h = hashlib.sha256()
-        h.update(normalized_bytes)
+        h.update(str(content_hash or "").encode("utf-8", errors="ignore"))
+        h.update(b"|")
         h.update(self.model.encode("utf-8", errors="ignore"))
+        h.update(b"|")
         h.update(_VISION_PROMPT_VERSION.encode("utf-8", errors="ignore"))
         return h.hexdigest()
 
@@ -758,17 +961,11 @@ class VisionSkill:
         while len(self._cache) > self.cache_max_entries:
             self._cache.popitem(last=False)
 
-    def _negative_key(self, segment: VisualSegment) -> str:
-        if segment.file_id:
-            return f"fid:{segment.file_id}"
-        if segment.file:
-            return "f:" + hashlib.sha256(segment.file.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        if segment.url:
-            return "u:" + hashlib.sha256(segment.url.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        return ""
+    def _negative_source_key(self, source_key: str) -> str:
+        return "s:" + hashlib.sha256(str(source_key or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
 
-    def _record_negative(self, segment: VisualSegment) -> None:
-        key = self._negative_key(segment)
+    def _record_negative_source(self, source_key: str) -> None:
+        key = self._negative_source_key(source_key)
         if not key or self.negative_cache_ttl <= 0:
             return
         self._negative_cache[key] = self.clock()
@@ -776,8 +973,8 @@ class VisionSkill:
         while len(self._negative_cache) > max(64, self.cache_max_entries):
             self._negative_cache.popitem(last=False)
 
-    def _is_negative(self, segment: VisualSegment) -> bool:
-        key = self._negative_key(segment)
+    def _is_negative_source(self, source_key: str) -> bool:
+        key = self._negative_source_key(source_key)
         if not key:
             return False
         ts = self._negative_cache.get(key)
@@ -792,8 +989,47 @@ class VisionSkill:
 # ============ 内部工具 ============
 
 
-class _VisionDownloadError(Exception):
+class _VisionError(Exception):
     pass
+
+
+class _VisionDownloadError(_VisionError):
+    """可重试错误：网络/超时/上游临时失败。"""
+
+
+class _PermanentVisionError(_VisionError):
+    """永久错误：非法路径/非图片/像素超限等，不再重试。"""
+
+
+def _copy_resolution(resolution: VisionResolution, slot_id: str) -> VisionResolution:
+    return VisionResolution(
+        slot_id=slot_id,
+        status=resolution.status,
+        description=resolution.description,
+        source_key=resolution.source_key,
+        content_hash=resolution.content_hash,
+        retry_after_ts=resolution.retry_after_ts,
+        cache_hit=resolution.cache_hit,
+    )
+
+
+def _apply_resolution_to_slot(slot: VisionSlot, resolution: VisionResolution) -> None:
+    """把解析结果应用到 slot；成功后清空临时图片 source。"""
+    slot.status = resolution.status
+    if resolution.description:
+        slot.description = resolution.description
+    if resolution.source_key:
+        slot.source_key = resolution.source_key
+    if resolution.content_hash:
+        slot.content_hash = resolution.content_hash
+    if resolution.retry_after_ts:
+        slot.retry_after_ts = float(resolution.retry_after_ts)
+    if resolution.status == _VISION_STATUS_READY:
+        # 成功后释放临时图片 source，避免 QQ 临时 URL 长期留在聊天上下文
+        slot.url = ""
+        slot.file = ""
+        slot.file_id = ""
+        slot.path = ""
 
 
 def _normalize_src(raw: str) -> str:
@@ -874,3 +1110,7 @@ def _parse_vision_json(raw: str) -> Optional[dict]:
     except Exception:
         return None
     return obj if isinstance(obj, dict) else None
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8", errors="ignore")).hexdigest()

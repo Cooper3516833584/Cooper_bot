@@ -28,7 +28,7 @@ from command_services import get_handin_task_summary, list_handin_tasks_for_grou
 from router import get_files
 from ziputil import open_fast_zip, write_path as zip_write_path
 from daily_calendar import parse_calendar_date
-from vision_skill import VisionContext, compose_ai_context_text
+from vision_skill import VisionSlot
 from config import (
     ADMIN_USERS,
     DATA_DIR,
@@ -2146,7 +2146,15 @@ def _augment_ai_input_with_sender(ctx, ai_input: str) -> str:
     return _format_group_ai_user_message(ctx, msg)
 
 
-def _remember_non_ai_chat_message(ctx, text: str, logsvc: LogService, aisvc: Optional["AIService"] = None) -> None:
+def _remember_non_ai_chat_message(
+    ctx,
+    text: str,
+    logsvc: LogService,
+    aisvc: Optional["AIService"] = None,
+    *,
+    msg_id: str = "",
+    vision_slots: Optional[list] = None,
+) -> None:
     if aisvc is None:
         return
     remember_fn = getattr(aisvc, "remember_user_message", None)
@@ -2156,7 +2164,12 @@ def _remember_non_ai_chat_message(ctx, text: str, logsvc: LogService, aisvc: Opt
     if not session_key:
         return
     try:
-        remember_fn(session_key, _format_group_ai_user_message(ctx, text))
+        remember_fn(
+            session_key,
+            _format_group_ai_user_message(ctx, text),
+            msg_id=msg_id,
+            vision_slots=vision_slots,
+        )
     except Exception as e:
         logsvc.log.warning(f"AI chat context non-aichat write failed: session={session_key[:80]} err={e}")
 
@@ -3883,10 +3896,11 @@ async def _handle_ai_chat_trigger(
     aisvc: Optional["AIService"] = None,
     forced_ai_input: Optional[str] = None,
     vision_skill=None,
-    vision_segments: Optional[list] = None,
+    current_slots: Optional[list] = None,
+    message_id: str = "",
 ):
-    vision_segments = list(vision_segments or [])
-    has_visual = bool(vision_segments)
+    current_slots = list(current_slots or [])
+    has_visual = bool(current_slots)
     trigger_text = forced_ai_input
     if trigger_text is None:
         trigger_text = extract_ai_chat_trigger_text(
@@ -3899,51 +3913,36 @@ async def _handle_ai_chat_trigger(
         if trigger_text is None:
             return False
     backend, clean_trigger_text = _split_ai_chat_backend(trigger_text)
-    # 需要回复时才解析：解析上下文窗口内所有待识别图片（缓存命中自动跳过已解析图），
-    # 描述写回历史供后续对话引用，同时用于本次输入。
-    vision_context = VisionContext()
+    backend_key = "deepseek" if backend == "default" else backend
     session_key = _ai_chat_session_key(ctx)
-    pending_images: List[dict] = []
+
+    # 视觉：历史补解析（按当前后端窗口）+ 当前消息图片统一解析
+    current_slots = list(current_slots or [])
+    history_slots: List[dict] = []
     if vision_skill is not None and getattr(vision_skill, "ready", False):
         try:
-            if session_key and aisvc is not None and callable(getattr(aisvc, "_load_pending_vision", None)):
-                pending_images = aisvc._load_pending_vision(session_key)
-            if pending_images:
-                vision_context = await vision_skill.describe_pending(api, pending_images)
-            elif has_visual:
-                vision_context = await vision_skill.describe_event(api, evt, segments=vision_segments)
-            if (
-                pending_images
-                and vision_context.descriptions
-                and aisvc is not None
-                and callable(getattr(aisvc, "apply_vision_descriptions_to_history", None))
-                and session_key
-            ):
-                try:
-                    aisvc.apply_vision_descriptions_to_history(
-                        session_key,
-                        [d.description for d in vision_context.descriptions],
-                    )
-                except Exception:
-                    pass
-            if pending_images and aisvc is not None and callable(getattr(aisvc, "clear_pending_vision", None)) and session_key:
-                try:
-                    aisvc.clear_pending_vision(session_key)
-                except Exception:
-                    pass
-        except Exception as e:
+            if session_key and aisvc is not None and callable(getattr(aisvc, "collect_unresolved_vision_slots", None)):
+                history_slots = aisvc.collect_unresolved_vision_slots(session_key, backend_key)
+        except Exception:
+            history_slots = []
+        all_targets = history_slots + current_slots
+        if all_targets:
             try:
-                logsvc.log.warning(f"vision event failed: {type(e).__name__}: {e}")
-            except Exception:
-                pass
-            vision_context = VisionContext(failed_count=1)
-    if forced_ai_input is None:
-        ai_input = compose_ai_context_text(clean_trigger_text, vision_context)
-    else:
-        ai_input = clean_trigger_text
-    ai_input = _augment_ai_input_with_sender(ctx, ai_input)
+                resolutions = await vision_skill.resolve_slots(api, all_targets)
+                if session_key and aisvc is not None and callable(getattr(aisvc, "apply_vision_resolutions", None)):
+                    try:
+                        aisvc.apply_vision_resolutions(session_key, resolutions)
+                    except Exception:
+                        pass
+                current_slots = vision_skill.apply_resolutions_to_slots(current_slots, resolutions)
+            except Exception as e:
+                try:
+                    logsvc.log.warning(f"vision resolve failed: {type(e).__name__}: {e}")
+                except Exception:
+                    pass
+    ai_input = _augment_ai_input_with_sender(ctx, clean_trigger_text)
     if ai_input is not None:
-        if not ai_input:
+        if not ai_input and not current_slots:
             await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊直接发送文本就行。", logsvc)
             return True
         if aisvc is None:
@@ -3980,9 +3979,21 @@ async def _handle_ai_chat_trigger(
         try:
             if session_key and callable(chat_with_context_fn):
                 if use_gemini:
-                    out = (await chat_with_context_fn(session_key, ai_input, model_key)).strip()
+                    out = (
+                        await chat_with_context_fn(
+                            session_key, ai_input, model_key,
+                            msg_id=message_id,
+                            vision_slots=current_slots,
+                        )
+                    ).strip()
                 else:
-                    out = (await chat_with_context_fn(session_key, ai_input)).strip()
+                    out = (
+                        await chat_with_context_fn(
+                            session_key, ai_input,
+                            msg_id=message_id,
+                            vision_slots=current_slots,
+                        )
+                    ).strip()
                 try:
                     setattr(ctx, "_skip_reply_context_once", True)
                 except Exception:
@@ -4876,53 +4887,59 @@ async def dispatch(
     if await _handle_pre_dispatch_state(api, ctx, evt, text, logsvc, state, handin, filesvc, aisvc):
         return
     raw_text = str(text or "").strip()
-    # 视觉延迟解析：本地提取段用于触发判断并记录待识别图片，不调用视觉 API；
-    # 仅在 AI 触发需要回复时统一解析（见 _handle_ai_chat_trigger）。
+    # 视觉 slot 架构：创建当前消息的 VisionSlot（不调视觉 API），
+    # 仅在 AI 触发回复时统一补解析（见 _handle_ai_chat_trigger）。
+    current_slots: list = []
+    message_id = str(evt.get("message_id") or "").strip()
     vision_skill_ready = vision_skill is not None and getattr(vision_skill, "ready", False)
-    vision_segments = vision_skill.extract_visual_segments(evt) if vision_skill_ready else []
-    # 引用（reply）消息：被引用消息里的图片也纳入待识别，让 AI 知道引用的是哪张图
-    referenced_images: List[dict] = []
-    reply_id = _extract_reply_msg_id(evt)
-    if reply_id and aisvc is not None and callable(getattr(aisvc, "_lookup_msg_images", None)):
-        try:
-            ref_images = aisvc._lookup_msg_images(reply_id)
-            if not ref_images and api is not None and callable(getattr(api, "call", None)):
+    if vision_skill_ready:
+        current_slots = vision_skill.create_slots_from_event(evt, message_id=message_id)
+        # 引用（reply）：被引用消息在历史内 → 直接依赖历史 _vision；历史外 → get_msg 建 reference slot
+        reply_id = _extract_reply_msg_id(evt)
+        if reply_id:
+            sess = _ai_chat_session_key(ctx)
+            found = None
+            if sess and aisvc is not None and callable(getattr(aisvc, "find_chat_message_by_msg_id", None)):
                 try:
-                    resp = await api.call("get_msg", {"message_id": int(reply_id)}, timeout=15.0)
-                    data = (resp or {}).get("data") or {}
-                    ref_msg = data.get("message")
-                    if isinstance(ref_msg, list) and vision_skill is not None:
-                        ref_segs = vision_skill.extract_visual_segments({"message": ref_msg})
-                        ref_images = [{"url": s.url, "file_id": s.file_id} for s in ref_segs]
+                    found = aisvc.find_chat_message_by_msg_id(sess, reply_id)
                 except Exception:
-                    ref_images = []
-            referenced_images = [dict(x) for x in ref_images]
-        except Exception:
-            referenced_images = []
-    has_visual = bool(vision_segments) or bool(referenced_images)
-    all_image_sources = [{"url": s.url, "file_id": s.file_id} for s in vision_segments] + referenced_images
-    if all_image_sources:
-        # 记录待识别图片源（未触发回复的图片也能在后续回复时被解析并写回上下文）
-        sess = _ai_chat_session_key(ctx)
-        if sess and aisvc is not None and callable(getattr(aisvc, "record_pending_vision", None)):
-            try:
-                aisvc.record_pending_vision(sess, all_image_sources)
-            except Exception:
-                pass
-        # 当前消息图片按消息 id 缓存，供后续被引用时提取
-        msg_id = str(evt.get("message_id") or "").strip()
-        if msg_id and vision_segments and aisvc is not None and callable(getattr(aisvc, "record_msg_images", None)):
-            try:
-                aisvc.record_msg_images(msg_id, [{"url": s.url, "file_id": s.file_id} for s in vision_segments])
-            except Exception:
-                pass
-    # 未解析前以占位符入上下文，回复时由视觉 Skill 替换为描述；占位数量与实际图片数量一致
-    placeholder = getattr(aisvc, "_VISION_PENDING_PLACEHOLDER", "[图片待识别]") if aisvc is not None else "[图片待识别]"
-    enriched_text = compose_ai_context_text(raw_text, VisionContext())
-    if has_visual:
-        placeholders = "\n\n".join([placeholder] * len(all_image_sources))
-        enriched_text = f"{enriched_text}\n\n{placeholders}".strip() if enriched_text else placeholders
-    if not enriched_text:
+                    found = None
+            if not (found and found.get("_vision")):
+                reply_slots: list = []
+                if api is not None and callable(getattr(api, "call", None)):
+                    try:
+                        resp = await api.call("get_msg", {"message_id": int(reply_id)}, timeout=15.0)
+                        data = (resp or {}).get("data") or {}
+                        ref_msg = data.get("message")
+                        if isinstance(ref_msg, list):
+                            reply_slots = vision_skill.create_slots_from_event(
+                                {"message": ref_msg},
+                                message_id=f"ref-{reply_id}",
+                                source_kind="reply_reference",
+                            )
+                    except Exception:
+                        reply_slots = []
+                current_slots = list(current_slots) + list(reply_slots)
+    has_visual = bool(current_slots)
+    # AI 触发判断（提前）：当前请求图片不受 capture 开关影响
+    ai_triggered = False
+    if not raw_text.startswith(("/", "／")):
+        ai_triggered = (
+            extract_ai_chat_trigger_text(
+                ctx,
+                evt,
+                raw_text,
+                has_visual=has_visual,
+                bot_nick=(aisvc.bot_nick if aisvc else AI_BOT_NICK),
+            )
+            is not None
+        )
+    # VISION_CAPTURE_CONTEXT_IMAGES=false：普通非 AI 消息的视觉内容不保存
+    if (not ai_triggered) and vision_skill is not None and (not vision_skill.capture_context_images):
+        current_slots = []
+        has_visual = False
+    enriched_text = raw_text
+    if not enriched_text and not has_visual:
         return
     # 记录 IN（只有最终 log_out 才会落盘）
     logsvc.log_in(ctx, raw_text or "[image]")
@@ -4932,8 +4949,15 @@ async def dispatch(
         nonlocal non_ai_remembered
         if non_ai_remembered:
             return
-        if enriched_text:
-            _remember_non_ai_chat_message(ctx, enriched_text, logsvc, aisvc)
+        if enriched_text or current_slots:
+            _remember_non_ai_chat_message(
+                ctx,
+                enriched_text,
+                logsvc,
+                aisvc,
+                msg_id=message_id,
+                vision_slots=current_slots,
+            )
         non_ai_remembered = True
 
     t = raw_text
@@ -4946,7 +4970,8 @@ async def dispatch(
             api, ctx, evt, t, logsvc, aisvc,
             forced_ai_input=t,
             vision_skill=vision_skill,
-            vision_segments=vision_segments,
+            current_slots=current_slots,
+            message_id=message_id,
         ):
             return
         _remember_non_ai_once()
@@ -4967,7 +4992,8 @@ async def dispatch(
     if await _handle_ai_chat_trigger(
         api, ctx, evt, t, logsvc, aisvc,
         vision_skill=vision_skill,
-        vision_segments=vision_segments,
+        current_slots=current_slots,
+        message_id=message_id,
     ):
         return
     _remember_non_ai_once()

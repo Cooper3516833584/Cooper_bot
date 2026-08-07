@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 
 import pytest
+from PIL import Image
 
 from vision_skill import (
-    VisionContext,
+    VisionResolution,
     VisionSkill,
-    VisualDescription,
+    VisionSlot,
     VisualSegment,
-    compose_ai_context_text,
-    is_direct_image_source,
+    build_source_key,
 )
 
 
@@ -31,7 +34,6 @@ class _DummyLog:
 def _fake_png_bytes() -> bytes:
     import base64
 
-    # 1x1 红色 PNG
     return base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
     )
@@ -39,13 +41,10 @@ def _fake_png_bytes() -> bytes:
 
 def _distinct_png_downloader() -> "Any":
     import hashlib as _hashlib
-    import io as _io
-
-    from PIL import Image
 
     def _dl(url: str) -> bytes:
         seed = int(_hashlib.md5(str(url).encode("utf-8")).hexdigest()[:4], 16) % 255
-        buf = _io.BytesIO()
+        buf = io.BytesIO()
         Image.new("RGB", (8, 8), (seed, 20, 200 - seed)).save(buf, format="PNG")
         return buf.getvalue()
 
@@ -56,16 +55,22 @@ class _FakeCompletions:
     def __init__(self, content: str) -> None:
         self._content = content
         self.calls: list[dict[str, Any]] = []
+        self.active = 0
+        self.peak = 0
 
     async def create(self, **kwargs) -> Any:
         self.calls.append(kwargs)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=self._content))]
-        )
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await asyncio.sleep(0.02)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=self._content))])
+        finally:
+            self.active -= 1
 
 
 class _FakeClient:
-    def __init__(self, content: str) -> None:
+    def __init__(self, content: str = '{"kind":"表情包","scene":"一只猫","visible_text":"","emotion":"","intent":""}') -> None:
         self.chat = SimpleNamespace(completions=_FakeCompletions(content))
 
 
@@ -85,366 +90,268 @@ class _FakeAPI:
 def _make_skill(
     log=None,
     *,
-    content: str = '{"kind":"表情包","scene":"熊猫头抱臂","visible_text":"就这？","emotion":"不屑","intent":"嘲讽"}',
+    content: str = '{"kind":"表情包","scene":"一只猫","visible_text":"","emotion":"","intent":""}',
     downloader=None,
-    cache_max_entries: Optional[int] = None,
-    cache_ttl: float = 600.0,
+    clock=None,
+    max_concurrency: int = 4,
 ) -> VisionSkill:
     svc = VisionSkill(
         log=log or _DummyLog(),
         client=_FakeClient(content),
         downloader=downloader or (lambda url: _fake_png_bytes()),
-        clock=lambda: 1000.0,
+        clock=clock or (lambda: 1000.0),
     )
-    if cache_max_entries is not None:
-        svc.cache_max_entries = cache_max_entries
-    svc.cache_ttl = cache_ttl
+    svc.cache_ttl = 600.0
+    svc.max_concurrency = max_concurrency
     return svc
 
 
-# ---------- 提取 ----------
+def _image_slot(slot_id: str, *, url: str = "", file_id: str = "", segment_type: str = "image", **kw) -> VisionSlot:
+    data: dict[str, Any] = dict(slot_id=slot_id, index=1, segment_type=segment_type, url=url, file_id=file_id)
+    data.update(kw)
+    return VisionSlot(**data)
 
 
-def test_extract_image_segments_from_array() -> None:
+# ============ 段提取 ============
+
+
+def test_extract_image_segments_from_array_and_cq() -> None:
     svc = _make_skill()
     evt = {
         "message": [
             {"type": "text", "data": {"text": "看图"}},
             {"type": "image", "data": {"file": "f1", "url": "https://a/1.png"}},
-            {"type": "image", "data": {"file_id": "f2", "url": "https://a/2.png"}},
-        ]
-    }
-    segs = svc.extract_visual_segments(evt)
-    assert [s.segment_type for s in segs] == ["image", "image"]
-    assert segs[0].url == "https://a/1.png"
-    assert segs[0].file == "f1"
-    assert segs[1].file_id == "f2"
-
-
-def test_extract_image_segments_from_cq() -> None:
-    svc = _make_skill()
-    evt = {"raw_message": "[CQ:image,file=f1,url=https://a/1.png] 看图"}
-    segs = svc.extract_visual_segments(evt)
-    assert len(segs) == 1
-    assert segs[0].segment_type == "image"
-    assert segs[0].file == "f1"
-    assert segs[0].url == "https://a/1.png"
-
-
-def test_extract_mface_with_url() -> None:
-    svc = _make_skill()
-    evt = {"message": [{"type": "mface", "data": {"url": "https://a/m.png", "summary": "疑惑"}}]}
-    segs = svc.extract_visual_segments(evt)
-    assert len(segs) == 1
-    assert segs[0].segment_type == "mface"
-    assert segs[0].url == "https://a/m.png"
-
-
-def test_extract_face_local_mapping() -> None:
-    svc = _make_skill()
-    evt = {"message": [{"type": "face", "data": {"id": "14"}}]}
-    segs = svc.extract_visual_segments(evt)
-    assert len(segs) == 1
-    assert segs[0].segment_type == "face"
-    assert segs[0].face_id == "14"
-
-
-def test_extract_dedupe_array_and_raw() -> None:
-    svc = _make_skill()
-    evt = {
-        "message": [{"type": "image", "data": {"file": "f1", "url": "https://a/1.png"}}],
+            {"type": "face", "data": {"id": "14"}},
+        ],
         "raw_message": "[CQ:image,file=f1,url=https://a/1.png]",
     }
     segs = svc.extract_visual_segments(evt)
-    assert len(segs) == 1
+    assert [s.segment_type for s in segs] == ["image", "face"]
+    assert segs[0].url == "https://a/1.png"
 
 
-def test_extract_preserves_order_multi_image() -> None:
+def test_extract_preserves_order_and_dedupes() -> None:
     svc = _make_skill()
     evt = {
         "message": [
             {"type": "image", "data": {"url": "https://a/1.png"}},
             {"type": "image", "data": {"url": "https://a/2.png"}},
-            {"type": "image", "data": {"url": "https://a/3.png"}},
+            {"type": "image", "data": {"url": "https://a/1.png"}},
         ]
     }
     segs = svc.extract_visual_segments(evt)
-    assert [s.url for s in segs] == ["https://a/1.png", "https://a/2.png", "https://a/3.png"]
-    assert [s.index for s in segs] == [0, 1, 2]
+    assert [s.url for s in segs] == ["https://a/1.png", "https://a/2.png"]
 
 
-# ---------- face / mface 本地描述 ----------
+# ============ create_slots_from_event ============
 
 
-@pytest.mark.asyncio
-async def test_describe_face_uses_local_mapping() -> None:
+def test_create_slots_from_event_with_message_id() -> None:
     svc = _make_skill()
-    seg = VisualSegment(index=0, segment_type="face", face_id="14")
-    out = await svc.describe_segment(_FakeAPI(), seg)
-    assert out is not None
-    assert out.description == "[QQ表情：微笑]"
-
-    seg2 = VisualSegment(index=1, segment_type="face", face_id="999")
-    out2 = await svc.describe_segment(_FakeAPI(), seg2)
-    assert out2 is not None
-    assert out2.description == "[QQ内置表情，ID：999]"
+    evt = {"message_id": "987654321", "message": [{"type": "image", "data": {"url": "https://a/1.png"}}]}
+    slots = svc.create_slots_from_event(evt)
+    assert len(slots) == 1
+    assert slots[0].slot_id == "987654321:1"
+    assert slots[0].index == 1
+    assert slots[0].status == "unresolved"
 
 
-@pytest.mark.asyncio
-async def test_describe_mface_without_image_uses_summary() -> None:
+def test_create_slots_face_ready_locally() -> None:
     svc = _make_skill()
-    seg = VisualSegment(index=0, segment_type="mface", summary="疑惑")
-    out = await svc.describe_segment(_FakeAPI(), seg)
-    assert out is not None
-    assert out.description == "[商城表情：疑惑]"
-
-    seg2 = VisualSegment(index=1, segment_type="market_face", face_id="abc123")
-    out2 = await svc.describe_segment(_FakeAPI(), seg2)
-    assert out2 is not None
-    assert out2.description == "[商城表情，ID：abc123，具体画面不可用]"
+    evt = {"message_id": "1", "message": [{"type": "face", "data": {"id": "14"}}]}
+    slots = svc.create_slots_from_event(evt)
+    assert slots[0].status == "ready"
+    assert "微笑" in slots[0].description
 
 
-# ---------- 描述与缓存 ----------
+def test_create_slots_mface_summary_ready_locally() -> None:
+    svc = _make_skill()
+    evt = {"message_id": "1", "message": [{"type": "mface", "data": {"summary": "流泪"}}]}
+    slots = svc.create_slots_from_event(evt)
+    assert slots[0].status == "ready"
+    assert "流泪" in slots[0].description
+
+
+def test_create_slots_respects_max_images_per_message() -> None:
+    svc = _make_skill()
+    svc.max_images_per_message = 3
+    evt = {"message_id": "1", "message": [{"type": "image", "data": {"url": f"https://a/{i}.png"}} for i in range(5)]}
+    slots = svc.create_slots_from_event(evt)
+    assert len(slots) == 3
+    assert slots[0].slot_id == "1:1"
+    assert slots[-1].slot_id == "1:3"
+
+
+# ============ build_source_key ============
+
+
+def test_build_source_key() -> None:
+    assert build_source_key(_image_slot("s", segment_type="face", face_id="14")) == "face:14"
+    assert build_source_key(_image_slot("s", segment_type="image", file_id="fid1")) == "image:fid:fid1"
+    assert build_source_key(_image_slot("s", segment_type="image", url="https://a/1.png")).startswith("image:url:")
+    assert build_source_key(_image_slot("s", segment_type="mface", file_id="mf")) == "mface:mf"
+
+
+# ============ resolve_slots：成功 ============
 
 
 @pytest.mark.asyncio
-async def test_describe_image_calls_api_and_formats() -> None:
-    log = _DummyLog()
-    svc = _make_skill(log=log)
-    seg = VisualSegment(index=0, segment_type="image", url="https://a/1.png")
-    out = await svc.describe_segment(_FakeAPI(), seg)
-    assert out is not None
-    assert "类型：表情包" in out.description
-    assert "熊猫头抱臂" in out.description
-    assert "就这？" in out.description
-    assert not out.cache_hit
+async def test_resolve_image_ready() -> None:
+    client = _FakeClient()
+    svc = _make_skill(content=client.chat.completions._content)
+    svc._client = client
+    slot = _image_slot("A:1", url="https://a/1.png")
+    resolutions = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert len(resolutions) == 1
+    assert resolutions[0].slot_id == "A:1"
+    assert resolutions[0].status == "ready"
+    assert "一只猫" in resolutions[0].description
 
 
 @pytest.mark.asyncio
-async def test_same_image_hits_cache_second_call() -> None:
-    client = _FakeClient('{"kind":"表情包","scene":"猫","visible_text":"","emotion":"","intent":""}')
-    svc = VisionSkill(_DummyLog(), client=client, downloader=lambda url: _fake_png_bytes(), clock=lambda: 1000.0)
-    svc.cache_ttl = 600.0
-    seg = VisualSegment(index=0, segment_type="image", url="https://a/1.png")
+async def test_resolve_face_and_mface_no_api() -> None:
+    client = _FakeClient()
+    svc = _make_skill()
+    svc._client = client
+    slots = [
+        _image_slot("f:1", segment_type="face", face_id="14"),
+        _image_slot("m:1", segment_type="mface", summary="流泪"),
+    ]
+    resolutions = await svc.resolve_slots(_FakeAPI(), slots)
+    assert len(resolutions) == 2
+    assert all(r.status == "ready" for r in resolutions)
+    assert len(client.chat.completions.calls) == 0
 
-    first = await svc.describe_segment(_FakeAPI(), seg)
-    second = await svc.describe_segment(_FakeAPI(), seg)
 
-    assert first is not None and second is not None
-    assert first.description == second.description
-    assert first.cache_hit is False
-    assert second.cache_hit is True
+@pytest.mark.asyncio
+async def test_resolve_same_source_key_calls_api_once() -> None:
+    client = _FakeClient()
+    svc = _make_skill()
+    svc._client = client
+    slots = [_image_slot(f"m{i}:1", url="https://x/doge.png", file_id="doge") for i in range(3)]
+    resolutions = await svc.resolve_slots(_FakeAPI(), slots)
+    assert len(resolutions) == 3
+    assert all(r.status == "ready" for r in resolutions)
     assert len(client.chat.completions.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_cache_ttl_expiry_reinvokes() -> None:
-    client = _FakeClient('{"kind":"照片","scene":"猫","visible_text":"","emotion":"","intent":""}')
-    now = {"ts": 1000.0}
-    svc = VisionSkill(_DummyLog(), client=client, downloader=lambda url: _fake_png_bytes(), clock=lambda: now["ts"])
-    svc.cache_ttl = 100.0
-    seg = VisualSegment(index=0, segment_type="image", url="https://a/1.png")
-
-    await svc.describe_segment(_FakeAPI(), seg)
-    now["ts"] += 200.0
-    await svc.describe_segment(_FakeAPI(), seg)
-    assert len(client.chat.completions.calls) == 2
+async def test_different_urls_same_bytes_api_once() -> None:
+    client = _FakeClient()
+    svc = _make_skill()
+    svc._client = client
+    slots = [_image_slot("a:1", url="https://a/1.png"), _image_slot("b:1", url="https://b/1.png")]
+    resolutions = await svc.resolve_slots(_FakeAPI(), slots)
+    assert len(resolutions) == 2
+    assert all(r.status == "ready" for r in resolutions)
+    assert len(client.chat.completions.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_cache_max_entries_evicts_oldest() -> None:
-    client = _FakeClient('{"kind":"照片","scene":"x","visible_text":"","emotion":"","intent":""}')
-    svc = VisionSkill(_DummyLog(), client=client, downloader=_distinct_png_downloader(), clock=lambda: 1000.0)
-    svc.cache_ttl = 600.0
-    svc.cache_max_entries = 2
-
-    segs = [VisualSegment(index=i, segment_type="image", url=f"https://a/{i}.png") for i in range(3)]
-    for seg in segs:
-        await svc.describe_segment(_FakeAPI(), seg)
-
-    assert len(svc._cache) == 2
-    assert len(client.chat.completions.calls) == 3
+async def test_singleflight_cross_session_concurrent() -> None:
+    client = _FakeClient()
+    svc = _make_skill()
+    svc._client = client
+    slot_a = _image_slot("ga:1", url="https://x/a.png")
+    slot_b = _image_slot("gb:1", url="https://y/b.png")
+    await asyncio.gather(svc.resolve_slots(_FakeAPI(), [slot_a]), svc.resolve_slots(_FakeAPI(), [slot_b]))
+    assert len(client.chat.completions.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_cache_disabled_when_max_entries_zero() -> None:
-    client = _FakeClient('{"kind":"照片","scene":"x","visible_text":"","emotion":"","intent":""}')
-    svc = VisionSkill(_DummyLog(), client=client, downloader=lambda url: _fake_png_bytes(), clock=lambda: 1000.0)
-    svc.cache_max_entries = 0
-    seg = VisualSegment(index=0, segment_type="image", url="https://a/1.png")
-    await svc.describe_segment(_FakeAPI(), seg)
-    await svc.describe_segment(_FakeAPI(), seg)
-    assert len(client.chat.completions.calls) == 2
+async def test_concurrency_limited_by_max_concurrency() -> None:
+    client = _FakeClient()
+    svc = _make_skill()
+    svc._client = client
+    svc.max_concurrency = 2
+    slots = [_image_slot(f"s{i}:1", url=f"https://a/{i}.png") for i in range(6)]
+    resolutions = await svc.resolve_slots(_FakeAPI(), slots)
+    assert len([r for r in resolutions if r.status == "ready"]) == 6
+    assert client.chat.completions.peak <= 2
 
 
-# ---------- 失败与降级 ----------
-
-
-@pytest.mark.asyncio
-async def test_download_failure_returns_none() -> None:
-    def _boom(_url: str) -> bytes:
-        raise RuntimeError("network down")
-
-    svc = _make_skill(downloader=_boom)
-    seg = VisualSegment(index=0, segment_type="image", url="https://a/1.png")
-    out = await svc.describe_segment(_FakeAPI(), seg)
-    assert out is None
+# ============ 失败映射 ============
 
 
 @pytest.mark.asyncio
-async def test_invalid_json_response_returns_none() -> None:
-    svc = _make_skill(content="not json at all")
-    seg = VisualSegment(index=0, segment_type="image", url="https://a/1.png")
-    out = await svc.describe_segment(_FakeAPI(), seg)
-    assert out is None
-
-
-@pytest.mark.asyncio
-async def test_empty_response_returns_none() -> None:
-    svc = _make_skill(content="")
-    seg = VisualSegment(index=0, segment_type="image", url="https://a/1.png")
-    out = await svc.describe_segment(_FakeAPI(), seg)
-    assert out is None
-
-
-@pytest.mark.asyncio
-async def test_describe_event_partial_failure() -> None:
+async def test_failure_mapping_no_misattribution() -> None:
+    client = _FakeClient()
     calls = {"n": 0}
     distinct = _distinct_png_downloader()
 
-    def _downloader(_url: str) -> bytes:
+    def _downloader(url: str) -> bytes:
         calls["n"] += 1
-        if calls["n"] == 2:
-            raise RuntimeError("boom")
-        return distinct(_url)
+        if calls["n"] == 1:
+            raise RuntimeError("network down")
+        return distinct(url)
 
-    svc = _make_skill(downloader=_downloader)
-    evt = {
-        "message": [
-            {"type": "image", "data": {"url": "https://a/1.png"}},
-            {"type": "image", "data": {"url": "https://a/2.png"}},
-            {"type": "image", "data": {"url": "https://a/3.png"}},
-        ]
-    }
-    ctx = await svc.describe_event(_FakeAPI(), evt)
-    assert len(ctx.descriptions) == 2
-    assert ctx.failed_count == 1
-    block = ctx.to_context_block()
-    assert "[视觉内容0]" in block
-    assert "[视觉内容2]" in block
-    assert "图片识别失败" in block
+    svc = _make_skill()
+    svc._client = client
+    svc._downloader = _downloader
+    slots = [_image_slot("A:1", url="https://x/a.png"), _image_slot("B:1", url="https://x/b.png")]
+    resolutions = await svc.resolve_slots(_FakeAPI(), slots)
+    by_id = {r.slot_id: r for r in resolutions}
+    assert by_id["A:1"].status == "retryable_error"
+    assert by_id["A:1"].description != "一只猫"
+    assert by_id["B:1"].status == "ready"
+    assert "一只猫" in by_id["B:1"].description
 
 
 @pytest.mark.asyncio
-async def test_describe_event_respects_max_images() -> None:
-    svc = _make_skill()
-    svc.max_images_per_message = 2
-    evt = {
-        "message": [
-            {"type": "image", "data": {"url": f"https://a/{i}.png"}} for i in range(4)
-        ]
-    }
-    ctx = await svc.describe_event(_FakeAPI(), evt)
-    assert len(ctx.descriptions) == 2
-    assert ctx.skipped_count == 2
-
-
-def test_ready_false_when_disabled() -> None:
-    svc = _make_skill()
-    svc.enabled = False
-    assert svc.ready is False
-
-
-# ---------- 安全 ----------
-
-
-def test_is_direct_image_source() -> None:
-    assert is_direct_image_source("https://a/b.png") is True
-    assert is_direct_image_source("file:///C:/x.png") is True
-    assert is_direct_image_source("C:\\Users\\a.png") is True
-    assert is_direct_image_source("/tmp/a.png") is True
-    assert is_direct_image_source("a.png") is False
-    assert is_direct_image_source("") is False
-
-
-def test_local_path_whitelist_blocks_system_paths(tmp_path) -> None:
-    svc = _make_skill()
-    assert svc._is_allowed_local_path(Path("C:/Windows/system32/passwd")) is False
-    assert svc._is_allowed_local_path(Path("/etc/passwd")) is False
-    assert svc._is_allowed_local_path(Path("C:/Users/Cooper/Desktop/a.png")) is False
-    # 敏感文件
-    assert svc._is_allowed_local_path(Path("C:/x/api_key.txt")) is False
-    # 白名单目录内允许
-    allowed_root = Path(__file__).resolve().parent.parent.parent / "data" / "ocr"
-    if allowed_root.exists():
-        assert svc._is_allowed_local_path(allowed_root / "a.jpg") is True
-
-
-def test_compose_ai_context_text() -> None:
-    ctx = VisionContext(
-        descriptions=[VisualDescription(index=1, segment_type="image", description="类型：表情包；画面：猫")],
-        failed_count=1,
-    )
-    out = compose_ai_context_text("你看看这个", ctx)
-    assert "你看看这个" in out
-    assert "[视觉内容1] 类型：表情包；画面：猫" in out
-    assert "图片识别失败" in out
-
-    assert compose_ai_context_text("", VisionContext()) == ""
-    assert compose_ai_context_text("纯文本", VisionContext()) == "纯文本"
-
-
-def test_vision_context_to_context_block_ordering() -> None:
-    ctx = VisionContext(
-        descriptions=[
-            VisualDescription(index=2, segment_type="image", description="d2"),
-            VisualDescription(index=1, segment_type="image", description="d1"),
-        ]
-    )
-    block = ctx.to_context_block()
-    assert block.index("[视觉内容1]") < block.index("[视觉内容2]")
+async def test_permanent_error_not_retried() -> None:
+    svc = _make_skill(downloader=lambda url: b"not an image at all")
+    slot = _image_slot("p:1", url="https://a/1.png")
+    resolutions = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert resolutions[0].status == "permanent_error"
+    # 已是 permanent_error 的 slot 不再处理
+    slot.status = "permanent_error"
+    resolutions2 = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert resolutions2 == []
 
 
 @pytest.mark.asyncio
-async def test_describe_event_runs_images_concurrently() -> None:
-    import asyncio as _asyncio
-    import time as _time
-
-    active = {"n": 0, "peak": 0}
-
-    async def _slow_downloader(_url: str) -> bytes:
-        active["n"] += 1
-        active["peak"] = max(active["peak"], active["n"])
-        await _asyncio.sleep(0.15)
-        active["n"] -= 1
-        return _distinct_png_downloader()(_url)
-
-    client = _FakeClient('{"kind":"照片","scene":"x","visible_text":"","emotion":"","intent":""}')
-    svc = VisionSkill(_DummyLog(), client=client, downloader=_slow_downloader, clock=lambda: 1000.0)
-    svc.cache_ttl = 600.0
-
-    evt = {"message": [{"type": "image", "data": {"url": f"https://a/{i}.png"}} for i in range(3)]}
-    start = _time.monotonic()
-    ctx = await svc.describe_event(_FakeAPI(), evt)
-    elapsed = _time.monotonic() - start
-
-    assert len(ctx.descriptions) == 3
-    # 并发执行：3 张图总耗时显著小于串行的 0.45s，且出现过并发峰值
-    assert elapsed < 0.4
-    assert active["peak"] >= 2
+async def test_retryable_skip_until_retry_after() -> None:
+    client = _FakeClient()
+    now = {"ts": 1000.0}
+    svc = _make_skill(clock=lambda: now["ts"])
+    svc._client = client
+    slot = _image_slot("r:1", url="https://a/1.png")
+    slot.status = "retryable_error"
+    slot.retry_after_ts = now["ts"] + 60.0
+    # 未到 retry_after：跳过
+    resolutions = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert resolutions == []
+    assert len(client.chat.completions.calls) == 0
+    # 超过 retry_after：重新处理
+    now["ts"] += 61.0
+    resolutions2 = await svc.resolve_slots(_FakeAPI(), [slot])
+    assert len(resolutions2) == 1
+    assert resolutions2[0].status == "ready"
 
 
-@pytest.mark.asyncio
-async def test_describe_pending_resolves_all_beyond_single_message_limit() -> None:
-    client = _FakeClient('{"kind":"照片","scene":"x","visible_text":"","emotion":"","intent":""}')
-    svc = VisionSkill(_DummyLog(), client=client, downloader=_distinct_png_downloader(), clock=lambda: 1000.0)
-    svc.cache_ttl = 600.0
-    svc.max_images_per_message = 3  # 单消息上限 3
+# ============ apply_resolutions_to_slots ============
 
-    pending = [{"url": f"https://a/{i}.png", "file_id": f"f{i}"} for i in range(8)]
-    ctx = await svc.describe_pending(_FakeAPI(), pending)
 
-    # pending 路径不受单消息上限限制，8 张全解析
-    assert len(ctx.descriptions) == 8
-    assert ctx.skipped_count == 0
-    assert len(client.chat.completions.calls) == 8
+def test_apply_resolutions_to_slots_by_slot_id() -> None:
+    svc = _make_skill()
+    slots = [_image_slot("A:1", url="https://a/1.png"), _image_slot("B:1", url="https://b/1.png")]
+    resolutions = [
+        VisionResolution(slot_id="A:1", status="retryable_error", retry_after_ts=1100.0),
+        VisionResolution(slot_id="B:1", status="ready", description="一只猫", content_hash="abc"),
+    ]
+    updated = svc.apply_resolutions_to_slots(slots, resolutions)
+    assert updated[0].status == "retryable_error"
+    assert updated[0].description == ""
+    assert updated[1].status == "ready"
+    assert updated[1].description == "一只猫"
+    assert updated[1].content_hash == "abc"
+    # 成功后释放 source
+    assert updated[1].url == ""
+
+
+def test_slot_to_dict_roundtrip() -> None:
+    svc = _make_skill()
+    slot = _image_slot("x:1", url="https://a/1.png", file_id="f1")
+    d = slot.to_dict()
+    assert d["slot_id"] == "x:1"
+    assert d["status"] == "unresolved"
