@@ -27,6 +27,7 @@ from permsvc import PermService
 from handinsvc import HandinService
 from aisvc import AIService
 from daily_calendar import DailyCalendarService
+from vision_skill import VisionSkill
 
 log = Logger("bot", "INFO")
 
@@ -87,6 +88,7 @@ async def run_forever():
     perm = PermService(PERM_DB_PATH)
     handin = HandinService(log)
     aisvc = AIService(log)
+    vision_skill = VisionSkill(log)
     calendar_service = DailyCalendarService(log, aisvc)
 
     if REBUILD_MATERIAL_SCAN_MARKS_ON_STARTUP:
@@ -195,17 +197,18 @@ async def run_forever():
                             conv_lock_last_used[key] = time.time()
                             try:
                                 await dispatch(
-                                    api,
-                                    ctx,
-                                    data,
-                                    text,
-                                    filesvc,
-                                    logsvc,
-                                    state,
-                                    handin,
-                                    perm,
-                                    aisvc,
-                                    calendar_service,
+                                    api=api,
+                                    ctx=ctx,
+                                    evt=data,
+                                    text=text,
+                                    filesvc=filesvc,
+                                    logsvc=logsvc,
+                                    state=state,
+                                    handin=handin,
+                                    perm=perm,
+                                    aisvc=aisvc,
+                                    vision_skill=vision_skill,
+                                    calendar_service=calendar_service,
                                 )
                             except Exception as e:
                                 log.exception(f"dispatch 异常: {e}")

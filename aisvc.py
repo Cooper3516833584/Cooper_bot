@@ -39,10 +39,6 @@ from config import (
     AI_SEARCH_MIN_SIMILARITY,
     AI_SYSTEM_PROMPT,
     AI_VECTORS_PATH,
-    AI_VISION_CACHE_DIR,
-    AI_VISION_CACHE_TTL_SECONDS,
-    AI_VISION_ENABLED,
-    AI_VISION_MAX_IMAGES,
     AI_WEB_SEARCH_ENABLED,
     AI_WEB_SEARCH_MODEL,
     BASE_DIR,
@@ -116,23 +112,6 @@ class AIService:
     _THINKING_DISABLED = {"type": "disabled"}
     _THINKING_ENABLED = {"type": "enabled"}
     _REASONING_EFFORT_HIGH = "high"
-    _VISION_DESCRIBE_PROMPT = (
-        "你是识图助手。\n"
-        "用户问题：{question}\n\n"
-        "请使用 read_file 工具依次读取以下图片文件：\n{paths}\n"
-        "然后：\n"
-        "1. 用简洁中文逐张描述图片内容（画面主体、文字、关键细节）。\n"
-        "2. 结合用户问题，给出对回答问题有用的信息；问题与图片无关时，客观描述图片即可。\n"
-        "3. 只允许读取上述图片文件，禁止读取或修改任何其他文件，禁止其他本地能力。\n"
-        "4. 某张图片无法读取时，明确说明是哪一张，不要编造内容。"
-    )
-    _VISION_IMAGE_HINT_PROMPT = (
-        "\n\n用户附带以下图片文件，请使用 read_file 工具查看这些图片（只允许读取这些文件）：\n{paths}"
-    )
-    _VISION_CACHE_MAX_ENTRIES_PER_SESSION = 20
-    _VISION_IMAGE_MAX_BYTES = 5 * 1024 * 1024
-    _VISION_DOWNLOAD_TIMEOUT_SECONDS = 15.0
-    _AGY_SETTINGS_REL = Path(".gemini") / "antigravity-cli" / "settings.json"
     _NOTICE_SILENT_TOKEN = "[静默]"
     _CHAT_AUTOMATION_BOUNDARY_PROMPT = (
         "# 自动服务边界\n"
@@ -141,6 +120,18 @@ class AIService:
         "如果用户发送 0、纯数字、Y/N、done 等看起来像业务流程控制的短回复，说明本该由业务功能流程已经结束，需要告知用户。你不得自行推断已经取消、覆盖、提交、归档、删除或发送文件。\n"
         "你应该如实说明：自己不能执行该自动操作，请以机器人业务功能实际返回的消息为准；如果没有业务回复，可以尝试提交重名文件覆盖。"
     )
+    _VISION_BOUNDARY_PROMPT = (
+        "# 视觉内容说明\n"
+        "历史消息中可能包含以 [视觉内容N] 开头的文本。\n"
+        "这些文本是外部视觉模型对用户图片、截图或表情包的描述，不是用户亲自输入的原文。\n"
+        "回答时可以使用这些描述理解图片，但如果描述中注明识别失败、文字模糊或无法确认，不得假装直接看到了图片，也不得补充描述之外的视觉细节。"
+    )
+    _BACKEND_HISTORY_LIMITS = {
+        "deepseek": 300,
+        "gemini": 100,
+        "claude": 100,
+    }
+    _VISION_PENDING_PLACEHOLDER = "[图片待识别]"
     _WEB_SEARCH_JUDGE_PROMPT = (
         "# 联网需求判定\n"
         "这是内部机制提示，请勿向用户提起。\n"
@@ -182,12 +173,6 @@ class AIService:
         self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_PRO_MODEL)
         self.web_search_enabled = bool(AI_WEB_SEARCH_ENABLED)
         self.web_search_model = str(AI_WEB_SEARCH_MODEL or self._DEEPSEEK_V4_FLASH_MODEL)
-        self.vision_enabled = bool(AI_VISION_ENABLED)
-        self.vision_cache_dir = Path(AI_VISION_CACHE_DIR)
-        self.vision_max_images = max(1, int(AI_VISION_MAX_IMAGES))
-        self.vision_cache_ttl = max(30.0, float(AI_VISION_CACHE_TTL_SECONDS))
-        self._recent_images_lock = threading.RLock()
-        self._recent_images: Dict[str, List[dict]] = {}
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
         self.gemini_cli_path = str(AI_GEMINI_CLI_PATH or "").strip()
         self.gemini_model = str(AI_GEMINI_MODEL or "").strip()
@@ -211,6 +196,10 @@ class AIService:
         self._lock = threading.RLock()
         self._chat_sessions_lock = threading.RLock()
         self._chat_sessions: Dict[str, Dict[str, object]] = {}
+        self._pending_vision_lock = threading.RLock()
+        self._pending_vision: Dict[str, List[dict]] = {}
+        self._msg_images_lock = threading.RLock()
+        self._msg_images: Dict[str, dict] = {}
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
         self._semantic_entry_by_rel: Dict[str, Tuple[dict, np.ndarray]] = {}
@@ -248,11 +237,16 @@ class AIService:
     def _append_chat_automation_boundary(self, system_prompt: str) -> str:
         prompt = str(system_prompt or "").strip()
         boundary = self._CHAT_AUTOMATION_BOUNDARY_PROMPT.strip()
+        vision_boundary = self._VISION_BOUNDARY_PROMPT.strip()
         if not prompt:
-            return boundary
-        if boundary in prompt:
-            return prompt
-        return f"{prompt}\n\n{boundary}"
+            out = boundary
+        elif boundary in prompt:
+            out = prompt
+        else:
+            out = f"{prompt}\n\n{boundary}"
+        if vision_boundary and vision_boundary not in out:
+            out = f"{out}\n\n{vision_boundary}"
+        return out
 
     def _get_deepseek_sdk_base_url(self) -> str:
         return (self.deepseek_base_url or "https://api.deepseek.com").rstrip("/")
@@ -332,32 +326,20 @@ class AIService:
     async def chat(self, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_sync, user_input)
 
-    async def chat_with_context(self, session_key: str, user_input: str, image_paths: Optional[List[str]] = None) -> str:
-        return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input, image_paths)
+    async def chat_with_context(self, session_key: str, user_input: str) -> str:
+        return await asyncio.to_thread(self._chat_with_context_sync, session_key, user_input)
 
     async def gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
         return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key)
 
-    async def gemini_chat_with_context(
-        self,
-        session_key: str,
-        user_input: str,
-        model_key: Optional[str] = None,
-        image_paths: Optional[List[str]] = None,
-    ) -> str:
-        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, image_paths)
+    async def gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
+        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key)
 
     async def restricted_gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
         return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key, True)
 
-    async def restricted_gemini_chat_with_context(
-        self,
-        session_key: str,
-        user_input: str,
-        model_key: Optional[str] = None,
-        image_paths: Optional[List[str]] = None,
-    ) -> str:
-        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, True, image_paths)
+    async def restricted_gemini_chat_with_context(self, session_key: str, user_input: str, model_key: Optional[str] = None) -> str:
+        return await asyncio.to_thread(self._gemini_chat_with_context_sync, session_key, user_input, model_key, True)
 
     async def restricted_gemini_calendar_chat(
         self,
@@ -415,12 +397,21 @@ class AIService:
                 return [str(node_path), str(js_path)]
         return [str(cli_path)]
 
+    def _history_limit_for_backend(self, backend: str) -> int:
+        key = str(backend or "").strip().lower()
+        return max(
+            1,
+            int(self._BACKEND_HISTORY_LIMITS.get(key, self._CHAT_CONTEXT_MAX_MESSAGES)),
+        )
+
+    def _select_history_for_backend(self, history: List[Dict[str, str]], backend: str) -> List[Dict[str, str]]:
+        limit = self._history_limit_for_backend(backend)
+        if len(history) <= limit:
+            return list(history)
+        return list(history[-limit:])
+
     def _trim_gemini_history(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        out = list(messages or [])
-        max_messages = max(1, int(self._GEMINI_CHAT_CONTEXT_MAX_MESSAGES))
-        if len(out) > max_messages:
-            out = out[-max_messages:]
-        return out
+        return self._select_history_for_backend(list(messages or []), "gemini")
 
     def _format_gemini_cli_history(self, history: List[Dict[str, str]]) -> str:
         lines: List[str] = []
@@ -441,7 +432,6 @@ class AIService:
         system_prompt: str,
         history: List[Dict[str, str]],
         user_input: str,
-        image_paths: Optional[List[str]] = None,
     ) -> str:
         content = str(user_input or "").strip()
         if not content:
@@ -458,37 +448,25 @@ class AIService:
             )
         sections.append("Use google_web_search before answering the latest user request.")
         sections.append("Latest user request:\n" + content)
-        prompt = "\n\n".join(sections).strip()
-        return self._append_vision_image_hint(prompt, image_paths)
+        return "\n\n".join(sections).strip()
 
     def _build_restricted_gemini_cli_prompt(
         self,
         system_prompt: str,
         history: List[Dict[str, str]],
         user_input: str,
-        image_paths: Optional[List[str]] = None,
     ) -> str:
         content = str(user_input or "").strip()
         if not content:
             return ""
-        has_images = bool(image_paths)
         base = (
             "Security policy for this QQ bot request:\n"
             "- You may answer the user and, when current/public information is needed, use google_web_search only.\n"
-            + (
-                "- You may additionally use read_file ONLY for the user-provided image files listed below.\n"
-                if has_images
-                else ""
-            )
-            + (
-                "- Do not use any local-computer capability: no read_file, read_many_files, list_directory, glob, grep_search, write_file, replace, run_shell_command, ask_user, save_memory, activate_skill, or MCP/local tools.\n"
-                if not has_images
-                else "- Do not use any other local-computer capability: no read_many_files, list_directory, glob, grep_search, write_file, replace, run_shell_command, ask_user, save_memory, activate_skill, or MCP/local tools.\n"
-            )
-            + "- Do not inspect, modify, execute, or summarize files, folders, processes, environment variables, shell output, browser state, or credentials on this computer.\n"
-            + "- If the request cannot be answered with normal model knowledge plus public web search, say you can only help with联网搜索获取信息.\n\n"
+            "- Do not use any local-computer capability: no read_file, read_many_files, list_directory, glob, grep_search, write_file, replace, run_shell_command, ask_user, save_memory, activate_skill, or MCP/local tools.\n"
+            "- Do not inspect, modify, execute, or summarize files, folders, processes, environment variables, shell output, browser state, or credentials on this computer.\n"
+            "- If the request cannot be answered with normal model knowledge plus public web search, say you can only help with联网搜索获取信息.\n\n"
         )
-        prompt = self._build_gemini_cli_prompt(system_prompt, history, content, image_paths)
+        prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
         return base + prompt
 
     @staticmethod
@@ -2414,7 +2392,6 @@ class AIService:
     def _bootstrap_quick_sync_sync(self) -> None:
         self.material_dir.mkdir(parents=True, exist_ok=True)
         self._load_api_config()
-        self._ensure_agy_vision_allow_rule()
 
         self.log.info("AI 启动阶段：加载缓存索引/元数据/向量")
         index_by_rel, metadata_by_rel, vector_by_rel = self._load_incremental_store_maps()
@@ -2865,12 +2842,21 @@ class AIService:
         if self.web_search_enabled:
             query = self._parse_web_search_marker(text)
             if query:
-                material = self._web_search_fetch_sources_sync(query)
-                text = self._web_search_compose_final_sync(
-                    self._append_web_search_judge(self._append_chat_automation_boundary(self.system_prompt)),
-                    content,
-                    material,
-                )
+                try:
+                    material = self._web_search_fetch_sources_sync(query)
+                    text = self._web_search_compose_final_sync(
+                        self._append_web_search_judge(self._append_chat_automation_boundary(self.system_prompt)),
+                        content,
+                        material,
+                    )
+                except Exception as e:
+                    self.log.warning(f"AI web search failed, fallback to plain chat: err={e}")
+                    text = self._web_search_fallback_chat_sync(
+                        [
+                            {"role": "system", "content": self._append_chat_automation_boundary(self.system_prompt)},
+                            {"role": "user", "content": content},
+                        ]
+                    )
         if not text:
             raise RuntimeError("empty chat response")
         return text
@@ -2909,7 +2895,7 @@ class AIService:
         prompt = self._build_gemini_cli_prompt(system_prompt, [], content)
         return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
-    def _chat_with_context_sync(self, session_key: str, user_input: str, image_paths: Optional[List[str]] = None) -> str:
+    def _chat_with_context_sync(self, session_key: str, user_input: str) -> str:
         if not self.chat_ready:
             raise RuntimeError("chat not ready")
 
@@ -2922,17 +2908,11 @@ class AIService:
             return self._chat_sync(content)
 
         raw_content = content
-        if self.vision_enabled and image_paths:
-            try:
-                desc = self._describe_images_via_gemini_sync(image_paths, raw_content)
-                if desc:
-                    content = f"【附带图片描述】\n{desc}\n\n用户问题：{raw_content}"
-            except Exception as e:
-                self.log.warning(f"AI vision describe failed, chat without image context: err={e}")
 
         history: List[Dict[str, str]] = []
         try:
             history = self._load_active_chat_history(key)
+            history = self._select_history_for_backend(history, "deepseek")
         except Exception as e:
             self.log.warning(f"AI chat context read failed, fallback to stateless: session={key[:80]} err={e}")
             history = []
@@ -2951,8 +2931,21 @@ class AIService:
         if self.web_search_enabled:
             query = self._parse_web_search_marker(text)
             if query:
-                material = self._web_search_fetch_sources_sync(query)
-                text = self._web_search_compose_final_sync(system_prompt, raw_content, material)
+                try:
+                    material = self._web_search_fetch_sources_sync(query)
+                    text = self._web_search_compose_final_sync(system_prompt, raw_content, material)
+                except Exception as e:
+                    self.log.warning(f"AI web search failed, fallback to plain chat: err={e}")
+                    plain_system = self._append_chat_automation_boundary(
+                        self._select_chat_system_prompt(key) or self.system_prompt
+                    )
+                    text = self._web_search_fallback_chat_sync(
+                        [
+                            {"role": "system", "content": plain_system},
+                            *history,
+                            {"role": "user", "content": raw_content},
+                        ]
+                    )
         if not text:
             raise RuntimeError("empty chat response")
 
@@ -3077,142 +3070,29 @@ class AIService:
             raise RuntimeError("empty web search final response")
         return text
 
-    def record_recent_images(self, session_key: str, images: List[dict]) -> None:
-        """按会话缓存最近消息里的图片（事件驱动，供后续 aichat 识图使用）。"""
-        key = str(session_key or "").strip()
-        if not key or not images:
-            return
-        now_ts = float(time.time())
-        cutoff = now_ts - float(self.vision_cache_ttl)
-        with self._recent_images_lock:
-            cached = self._recent_images.get(key) or []
-            cached = [x for x in cached if isinstance(x, dict) and float(x.get("ts") or 0.0) >= cutoff]
-            for img in images:
-                cached.append(
-                    {
-                        "ts": now_ts,
-                        "file": str(img.get("file") or "").strip(),
-                        "url": str(img.get("url") or "").strip(),
-                    }
-                )
-            cached = cached[-int(self._VISION_CACHE_MAX_ENTRIES_PER_SESSION):]
-            self._recent_images[key] = cached
+    @staticmethod
+    def _strip_web_search_marker(text: str) -> str:
+        """从回复中删除 [WEB_SEARCH] 标记行，避免内部标记泄漏给用户。"""
+        s = re.sub(r"\[WEB_SEARCH\][^\n]*", "", str(text or ""))
+        s = re.sub(r"\n{2,}", "\n", s)
+        return s.strip()
 
-    def _load_recent_images(self, session_key: str, now_ts: Optional[float] = None) -> List[dict]:
-        """读取会话最近缓存图片（TTL 过滤，返回 {file,url} 列表）。"""
-        key = str(session_key or "").strip()
-        if not key:
-            return []
-        use_ts = float(now_ts if now_ts is not None else time.time())
-        cutoff = use_ts - float(self.vision_cache_ttl)
-        with self._recent_images_lock:
-            cached = self._recent_images.get(key) or []
-        out: List[dict] = []
-        for x in cached:
-            if not isinstance(x, dict):
-                continue
-            try:
-                ts = float(x.get("ts") or 0.0)
-            except Exception:
-                ts = 0.0
-            if ts < cutoff:
-                continue
-            out.append({"file": str(x.get("file") or "").strip(), "url": str(x.get("url") or "").strip()})
-        return out
-
-    def _agy_settings_path(self) -> Path:
-        return Path.home() / self._AGY_SETTINGS_REL
-
-    def _ensure_agy_vision_allow_rule(self) -> bool:
-        """幂等写入 agy settings.json 的 permissions.allow 规则：read_file(<vision_cache_dir>/**)。"""
-        if not self.vision_enabled:
-            return False
-        try:
-            self.vision_cache_dir.mkdir(parents=True, exist_ok=True)
-            settings_path = self._agy_settings_path()
-            if not settings_path.is_file():
-                self.log.warning("AI vision: agy settings.json 不存在，跳过识图权限配置")
-                return False
-            try:
-                obj = json.loads(settings_path.read_text(encoding="utf-8"))
-            except Exception:
-                obj = {}
-            if not isinstance(obj, dict):
-                obj = {}
-            rule = "read_file({})".format(str(self.vision_cache_dir.resolve() / "**"))
-            perms = obj.get("permissions")
-            if not isinstance(perms, dict):
-                perms = {}
-                obj["permissions"] = perms
-            allow = perms.get("allow")
-            if not isinstance(allow, list):
-                allow = []
-                perms["allow"] = allow
-            if rule in allow:
-                return True
-            allow.append(rule)
-            settings_path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.log.info(f"AI vision: 已写入 agy 识图允许规则 {rule}")
-            return True
-        except Exception as e:
-            self.log.warning(f"AI vision: settings.json 权限写入失败: {e}")
-            return False
-
-    def _vision_cache_save_path(self, url: str, file_id: str) -> Path:
-        self.vision_cache_dir.mkdir(parents=True, exist_ok=True)
-        seed = str(url or "") or str(file_id or "")
-        digest = hashlib.md5(seed.encode("utf-8", errors="ignore")).hexdigest()[:12]
-        ext = ""
-        m = re.search(r"\.(jpg|jpeg|png|gif|webp|bmp)(?:\?|$)", str(url or "").lower())
-        if m:
-            ext = f".{m.group(1)}"
-        return self.vision_cache_dir / f"{int(time.time() * 1000)}_{digest}{ext or '.img'}"
-
-    def _download_image_sync(
-        self,
-        url: str,
-        save_path: Path,
-        max_bytes: Optional[int] = None,
-        timeout: Optional[float] = None,
-    ) -> bool:
-        """下载图片到本地；失败或超限返回 False。"""
-        u = str(url or "").strip()
-        if not u:
-            return False
-        limit = int(max_bytes if max_bytes is not None else self._VISION_IMAGE_MAX_BYTES)
-        try:
-            req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=float(timeout if timeout is not None else self._VISION_DOWNLOAD_TIMEOUT_SECONDS)) as resp:
-                data = resp.read(limit + 1)
-            if len(data) > limit:
-                return False
-            if not data:
-                return False
-            Path(save_path).write_bytes(data)
-            return True
-        except Exception:
-            return False
-
-    def _build_vision_describe_prompt(self, image_paths: List[str], user_question: str) -> str:
-        paths_txt = "\n".join(f"- {p}" for p in image_paths)
-        return self._VISION_DESCRIBE_PROMPT.format(question=str(user_question or "").strip(), paths=paths_txt)
-
-    def _describe_images_via_gemini_sync(self, image_paths: List[str], user_question: str) -> str:
-        """用 agy（Gemini 模型）读取图片并输出文本描述，供 DeepSeek 等纯文本模型使用。"""
-        paths = [str(p) for p in (image_paths or []) if str(p).strip()]
-        if not paths:
-            return ""
-        if not self.gemini_chat_ready:
-            raise RuntimeError("gemini chat not ready")
-        prompt = self._build_vision_describe_prompt(paths, user_question)
-        return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(None), restricted=True)
-
-    def _append_vision_image_hint(self, prompt: str, image_paths: List[str]) -> str:
-        paths = [str(p) for p in (image_paths or []) if str(p).strip()]
-        if not paths:
-            return str(prompt or "")
-        paths_txt = "\n".join(f"- {p}" for p in paths)
-        return f"{str(prompt or '').strip()}\n{self._VISION_IMAGE_HINT_PROMPT.format(paths=paths_txt)}"
+    def _web_search_fallback_chat_sync(self, messages: List[dict]) -> str:
+        """联网失效时用不含联网判定指令的 prompt 重新请求 v4-pro，按普通模式回答。"""
+        payload = self._build_chat_payload(
+            list(messages),
+            self._CHAT_TEMPERATURE,
+            enable_thinking=True,
+        )
+        url = self._join_url(self.deepseek_base_url, "chat/completions")
+        data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
+        text = self._extract_chat_text(data)
+        query = self._parse_web_search_marker(text)
+        if query:
+            text = self._strip_web_search_marker(text)
+        if not text:
+            raise RuntimeError("empty chat response")
+        return text
 
     def _gemini_chat_with_context_sync(
         self,
@@ -3220,7 +3100,6 @@ class AIService:
         user_input: str,
         model_key: Optional[str] = None,
         restricted: bool = False,
-        image_paths: Optional[List[str]] = None,
     ) -> str:
         if not self.gemini_chat_ready:
             raise RuntimeError("gemini chat not ready")
@@ -3235,16 +3114,23 @@ class AIService:
 
         try:
             history = self._load_active_chat_history(key)
+            backend_key = (
+                "claude"
+                if str(model_key or "").strip().lower()
+                in {"claude", "opus", "opus4.6", "claude-opus"}
+                else "gemini"
+            )
+            history = self._select_history_for_backend(history, backend_key)
         except Exception as e:
             self.log.warning(f"AI chat context read failed, fallback to stateless gemini: session={key[:80]} err={e}")
             history = []
 
         system_prompt = self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
         if restricted:
-            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, history, content, image_paths)
+            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, history, content)
             text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
         else:
-            prompt = self._build_gemini_cli_prompt(system_prompt, history, content, image_paths)
+            prompt = self._build_gemini_cli_prompt(system_prompt, history, content)
             text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
 
         try:
@@ -3362,6 +3248,147 @@ class AIService:
                 self.log.warning(f"AI chat context invalid after append, reset to current turn: session={key[:80]}")
             self._chat_sessions[key] = {"messages": checked, "last_active_ts": now_ts}
 
+    def record_pending_vision(self, session_key: str, images: List[dict]) -> None:
+        """记录会话内待识别的图片源（不调视觉 API），供回复时统一解析。
+
+        队列只按 TTL（与聊天上下文一致）过期清理，不设条数上限——实际有多少图就记多少。
+        """
+        key = str(session_key or "").strip()
+        if not key or not images:
+            return
+        now_ts = float(time.time())
+        cutoff = now_ts - float(self._CHAT_CONTEXT_TTL_SECONDS)
+        with self._pending_vision_lock:
+            cached = self._pending_vision.get(key) or []
+            cached = [x for x in cached if isinstance(x, dict) and float(x.get("ts") or 0.0) >= cutoff]
+            for img in images:
+                cached.append(
+                    {
+                        "ts": now_ts,
+                        "url": str(img.get("url") or "").strip(),
+                        "file_id": str(img.get("file_id") or "").strip(),
+                    }
+                )
+            self._pending_vision[key] = cached
+
+    def _load_pending_vision(self, session_key: str, now_ts: Optional[float] = None) -> List[dict]:
+        """读取会话内待识别图片（TTL 过滤，返回 {url,file_id} 列表）。"""
+        key = str(session_key or "").strip()
+        if not key:
+            return []
+        use_ts = float(now_ts if now_ts is not None else time.time())
+        cutoff = use_ts - float(self._CHAT_CONTEXT_TTL_SECONDS)
+        with self._pending_vision_lock:
+            cached = self._pending_vision.get(key) or []
+        out: List[dict] = []
+        for x in cached:
+            if not isinstance(x, dict):
+                continue
+            try:
+                ts = float(x.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts < cutoff:
+                continue
+            out.append({"url": str(x.get("url") or "").strip(), "file_id": str(x.get("file_id") or "").strip()})
+        return out
+
+    def clear_pending_vision(self, session_key: str) -> None:
+        key = str(session_key or "").strip()
+        if not key:
+            return
+        with self._pending_vision_lock:
+            self._pending_vision.pop(key, None)
+
+    def record_msg_images(self, msg_id: str, images: List[dict]) -> None:
+        """按消息 id 记录图片，供后续引用（reply）该消息时提取图片。"""
+        key = str(msg_id or "").strip()
+        if not key or not images:
+            return
+        now_ts = float(time.time())
+        with self._msg_images_lock:
+            self._msg_images[key] = {
+                "ts": now_ts,
+                "images": [
+                    {"url": str(img.get("url") or "").strip(), "file_id": str(img.get("file_id") or "").strip()}
+                    for img in images
+                ],
+            }
+            cutoff = now_ts - float(self._CHAT_CONTEXT_TTL_SECONDS)
+            stale = [k for k, v in self._msg_images.items() if not isinstance(v, dict) or float(v.get("ts") or 0.0) < cutoff]
+            for k in stale:
+                self._msg_images.pop(k, None)
+            # 防御性上限：远超正常聊天量时才淘汰最旧
+            while len(self._msg_images) > 500:
+                oldest = min(self._msg_images, key=lambda k: float(self._msg_images[k].get("ts") or 0.0))
+                self._msg_images.pop(oldest, None)
+
+    def _lookup_msg_images(self, msg_id: str, now_ts: Optional[float] = None) -> List[dict]:
+        """按消息 id 查图片（TTL 过滤），返回 {url,file_id} 列表。"""
+        key = str(msg_id or "").strip()
+        if not key:
+            return []
+        use_ts = float(now_ts if now_ts is not None else time.time())
+        cutoff = use_ts - float(self._CHAT_CONTEXT_TTL_SECONDS)
+        with self._msg_images_lock:
+            entry = self._msg_images.get(key)
+            if not isinstance(entry, dict):
+                return []
+            try:
+                ts = float(entry.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts < cutoff:
+                self._msg_images.pop(key, None)
+                return []
+            images = entry.get("images")
+            if not isinstance(images, list):
+                return []
+            return [
+                {"url": str(x.get("url") or "").strip(), "file_id": str(x.get("file_id") or "").strip()}
+                for x in images
+                if isinstance(x, dict)
+            ]
+
+    def apply_vision_descriptions_to_history(
+        self,
+        session_key: str,
+        descriptions: List[str],
+    ) -> int:
+        """把会话历史消息中的 [图片待识别] 占位按顺序替换为 [视觉内容N] 描述。
+
+        返回未被消费（历史中无占位可填）的描述数量。
+        """
+        key = str(session_key or "").strip()
+        descs = [str(d or "").strip() for d in (descriptions or []) if str(d or "").strip()]
+        if not key or not descs:
+            return len(descs)
+        placeholder = self._VISION_PENDING_PLACEHOLDER
+        consumed = 0
+        with self._chat_sessions_lock:
+            entry = self._chat_sessions.get(key)
+            if isinstance(entry, dict):
+                messages = entry.get("messages")
+                if isinstance(messages, list):
+                    new_messages: List[Dict[str, str]] = []
+                    for m in messages:
+                        if not isinstance(m, dict):
+                            new_messages.append(m)
+                            continue
+                        content = str(m.get("content") or "")
+                        if consumed < len(descs) and placeholder in content:
+                            content = content.replace(
+                                placeholder,
+                                f"[视觉内容{consumed + 1}] {descs[consumed]}",
+                                1,
+                            )
+                            consumed += 1
+                            new_messages.append({**m, "content": content})
+                            continue
+                        new_messages.append(m)
+                    entry["messages"] = new_messages
+        return max(0, len(descs) - consumed)
+
     def _extract_notice_file_head_sync(self, path: Path, max_chars: int = 4000, max_pages: int = 6) -> str:
         p = Path(path)
         if (not p.exists()) or (not p.is_file()):
@@ -3384,6 +3411,8 @@ class AIService:
             return self._read_doc_head(p, max_chars=max_chars)
         if suffix == ".docx":
             return self._read_docx_head(p, max_chars=max_chars)
+        if suffix in {".md", ".markdown"}:
+            return self._read_md_head(p, max_chars=max_chars)
         return ""
 
     @staticmethod
@@ -4541,6 +4570,18 @@ class AIService:
         s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
+
+    def _read_md_head(self, path: Path, max_chars: int = 2000) -> str:
+        try:
+            raw = Path(path).read_bytes()
+        except Exception as e:
+            self.log.warning(f"AI 索引：读取 MD 失败 {path.name}: {e}")
+            return ""
+        if not raw:
+            return ""
+        raw = raw[: 4 * 1024 * 1024]
+        txt = self._cleanup_extracted_text(raw.decode("utf-8", errors="replace"))
+        return txt[:max_chars]
 
     def _read_doc_head(self, path: Path, max_chars: int = 2000) -> str:
         antiword_path = shutil.which("antiword")

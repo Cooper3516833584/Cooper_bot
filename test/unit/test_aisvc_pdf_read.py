@@ -77,3 +77,34 @@ def test_read_pdf_head_logs_warning_and_returns_empty_on_reader_failure(monkeypa
     out = svc._read_pdf_head(pdf_path, max_pages=3, max_chars=20)
     assert out == ""
     assert any("broken.pdf" in msg for msg in log.warnings)
+
+
+def test_extract_notice_file_head_reads_md(tmp_path) -> None:
+    svc = _new_service()
+    md_path = tmp_path / "notes.md"
+    md_path.write_text(
+        "# 期中考试安排\n\n- 时间：下周一 14:00\n- 地点：A101\n\n**请带学生证**",
+        encoding="utf-8",
+    )
+
+    out = svc._extract_notice_file_head_sync(md_path, max_chars=4000)
+    assert "期中考试安排" in out
+    assert "A101" in out
+    assert "学生证" in out
+
+    clipped = svc._extract_notice_file_head_sync(md_path, max_chars=10)
+    assert len(clipped) <= 10
+
+
+def test_extract_notice_file_head_reads_markdown_extension(tmp_path) -> None:
+    svc = _new_service()
+    md_path = tmp_path / "README.markdown"
+    md_path.write_text("## 使用说明\n\n详情见文档。", encoding="utf-8")
+    out = svc._extract_notice_file_head_sync(md_path, max_chars=200)
+    assert "使用说明" in out
+
+
+def test_extract_notice_file_head_md_missing_file_returns_empty(tmp_path) -> None:
+    svc = _new_service()
+    assert svc._extract_notice_file_head_sync(tmp_path / "nope.md", max_chars=200) == ""
+    assert svc._extract_notice_file_head_sync(tmp_path / "nope.xyz", max_chars=200) == ""

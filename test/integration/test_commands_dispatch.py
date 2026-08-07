@@ -442,7 +442,7 @@ async def test_dispatch_unknown_private_slash_command_reaches_aichat(dispatch_ha
         aisvc=aisvc,
     )
 
-    aisvc.chat_with_context.assert_awaited_once_with(f"private:{ctx.user_id}", "/fnd 高数", [])
+    aisvc.chat_with_context.assert_awaited_once_with(f"private:{ctx.user_id}", "/fnd 高数")
     assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
     assert not any("未知命令" in one["text"] for one in dispatch_harness.messages)
 

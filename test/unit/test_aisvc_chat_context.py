@@ -333,19 +333,106 @@ def test_chat_with_context_web_search_disabled(monkeypatch, controlled_time) -> 
     assert len(payloads) == 1
 
 
-def test_chat_with_context_web_search_no_sources_raises(monkeypatch, controlled_time) -> None:
+def test_chat_with_context_web_search_no_sources_falls_back(monkeypatch, controlled_time) -> None:
     svc = _new_service()
-    calls: list[str] = []
+    calls: list[dict[str, Any]] = []
 
     def _fake_post_json(url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
-        _ = payload, timeout
-        calls.append(url)
+        _ = timeout
+        calls.append({"url": url, "payload": payload})
         if url.endswith("/responses"):
             return {"output": [{"type": "web_search_call", "status": "completed"}]}
-        return {"choices": [{"message": {"content": "[WEB_SEARCH]某查询"}}]}
+        n = len([c for c in calls if c["url"].endswith("/chat/completions")])
+        if n == 1:
+            return {"choices": [{"message": {"content": "[WEB_SEARCH]某查询"}}]}
+        return {"choices": [{"message": {"content": "无素材回退回答"}}]}
 
     monkeypatch.setattr(svc, "_post_json", _fake_post_json)
 
-    with pytest.raises(RuntimeError, match="web search returned no usable sources"):
-        svc._chat_with_context_sync("private:10003", "查新闻")
-    assert len(calls) == 2
+    out = svc._chat_with_context_sync("private:10003", "查新闻")
+    assert out == "无素材回退回答"
+    assert len(calls) == 3  # 判定 + responses 搜索(无素材) + 回退
+
+
+def test_strip_web_search_marker() -> None:
+    svc = _new_service()
+    assert svc._strip_web_search_marker("[WEB_SEARCH]北京天气") == ""
+    assert svc._strip_web_search_marker("说明\n[WEB_SEARCH]查询词\n剩余") == "说明\n剩余"
+    assert svc._strip_web_search_marker("普通文本") == "普通文本"
+
+
+def test_chat_with_context_web_search_failure_falls_back_to_plain(monkeypatch, controlled_time) -> None:
+    svc = _new_service()
+    calls: list[dict[str, Any]] = []
+
+    def _fake_post_json(url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = timeout
+        calls.append({"url": url, "payload": payload})
+        n = len([c for c in calls if c["url"].endswith("/chat/completions")])
+        if n == 1:
+            return {"choices": [{"message": {"content": "[WEB_SEARCH]北京今天天气"}}]}
+        return {"choices": [{"message": {"content": "普通回答"}}]}
+
+    def _boom(_query: str) -> str:
+        raise RuntimeError("v4-flash search failed")
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+    monkeypatch.setattr(svc, "_web_search_fetch_sources_sync", _boom)
+
+    out = svc._chat_with_context_sync("private:10001", "北京今天天气？")
+    assert out == "普通回答"
+
+    chat_calls = [c for c in calls if c["url"].endswith("/chat/completions")]
+    assert len(chat_calls) == 2
+    # 回退调用不带联网判定指令，避免再次输出标记
+    assert "联网需求判定" not in str(chat_calls[1]["payload"]["messages"][0]["content"])
+
+    history = svc._load_active_chat_history("private:10001")
+    assert history[0] == {"role": "user", "content": "北京今天天气？"}
+
+
+def test_chat_sync_web_search_failure_falls_back_to_plain(monkeypatch) -> None:
+    svc = _new_service()
+    calls: list[dict[str, Any]] = []
+
+    def _fake_post_json(url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = timeout
+        calls.append({"url": url, "payload": payload})
+        n = len([c for c in calls if c["url"].endswith("/chat/completions")])
+        if n == 1:
+            return {"choices": [{"message": {"content": "[WEB_SEARCH]北京天气"}}]}
+        return {"choices": [{"message": {"content": "stateless 普通回答"}}]}
+
+    def _boom(_query: str) -> str:
+        raise RuntimeError("search failed")
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+    monkeypatch.setattr(svc, "_web_search_fetch_sources_sync", _boom)
+
+    out = svc._chat_sync("北京天气？")
+    assert out == "stateless 普通回答"
+    chat_calls = [c for c in calls if c["url"].endswith("/chat/completions")]
+    assert len(chat_calls) == 2
+
+
+def test_web_search_fallback_strips_stray_marker(monkeypatch, controlled_time) -> None:
+    svc = _new_service()
+    calls: list[dict[str, Any]] = []
+
+    def _fake_post_json(url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
+        _ = timeout
+        calls.append({"url": url, "payload": payload})
+        n = len([c for c in calls if c["url"].endswith("/chat/completions")])
+        if n == 1:
+            return {"choices": [{"message": {"content": "[WEB_SEARCH]某查询"}}]}
+        return {"choices": [{"message": {"content": "[WEB_SEARCH]残留标记\n实际上普通内容"}}]}
+
+    def _boom(_query: str) -> str:
+        raise RuntimeError("search failed")
+
+    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+    monkeypatch.setattr(svc, "_web_search_fetch_sources_sync", _boom)
+
+    out = svc._chat_with_context_sync("private:10002", "查一下")
+    assert "[WEB_SEARCH]" not in out
+    assert "实际上普通内容" in out

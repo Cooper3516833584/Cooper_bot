@@ -244,3 +244,11 @@ def test_extract_ai_chat_input_group_keeps_other_at_segment() -> None:
         bot_nick="Cooper_bot",
     )
     assert out == "ask @10001 about ta"
+
+
+def test_is_notice_file_name_accepts_md() -> None:
+    assert commands._is_notice_file_name("通知.md") is True
+    assert commands._is_notice_file_name("README.markdown") is True
+    assert commands._is_notice_file_name("资料.pdf") is True
+    assert commands._is_notice_file_name("图片.png") is False
+    assert commands._is_notice_file_name("") is False

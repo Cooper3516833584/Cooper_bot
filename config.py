@@ -211,10 +211,6 @@ AI_VECTORS_PATH = AI_MATERIAL_DIR / "file_vectors.npy"
 AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-pro")
 AI_WEB_SEARCH_ENABLED = _get_env("AI_WEB_SEARCH_ENABLED", "1") == "1"
 AI_WEB_SEARCH_MODEL = _get_env("AI_WEB_SEARCH_MODEL", "")
-AI_VISION_ENABLED = _get_env("AI_VISION_ENABLED", "0") == "1"
-AI_VISION_CACHE_DIR = _get_env_path("AI_VISION_CACHE_DIR", DATA_DIR / "_gemini_vision_cache")
-AI_VISION_MAX_IMAGES = int(_get_env("AI_VISION_MAX_IMAGES", "3") or "3")
-AI_VISION_CACHE_TTL_SECONDS = float(_get_env("AI_VISION_CACHE_TTL_SECONDS", "600") or "600")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
 AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "agy")
@@ -271,3 +267,38 @@ AI_SYSTEM_PROMPT = """# 核心角色与身份设定
 
 - 遇到你确实无法解决的技术故障，请回复：“哎呀，我的脑子好像卡壳了（API报错/网络波动），请稍后重试，或者@Cooper 检查一下我的后台服务器吧！🔌”
 """
+
+
+# ===== 视觉描述 Skill（VISION_*）=====
+# 视觉 API 配置优先从环境变量 / secrets.env 读取；
+# 未配置时兜底读取 api_key.txt 第 5、6 行（视觉 base url + key）。
+def _read_vision_config_from_api_key_txt() -> "tuple[str, str]":
+    try:
+        lines = [
+            x.strip()
+            for x in (BASE_DIR / "api_key.txt").read_text(encoding="utf-8").splitlines()
+            if x.strip()
+        ]
+        if len(lines) >= 6:
+            return lines[4].rstrip("/"), lines[5]
+    except Exception:
+        pass
+    return "", ""
+
+
+_VISION_BASE_URL_FROM_FILE, _VISION_API_KEY_FROM_FILE = _read_vision_config_from_api_key_txt()
+
+VISION_ENABLED = _get_env_bool("VISION_ENABLED", bool(_VISION_BASE_URL_FROM_FILE and _VISION_API_KEY_FROM_FILE))
+VISION_API_KEY = _get_env("VISION_API_KEY", _VISION_API_KEY_FROM_FILE)
+VISION_BASE_URL = _get_env("VISION_BASE_URL", _VISION_BASE_URL_FROM_FILE)
+VISION_MODEL = _get_env("VISION_MODEL", "qwen3.5-flash")
+VISION_TIMEOUT_SECONDS = float(_get_env("VISION_TIMEOUT_SECONDS", "20") or "20")
+VISION_MAX_IMAGES_PER_MESSAGE = int(_get_env("VISION_MAX_IMAGES_PER_MESSAGE", "3") or "3")
+VISION_MAX_IMAGE_BYTES = int(_get_env("VISION_MAX_IMAGE_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024))
+VISION_MAX_EDGE = int(_get_env("VISION_MAX_EDGE", "1024") or "1024")
+VISION_DESCRIPTION_MAX_CHARS = int(_get_env("VISION_DESCRIPTION_MAX_CHARS", "240") or "240")
+VISION_MAX_CONCURRENCY = int(_get_env("VISION_MAX_CONCURRENCY", "4") or "4")
+VISION_CACHE_MAX_ENTRIES = int(_get_env("VISION_CACHE_MAX_ENTRIES", "512") or "512")
+VISION_CACHE_TTL_SECONDS = float(_get_env("VISION_CACHE_TTL_SECONDS", "21600") or "21600")
+VISION_NEGATIVE_CACHE_TTL_SECONDS = float(_get_env("VISION_NEGATIVE_CACHE_TTL_SECONDS", "60") or "60")
+VISION_CAPTURE_CONTEXT_IMAGES = _get_env_bool("VISION_CAPTURE_CONTEXT_IMAGES", True)
