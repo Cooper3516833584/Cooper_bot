@@ -11,7 +11,7 @@ from typing import Any, Optional
 import pytest
 from PIL import Image
 
-from vision_skill import (
+from cooper_bot.modules.vision.vision_skill import (
     VisionResolution,
     VisionSkill,
     VisionSlot,

@@ -9,7 +9,7 @@ import time
 import threading
 import unicodedata
 
-from config import (
+from cooper_bot.core.config import (
     DOC_ROOTS,
     GROUP_DOCS_DIR,
     USER_DOCS_DIR,
@@ -22,6 +22,7 @@ from config import (
     FIND_MAX_SCAN,
     DATA_DIR,
     DATA_DIR_CONTAINER,
+    FIND_INDEX_PATH,
 )
 
 
@@ -201,7 +202,7 @@ class FileService:
     def __init__(self, log=None):
         self.log = log
         self.roots: List[Root] = [Root(n, Path(p), int(lv)) for (n, p, lv) in DOC_ROOTS]
-        self._find_index_path = Path(DATA_DIR) / self._FIND_INDEX_FILENAME
+        self._find_index_path = Path(FIND_INDEX_PATH)
         self._find_index_lock = threading.RLock()
         self._find_index_entries: List[dict] = []
         self._find_index_mtime_ns: int = 0

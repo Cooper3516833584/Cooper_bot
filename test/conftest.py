@@ -38,6 +38,10 @@ def _apply_path_patches(monkeypatch: pytest.MonkeyPatch, cfg: dict[str, Any]) ->
     config_map = {
         "BASE_DIR": cfg["project_root"],
         "DATA_DIR": cfg["data_dir"],
+        "FIND_INDEX_PATH": cfg["find_index_path"],
+        "AI_SEMANTIC_STORE_PATH": cfg["ai_semantic_store_path"],
+        "AI_MATERIAL_SCAN_MARKS_PATH": cfg["ai_material_scan_marks_path"],
+        "AI_MATERIAL_STATE_CACHE_PATH": cfg["ai_material_state_cache_path"],
         "LOG_DIR": cfg["log_dir"],
         "DOC_ROOTS": cfg["doc_roots"],
         "GROUP_DOCS_DIR": cfg["groups_dir"],
@@ -59,10 +63,10 @@ def _apply_path_patches(monkeypatch: pytest.MonkeyPatch, cfg: dict[str, Any]) ->
         "DEFAULT_LEVEL": 0,
     }
     for attr, value in config_map.items():
-        _patch_module_attr(monkeypatch, "config", attr, value, import_if_missing=True)
+        _patch_module_attr(monkeypatch, "cooper_bot.core.config", attr, value, import_if_missing=True)
 
     module_patch_map: dict[str, dict[str, Any]] = {
-        "filesvc": {
+        "cooper_bot.modules.files.filesvc": {
             "DOC_ROOTS": cfg["doc_roots"],
             "GROUP_DOCS_DIR": cfg["groups_dir"],
             "USER_DOCS_DIR": cfg["users_dir"],
@@ -70,8 +74,9 @@ def _apply_path_patches(monkeypatch: pytest.MonkeyPatch, cfg: dict[str, Any]) ->
             "UPLOAD_GROUP_HOST_DIR": cfg["upload_group_dir"],
             "UPLOAD_PRIVATE_HOST_DIR": cfg["upload_private_dir"],
             "DATA_DIR": cfg["data_dir"],
+            "FIND_INDEX_PATH": cfg["find_index_path"],
         },
-        "handinsvc": {
+        "cooper_bot.modules.handin.handinsvc": {
             "DATA_DIR": cfg["data_dir"],
             "GROUP_DOCS_DIR": cfg["groups_dir"],
             "USER_DOCS_DIR": cfg["users_dir"],
@@ -80,24 +85,27 @@ def _apply_path_patches(monkeypatch: pytest.MonkeyPatch, cfg: dict[str, Any]) ->
             "HANDIN_ROOT_DIR": cfg["handin_root_dir"],
             "ROSTER_XLSX_PATH": cfg["roster_xlsx_path"],
         },
-        "commands": {
+        "cooper_bot.commands.commands": {
             "DATA_DIR": cfg["data_dir"],
             "UPLOAD_GROUP_HOST_DIR": cfg["upload_group_dir"],
             "UPLOAD_PRIVATE_HOST_DIR": cfg["upload_private_dir"],
             "ADMIN_USERS": cfg["admin_users"],
         },
-        "router": {
+        "cooper_bot.core.router": {
             "ADMIN_USERS": cfg["admin_users"],
             "GROUP_LEVEL": {},
             "DEFAULT_LEVEL": 0,
         },
-        "aisvc": {
+        "cooper_bot.modules.ai.aisvc": {
             "BASE_DIR": cfg["project_root"],
             "AI_API_KEY_PATH": cfg["ai_api_key_path"],
             "AI_MATERIAL_DIR": cfg["ai_material_dir"],
             "AI_INDEX_PATH": cfg["ai_index_path"],
             "AI_METADATA_PATH": cfg["ai_metadata_path"],
             "AI_VECTORS_PATH": cfg["ai_vectors_path"],
+            "AI_SEMANTIC_STORE_PATH": cfg["ai_semantic_store_path"],
+            "AI_MATERIAL_SCAN_MARKS_PATH": cfg["ai_material_scan_marks_path"],
+            "AI_MATERIAL_STATE_CACHE_PATH": cfg["ai_material_state_cache_path"],
         },
     }
     for module_name, attr_map in module_patch_map.items():
@@ -119,17 +127,17 @@ def tmp_project_root() -> Path:
 
 @pytest.fixture
 def tmp_data_dirs(tmp_project_root: Path) -> dict[str, Path]:
-    data_dir = tmp_project_root / "data"
-    log_dir = tmp_project_root / "logs"
+    data_dir = tmp_project_root / "storage" / "documents"
+    log_dir = tmp_project_root / "runtime" / "logs"
     public_dir = data_dir / "public"
     friend_dir = data_dir / "friend"
     admin_dir = data_dir / "admin"
     groups_dir = data_dir / "groups"
     users_dir = data_dir / "users"
-    handin_root_dir = data_dir / "handin"
-    handin_inbox_dir = users_dir / "_handin_inbox"
-    upload_group_dir = tmp_project_root / "upload_group_file"
-    upload_private_dir = tmp_project_root / "upload_private_file"
+    handin_root_dir = tmp_project_root / "storage" / "submissions" / "handin"
+    handin_inbox_dir = tmp_project_root / "runtime" / "staging" / "handin"
+    upload_group_dir = tmp_project_root / "runtime" / "staging" / "group"
+    upload_private_dir = tmp_project_root / "runtime" / "staging" / "private"
     ai_material_dir = public_dir / "textbook_and_material"
 
     all_dirs = (
@@ -162,6 +170,7 @@ def tmp_data_dirs(tmp_project_root: Path) -> dict[str, Path]:
         "upload_group_dir": upload_group_dir,
         "upload_private_dir": upload_private_dir,
         "ai_material_dir": ai_material_dir,
+        "find_index_path": tmp_project_root / "runtime" / "databases" / "file_search" / "find_index.json",
     }
 
 
@@ -189,12 +198,16 @@ def test_config(
         "upload_group_dir": tmp_data_dirs["upload_group_dir"],
         "upload_private_dir": tmp_data_dirs["upload_private_dir"],
         "ai_material_dir": tmp_data_dirs["ai_material_dir"],
+        "find_index_path": tmp_data_dirs["find_index_path"],
+        "ai_semantic_store_path": tmp_project_root / "runtime" / "databases" / "ai" / "semantic_store.sqlite3",
+        "ai_material_scan_marks_path": tmp_project_root / "runtime" / "state" / "ai" / "material_scan_marks.json",
+        "ai_material_state_cache_path": tmp_project_root / "runtime" / "state" / "ai" / "material_state_cache.json",
         "ai_index_path": tmp_data_dirs["ai_material_dir"] / "all_files_index.json",
         "ai_metadata_path": tmp_data_dirs["ai_material_dir"] / "file_metadata.json",
         "ai_vectors_path": tmp_data_dirs["ai_material_dir"] / "file_vectors.npy",
         "ai_api_key_path": tmp_project_root / "api_key.txt",
-        "perm_db_path": tmp_data_dirs["users_dir"] / "_perm_levels.json",
-        "handin_db_path": tmp_data_dirs["data_dir"] / "_handin_tasks.json",
+        "perm_db_path": tmp_project_root / "runtime" / "databases" / "permissions" / "levels.json",
+        "handin_db_path": tmp_project_root / "runtime" / "databases" / "handin" / "tasks.json",
         "roster_xlsx_path": tmp_data_dirs["friend_dir"] / "class_roster.xlsx",
         "admin_users": {admin_user_id},
         "admin_user_id": admin_user_id,
@@ -208,6 +221,15 @@ def test_config(
     ]
 
     cfg["ai_api_key_path"].write_text("sk-test-only\n", encoding="utf-8")
+    for path in (
+        cfg["find_index_path"],
+        cfg["ai_semantic_store_path"],
+        cfg["ai_material_scan_marks_path"],
+        cfg["ai_material_state_cache_path"],
+        cfg["perm_db_path"],
+        cfg["handin_db_path"],
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
     _apply_path_patches(monkeypatch, cfg)
     return cfg
 
@@ -228,7 +250,7 @@ def _block_external_services(monkeypatch: pytest.MonkeyPatch) -> None:
     except Exception:
         pass
 
-    for module_name in ("aisvc", "handinsvc"):
+    for module_name in ("cooper_bot.modules.ai.aisvc", "cooper_bot.modules.handin.handinsvc"):
         module = sys.modules.get(module_name)
         if module is None:
             continue
@@ -238,8 +260,8 @@ def _block_external_services(monkeypatch: pytest.MonkeyPatch) -> None:
         if request_mod is not None:
             monkeypatch.setattr(request_mod, "urlopen", _blocked, raising=False)
 
-    _patch_module_attr(monkeypatch, "aisvc", "OpenAI", None)
-    _patch_module_attr(monkeypatch, "aisvc", "RapidOCR", None)
+    _patch_module_attr(monkeypatch, "cooper_bot.modules.ai.aisvc", "OpenAI", None)
+    _patch_module_attr(monkeypatch, "cooper_bot.modules.ai.aisvc", "RapidOCR", None)
 
 
 @pytest.fixture

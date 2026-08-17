@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-import commands
-from aisvc import AIService
-from vision_skill import VisionResolution, VisionSkill, VisionSlot
+import cooper_bot.commands.commands as commands
+from cooper_bot.modules.ai.aisvc import AIService
+from cooper_bot.modules.vision.vision_skill import VisionResolution, VisionSkill, VisionSlot
 
 
 class _DummyLog:

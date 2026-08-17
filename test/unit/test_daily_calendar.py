@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-import commands
-from daily_calendar import CalendarResult, DailyCalendarService, parse_calendar_date
+import cooper_bot.commands.commands as commands
+from cooper_bot.modules.calendar.daily_calendar import CalendarResult, DailyCalendarService, parse_calendar_date
 
 
 class _Log:

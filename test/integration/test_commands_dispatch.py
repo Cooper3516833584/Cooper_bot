@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-import commands
+import cooper_bot.commands.commands as commands
 
 
 class _DummyLogger:

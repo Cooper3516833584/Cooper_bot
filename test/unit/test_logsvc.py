@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import logsvc
-from logsvc import LogService
+import cooper_bot.modules.logging.logsvc as logsvc
+from cooper_bot.modules.logging.logsvc import LogService
 
 
 class _DummyLog:

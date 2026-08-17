@@ -5,13 +5,16 @@ api_key.txt
 
 # runtime folders (不上传这些目录)
 __pycache__/
-data/
-data/daily_calendar/
+config/private/
+runtime/databases/
+runtime/state/
+runtime/workspaces/
+runtime/staging/
+runtime/temp/
+runtime/logs/
+runtime/napcat/
+storage/
 logs/
-napcat_config/
-napcat_qq/
-upload_group_file/
-upload_private_file/
 output_hw_*/
 
 # OS / IDE
@@ -48,8 +51,7 @@ history*.json
 ocr/
 
 # wiki upload local artifacts
-wiki/url_and_token.txt
-wiki/*.log
-wiki/1037wiki_upload_plan.*
-wiki/*_upload_state.json
-wiki/*_upload_summary.*
+config/private/url_and_token.txt
+tools/wiki/*.log
+tools/wiki/1037wiki_upload_plan.*
+runtime/state/wiki/

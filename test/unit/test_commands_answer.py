@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import commands
+import cooper_bot.commands.commands as commands
 
 
 NI_HAO = "\u4f60\u597d"

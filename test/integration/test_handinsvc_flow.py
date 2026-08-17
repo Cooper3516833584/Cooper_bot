@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import zipfile
 
-from handinsvc import HandinService
+from cooper_bot.modules.handin.handinsvc import HandinService
 
 
 class _DummyLog:

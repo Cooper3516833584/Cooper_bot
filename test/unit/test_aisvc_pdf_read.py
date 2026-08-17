@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-import aisvc
-from aisvc import AIService
+import cooper_bot.modules.ai.aisvc as aisvc
+from cooper_bot.modules.ai.aisvc import AIService
 
 
 class _DummyLog:

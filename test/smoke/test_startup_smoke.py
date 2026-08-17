@@ -4,10 +4,10 @@ from pathlib import Path
 
 import numpy as np
 
-from aisvc import AIService
-from filesvc import FileService
-from handinsvc import HandinService
-from logsvc import LogService
+from cooper_bot.modules.ai.aisvc import AIService
+from cooper_bot.modules.files.filesvc import FileService
+from cooper_bot.modules.handin.handinsvc import HandinService
+from cooper_bot.modules.logging.logsvc import LogService
 
 
 class _DummyLog:

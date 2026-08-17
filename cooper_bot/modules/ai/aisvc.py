@@ -19,9 +19,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from vision_skill import VisionSlot
+from cooper_bot.modules.vision.vision_skill import VisionSlot
 
-from config import (
+from cooper_bot.core.config import (
     AI_API_KEY_PATH,
     AI_BOT_NICK,
     AI_CHAT_MODEL,
@@ -36,6 +36,8 @@ from config import (
     AI_GEMINI_WORKDIR,
     AI_INDEX_PATH,
     AI_MATERIAL_DIR,
+    AI_MATERIAL_SCAN_MARKS_PATH,
+    AI_MATERIAL_STATE_CACHE_PATH,
     AI_METADATA_PATH,
     AI_SEARCH_LIMIT,
     AI_SEARCH_MIN_SIMILARITY,
@@ -43,6 +45,10 @@ from config import (
     AI_VECTORS_PATH,
     AI_WEB_SEARCH_ENABLED,
     AI_WEB_SEARCH_MODEL,
+    AI_GROUP_CHAT_PROMPTS_PATH,
+    AI_GROUP_NOTICE_PROMPTS_PATH,
+    AI_PRIVATE_CHAT_PROMPTS_PATH,
+    AI_SEMANTIC_STORE_PATH,
     BASE_DIR,
     ENABLE_OCR,
 )
@@ -162,12 +168,12 @@ class AIService:
         self.index_path = Path(AI_INDEX_PATH)
         self.metadata_path = Path(AI_METADATA_PATH)
         self.vectors_path = Path(AI_VECTORS_PATH)
-        self.notice_prompt_config_path = Path(__file__).resolve().parent / "group_notice_prompts.json"
-        self.private_chat_prompt_config_path = Path(__file__).resolve().parent / "private_chat_prompts.json"
-        self.group_chat_prompt_config_path = Path(__file__).resolve().parent / "group_chat_prompts.json"
-        self.material_scan_marks_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_MARKS_FILENAME
-        self.material_state_cache_path = Path(BASE_DIR) / self._AUTO_ORGANIZE_STATE_CACHE_FILENAME
-        self.incremental_store_path = Path(BASE_DIR) / self._INCREMENTAL_STORE_FILENAME
+        self.notice_prompt_config_path = Path(AI_GROUP_NOTICE_PROMPTS_PATH)
+        self.private_chat_prompt_config_path = Path(AI_PRIVATE_CHAT_PROMPTS_PATH)
+        self.group_chat_prompt_config_path = Path(AI_GROUP_CHAT_PROMPTS_PATH)
+        self.material_scan_marks_path = Path(AI_MATERIAL_SCAN_MARKS_PATH)
+        self.material_state_cache_path = Path(AI_MATERIAL_STATE_CACHE_PATH)
+        self.incremental_store_path = Path(AI_SEMANTIC_STORE_PATH)
 
         self.bot_nick = str(AI_BOT_NICK or "Cooper_bot")
         self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_PRO_MODEL)

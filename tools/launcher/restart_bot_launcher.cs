@@ -11,8 +11,8 @@ internal static class RestartBotLauncher
     private const string PreferredPython = @"C:\Users\Cooper\AppData\Local\Programs\Python\Python313\python.exe";
     private const string PreferredPyLauncher = @"C:\Users\Cooper\AppData\Local\Programs\Python\Launcher\py.exe";
 
-    private static readonly string LockPath = Path.Combine(RepoDir, "data", "_client.lock");
-    private static readonly string LogPath = Path.Combine(RepoDir, "logs", "restart_bot_launcher.log");
+    private static readonly string LockPath = Path.Combine(RepoDir, "runtime", "state", "client", "client.lock");
+    private static readonly string LogPath = Path.Combine(RepoDir, "runtime", "logs", "restart_bot_launcher.log");
 
     [STAThread]
     private static int Main(string[] args)

@@ -4,30 +4,29 @@ import asyncio
 import json
 import time
 import websockets
-from pathlib import Path
 from typing import Dict, Set
 
-from logger import Logger
-from config import (
+from cooper_bot.core.logger import Logger
+from cooper_bot.core.config import (
     WS_URI,
     HTTP_BASE,
     HTTP_TOKEN,
-    DATA_DIR,
+    CLIENT_LOCK_PATH,
     LOG_DIR,
     PERM_DB_PATH,
     AUTO_APPROVE_FRIEND_REQUEST,
     AUTO_APPROVE_FRIEND_REMARK,
 )
-from router import build_ctx, get_text
-from onebot import OneBotAPI
-from filesvc import FileService
-from logsvc import LogService
-from commands import dispatch, BotState, conv_key, notify_admin_error
-from permsvc import PermService
-from handinsvc import HandinService
-from aisvc import AIService
-from daily_calendar import DailyCalendarService
-from vision_skill import VisionSkill
+from cooper_bot.core.router import build_ctx, get_text
+from cooper_bot.core.onebot import OneBotAPI
+from cooper_bot.modules.files.filesvc import FileService
+from cooper_bot.modules.logging.logsvc import LogService
+from cooper_bot.commands.commands import dispatch, BotState, conv_key, notify_admin_error
+from cooper_bot.modules.permissions.permsvc import PermService
+from cooper_bot.modules.handin.handinsvc import HandinService
+from cooper_bot.modules.ai.aisvc import AIService
+from cooper_bot.modules.calendar.daily_calendar import DailyCalendarService
+from cooper_bot.modules.vision.vision_skill import VisionSkill
 
 log = Logger("bot", "INFO")
 
@@ -48,7 +47,7 @@ def _acquire_single_instance_lock() -> bool:
     if _INSTANCE_LOCK_HANDLE is not None:
         return True
 
-    lock_path = Path(DATA_DIR) / "_client.lock"
+    lock_path = CLIENT_LOCK_PATH
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+b")
     try:
@@ -74,7 +73,7 @@ def _acquire_single_instance_lock() -> bool:
 
 
 def _lock_path_text() -> str:
-    return str((Path(DATA_DIR) / "_client.lock").resolve())
+    return str(CLIENT_LOCK_PATH.resolve())
 
 async def run_forever():
     if not _acquire_single_instance_lock():

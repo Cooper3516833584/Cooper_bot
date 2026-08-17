@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from aisvc import AIService
+from cooper_bot.modules.ai.aisvc import AIService
 
 
 class _DummyLog:
@@ -149,7 +149,7 @@ def test_run_gemini_cli_sync_parses_json_response(monkeypatch, tmp_project_root)
         return SimpleNamespace(returncode=0, stdout=b'{"response":"OK"}', stderr=b"warning")
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "C:/tools/gemini.cmd")
-    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+    monkeypatch.setattr("cooper_bot.modules.ai.aisvc.subprocess.run", _fake_subprocess_run)
 
     out = svc._run_gemini_cli_sync("Reply exactly OK")
 
@@ -185,7 +185,7 @@ def test_run_gemini_cli_sync_reads_agy_transcript_when_stdout_empty(monkeypatch,
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
-    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+    monkeypatch.setattr("cooper_bot.modules.ai.aisvc.subprocess.run", _fake_subprocess_run)
 
     out = svc._run_gemini_cli_sync("Reply exactly OK")
 
@@ -207,7 +207,7 @@ def test_run_gemini_cli_sync_restricted_uses_agy_sandbox(monkeypatch, tmp_projec
         return SimpleNamespace(returncode=0, stdout=b"OK", stderr=b"")
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
-    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+    monkeypatch.setattr("cooper_bot.modules.ai.aisvc.subprocess.run", _fake_subprocess_run)
 
     out = svc._run_gemini_cli_sync("Reply exactly OK", "Claude Opus 4.6 (Thinking)", restricted=True)
 
@@ -237,7 +237,7 @@ def test_run_gemini_cli_sync_reports_agy_log_error_when_empty(monkeypatch, tmp_p
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
-    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+    monkeypatch.setattr("cooper_bot.modules.ai.aisvc.subprocess.run", _fake_subprocess_run)
 
     with pytest.raises(RuntimeError, match="No capacity available"):
         svc._run_gemini_cli_sync("Reply exactly OK", "Claude Opus 4.6 (Thinking)")
@@ -263,7 +263,7 @@ def test_run_gemini_cli_sync_rejects_agy_busy_transcript(monkeypatch, tmp_projec
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
-    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+    monkeypatch.setattr("cooper_bot.modules.ai.aisvc.subprocess.run", _fake_subprocess_run)
 
     with pytest.raises(RuntimeError, match="service busy"):
         svc._run_gemini_cli_sync("Reply exactly OK")
@@ -277,7 +277,7 @@ def test_run_gemini_cli_sync_preserves_agy_cursor_line_breaks(monkeypatch, tmp_p
         return SimpleNamespace(returncode=0, stdout=raw.encode("utf-8"), stderr=b"")
 
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
-    monkeypatch.setattr("aisvc.subprocess.run", _fake_subprocess_run)
+    monkeypatch.setattr("cooper_bot.modules.ai.aisvc.subprocess.run", _fake_subprocess_run)
 
     out = svc._run_gemini_cli_sync("列出命令")
 

@@ -10,7 +10,7 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from config import DAILY_CALENDAR_CONFIG_PATH, DAILY_CALENDAR_DATA_DIR, TIMEZONE
+from cooper_bot.core.config import DAILY_CALENDAR_CONFIG_PATH, DAILY_CALENDAR_DATA_DIR, TIMEZONE
 
 try:
     from lunar_python import Solar

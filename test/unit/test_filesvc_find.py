@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from filesvc import FileService
+from cooper_bot.modules.files.filesvc import FileService
 
 
 class _DummyLog:

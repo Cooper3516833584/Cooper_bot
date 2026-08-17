@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import commands
+import cooper_bot.commands.commands as commands
 
 
 def _fake_filesvc_roots():
@@ -127,7 +127,7 @@ async def test_private_signin_image_then_name_records_submission(monkeypatch) ->
     monkeypatch.setattr(commands, "reply", _fake_reply)
     monkeypatch.setattr(commands, "_download_signin_image", _fake_download)
 
-    import signin_ocr
+    import cooper_bot.modules.vision.signin_ocr as signin_ocr
 
     monkeypatch.setattr(
         signin_ocr,

@@ -6,9 +6,9 @@ from typing import Any
 
 import pytest
 
-import aisvc
-import config
-from aisvc import AIService
+import cooper_bot.modules.ai.aisvc as aisvc
+import cooper_bot.core.config as config
+from cooper_bot.modules.ai.aisvc import AIService
 
 
 class _DummyLog:

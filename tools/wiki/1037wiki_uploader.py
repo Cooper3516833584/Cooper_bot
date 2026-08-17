@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 WIKI_DIR = Path(__file__).resolve().parent
-PLAN_PATH = WIKI_DIR / "1037wiki_upload_plan.json"
-TOKEN_PATH = WIKI_DIR / "url_and_token.txt"
-STATE_PATH = WIKI_DIR / "1037wiki_upload_state.json"
+WIKI_STATE_DIR = REPO_ROOT / "runtime" / "state" / "wiki"
+PLAN_PATH = WIKI_STATE_DIR / "1037wiki_upload_plan.json"
+TOKEN_PATH = REPO_ROOT / "config" / "private" / "url_and_token.txt"
+STATE_PATH = WIKI_STATE_DIR / "1037wiki_upload_state.json"
 API_BASE = "https://api.1037.wiki"
 MAX_FILE_SIZE = 200 * 1024 * 1024
 

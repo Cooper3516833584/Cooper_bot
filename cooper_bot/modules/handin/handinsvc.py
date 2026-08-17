@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse, unquote
 import os
 
-from config import (
+from cooper_bot.core.config import (
     DATA_DIR,
     GROUP_DOCS_DIR,
     USER_DOCS_DIR,
@@ -31,8 +31,8 @@ from config import (
     HANDIN_KEEP_DAYS_AFTER_LAST_GET,
     HANDIN_INBOX_KEEP_DAYS,
 )
-from logger import Logger
-from ziputil import open_fast_zip, write_path as zip_write_path
+from cooper_bot.core.logger import Logger
+from cooper_bot.core.ziputil import open_fast_zip, write_path as zip_write_path
 
 try:
     from zoneinfo import ZoneInfo

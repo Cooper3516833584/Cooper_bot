@@ -4,7 +4,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import command_services as cs
+import cooper_bot.commands.command_services as cs
 
 
 def test_format_simple_success_and_failure() -> None:

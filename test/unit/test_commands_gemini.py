@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import commands
+import cooper_bot.commands.commands as commands
 
 
 def test_split_ai_chat_backend_gemini_prefix() -> None:

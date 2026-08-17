@@ -5,13 +5,34 @@ import os
 import re
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BASE_DIR = PROJECT_ROOT  # 兼容旧代码；迁移后仍表示仓库根目录
+
+CONFIG_DIR = PROJECT_ROOT / "config"
+STORAGE_DIR = PROJECT_ROOT / "storage"
+RUNTIME_DIR = PROJECT_ROOT / "runtime"
+TOOLS_DIR = PROJECT_ROOT / "tools"
+
+DOCUMENTS_DIR = STORAGE_DIR / "documents"
+SUBMISSIONS_DIR = STORAGE_DIR / "submissions"
+DATABASES_DIR = RUNTIME_DIR / "databases"
+STATE_DIR = RUNTIME_DIR / "state"
+WORKSPACES_DIR = RUNTIME_DIR / "workspaces"
+STAGING_DIR = RUNTIME_DIR / "staging"
+TEMP_DIR = RUNTIME_DIR / "temp"
+LOG_DIR = RUNTIME_DIR / "logs"
+NAPCAT_DIR = RUNTIME_DIR / "napcat"
+
+PRIVATE_CONFIG_DIR = CONFIG_DIR / "private"
+AI_CONFIG_DIR = CONFIG_DIR / "ai"
+REPLIES_DIR = CONFIG_DIR / "replies"
+WIKI_CONFIG_DIR = CONFIG_DIR / "wiki"
 
 # ========== 读取敏感配置（secrets.env） ==========
 # 目标：把 TOKEN / ACCOUNT / ADMIN_USERS 等敏感信息从代码里剥离出去
-# - docker-compose.yml 通过 env_file: ./secrets.env 传给 NapCat 容器
+# - docker-compose.yml 通过 env_file: ./config/private/secrets.env 传给 NapCat 容器
 # - Python 侧这里也会读同一个 secrets.env（若环境变量已存在则不覆盖）
-SECRETS_ENV_PATH = BASE_DIR / "secrets.env"
+SECRETS_ENV_PATH = PRIVATE_CONFIG_DIR / "secrets.env"
 
 def _load_env_file(path: Path):
     try:
@@ -75,8 +96,9 @@ def _parse_int_set(s: str) -> set[int]:
 
 
 # 资料库根目录（宿主机）
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
+DATA_DIR = DOCUMENTS_DIR  # 兼容旧变量名，仅表示可访问文档根目录
+FIND_INDEX_PATH = DATABASES_DIR / "file_search" / "find_index.json"
+CLIENT_LOCK_PATH = STATE_DIR / "client" / "client.lock"
 
 # NapCat / OneBot v11
 TOKEN = _get_env("TOKEN", "CHANGE_ME_TOKEN")
@@ -120,50 +142,50 @@ DOC_ROOTS = [
 ]
 
 # 群/个人专属目录
-GROUP_DOCS_DIR = DATA_DIR / "groups"   # data/groups/<group_id>/...
-USER_DOCS_DIR  = DATA_DIR / "users"    # data/users/<user_id>/...
+GROUP_DOCS_DIR = DATA_DIR / "groups"   # storage/documents/groups/<group_id>/...
+USER_DOCS_DIR  = DATA_DIR / "users"    # storage/documents/users/<user_id>/...
 
 # 权限库（群里发过言的人会写进这里 -> level>=1）
-PERM_DB_PATH = USER_DOCS_DIR / "_perm_levels.json"
+PERM_DB_PATH = DATABASES_DIR / "permissions" / "levels.json"
 
 
 # ===== Handin（作业提交）=====
 # 任务数据库
-HANDIN_DB_PATH = DATA_DIR / "_handin_tasks.json"
+HANDIN_DB_PATH = DATABASES_DIR / "handin" / "tasks.json"
 # 私聊提交临时收件箱
-HANDIN_INBOX_DIR = USER_DOCS_DIR / "_handin_inbox"
+HANDIN_INBOX_DIR = STAGING_DIR / "handin"
 # 旧版群内任务目录名（仅用于兼容迁移）：data/groups/<group_id>/<HANDIN_TASKS_DIRNAME>/<task>/files/
 HANDIN_TASKS_DIRNAME = "handin"
 
 # 新版提交文件根目录（不再放在 data/groups 下，避免群成员通过 /find 看到他人提交）
 # data/handin/<group_id>/<task>/files/
-HANDIN_ROOT_DIR = DATA_DIR / "handin"
-# 班级名册（放在 data/friend/ 下）
+HANDIN_ROOT_DIR = SUBMISSIONS_DIR / "handin"
+# 班级名册（放在 storage/documents/friend/ 下）
 ROSTER_XLSX_PATH = DATA_DIR / "friend" / "班级名册.xlsx"
 # 时区（用于解析提醒/截止时间）
 TIMEZONE = "Asia/Shanghai"
 
 # ===== 每日重要日提醒 =====
-# 配置与运行状态分离：配置可由管理员编辑，联网事实、年度放假安排和发送记录都写入 data/。
-DAILY_CALENDAR_CONFIG_PATH = BASE_DIR / "daily_calendar_config.json"
-DAILY_CALENDAR_DATA_DIR = DATA_DIR / "daily_calendar"
+# 配置与运行状态分离：配置可由管理员编辑，联网事实、年度放假安排和发送记录都写入 runtime/。
+DAILY_CALENDAR_CONFIG_PATH = CONFIG_DIR / "calendar" / "daily_calendar_config.json"
+DAILY_CALENDAR_DATA_DIR = STATE_DIR / "calendar"
 
 # NapCat 本地缓存 temp 映射（用于私聊文件提交：不走网络下载，直接拷贝缓存文件）
 NAPCAT_TEMP_CONTAINER_DIR = "/app/.config/QQ/NapCat/temp"
 NAPCAT_TEMP_HOST_DIR = _get_env_path(
     "NAPCAT_TEMP_HOST_DIR",
-    BASE_DIR / "napcat_qq" / "NapCat" / "temp",
+    NAPCAT_DIR / "qq" / "NapCat" / "temp",
 )
 
 
 # ===== NapCat 容器内的资料库挂载点 =====
-# docker-compose 里把 ./data 挂载到这个路径后，upload_* action 才能读到文件
+# docker-compose 里把 ./storage/documents 挂载到这个路径后，upload_* action 才能读到文件
 DATA_DIR_CONTAINER = "/bot_data"
 
 # ===== NapCat 专用上传目录（更稳定的发送文件方式）=====
 # 宿主机目录（与 docker-compose 的 ./upload_* 挂载对应）
-UPLOAD_GROUP_HOST_DIR = BASE_DIR / "upload_group_file"
-UPLOAD_PRIVATE_HOST_DIR = BASE_DIR / "upload_private_file"
+UPLOAD_GROUP_HOST_DIR = STAGING_DIR / "group"
+UPLOAD_PRIVATE_HOST_DIR = STAGING_DIR / "private"
 # 容器内目录（docker-compose 挂载到 /data/upload_*）
 UPLOAD_GROUP_CONTAINER_DIR = "/data/upload_group_file"
 UPLOAD_PRIVATE_CONTAINER_DIR = "/data/upload_private_file"
@@ -202,11 +224,24 @@ HANDIN_INBOX_KEEP_DAYS = 30
 
 
 # ===== AI（DeepSeek + Embedding）=====
-AI_API_KEY_PATH = BASE_DIR / "api_key.txt"
+AI_API_KEY_PATH = PRIVATE_CONFIG_DIR / "api_key.txt"
 AI_MATERIAL_DIR = DATA_DIR / "public" / "textbook_and_material"
-AI_INDEX_PATH = AI_MATERIAL_DIR / "all_files_index.json"
-AI_METADATA_PATH = AI_MATERIAL_DIR / "file_metadata.json"
-AI_VECTORS_PATH = AI_MATERIAL_DIR / "file_vectors.npy"
+AI_SEMANTIC_STORE_PATH = DATABASES_DIR / "ai" / "semantic_store.sqlite3"
+AI_LEGACY_DIR = DATABASES_DIR / "ai" / "legacy"
+AI_INDEX_PATH = AI_LEGACY_DIR / "all_files_index.json"
+AI_METADATA_PATH = AI_LEGACY_DIR / "file_metadata.json"
+AI_VECTORS_PATH = AI_LEGACY_DIR / "file_vectors.npy"
+AI_STATE_DIR = STATE_DIR / "ai"
+AI_MATERIAL_SCAN_MARKS_PATH = AI_STATE_DIR / "material_scan_marks.json"
+AI_MATERIAL_STATE_CACHE_PATH = AI_STATE_DIR / "material_state_cache.json"
+
+AI_GROUP_CHAT_PROMPTS_PATH = AI_CONFIG_DIR / "group_chat_prompts.json"
+AI_GROUP_NOTICE_PROMPTS_PATH = AI_CONFIG_DIR / "group_notice_prompts.json"
+AI_PRIVATE_CHAT_PROMPTS_PATH = AI_CONFIG_DIR / "private_chat_prompts.json"
+ANSWER_FILE_PATH = REPLIES_DIR / "answer.txt"
+KEYWORD_ANSWER_FILE_PATH = REPLIES_DIR / "keyword_answer.txt"
+WIKI_CATEGORIES_PATH = WIKI_CONFIG_DIR / "1037wiki_categories.json"
+WIKI_STATE_DIR = STATE_DIR / "wiki"
 
 AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-pro")
 AI_WEB_SEARCH_ENABLED = _get_env("AI_WEB_SEARCH_ENABLED", "1") == "1"
@@ -217,9 +252,9 @@ AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "agy")
 AI_GEMINI_MODEL = _get_env("AI_GEMINI_MODEL", "Gemini 3.1 Pro (High)")
 AI_CLAUDE_MODEL = _get_env("AI_CLAUDE_MODEL", "Claude Opus 4.6 (Thinking)")
 AI_GEMINI_TIMEOUT_SECONDS = float(_get_env("AI_GEMINI_TIMEOUT_SECONDS", "480") or "480")
-AI_GEMINI_WORKDIR = _get_env_path("AI_GEMINI_WORKDIR", DATA_DIR / "_gemini_cli_workspace")
-AI_GEMINI_RESTRICTED_WORKDIR = _get_env_path("AI_GEMINI_RESTRICTED_WORKDIR", DATA_DIR / "_gemini_cli_restricted_workspace")
-AI_GEMINI_POLICY_PATH = _get_env_path("AI_GEMINI_POLICY_PATH", BASE_DIR / "gemini_cli_chat_only.toml")
+AI_GEMINI_WORKDIR = _get_env_path("AI_GEMINI_WORKDIR", WORKSPACES_DIR / "ai_cli" / "general")
+AI_GEMINI_RESTRICTED_WORKDIR = _get_env_path("AI_GEMINI_RESTRICTED_WORKDIR", WORKSPACES_DIR / "ai_cli" / "restricted")
+AI_GEMINI_POLICY_PATH = _get_env_path("AI_GEMINI_POLICY_PATH", AI_CONFIG_DIR / "gemini_cli_chat_only.toml")
 AI_SEARCH_LIMIT = int(_get_env("AI_SEARCH_LIMIT", "10") or "10")
 AI_SEARCH_MIN_SIMILARITY = float(_get_env("AI_SEARCH_MIN_SIMILARITY", "0.35") or "0.35")
 AI_FALLBACK_ERROR_REPLY = (
@@ -276,7 +311,7 @@ def _read_vision_config_from_api_key_txt() -> "tuple[str, str]":
     try:
         lines = [
             x.strip()
-            for x in (BASE_DIR / "api_key.txt").read_text(encoding="utf-8").splitlines()
+            for x in AI_API_KEY_PATH.read_text(encoding="utf-8").splitlines()
             if x.strip()
         ]
         if len(lines) >= 6:

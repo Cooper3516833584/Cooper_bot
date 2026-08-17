@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from aisvc import AIService
+from cooper_bot.modules.ai.aisvc import AIService
 
 
 class _DummyLog:

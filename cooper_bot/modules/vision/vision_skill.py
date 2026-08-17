@@ -29,10 +29,11 @@ from typing import Optional
 
 from PIL import Image, ImageDraw, UnidentifiedImageError
 
-import config
-from config import (
-    BASE_DIR,
-    DATA_DIR,
+import cooper_bot.core.config as config
+from cooper_bot.core.config import (
+    TEMP_DIR,
+    PROJECT_ROOT,
+    DOCUMENTS_DIR,
     VISION_API_KEY,
     VISION_BASE_URL,
     VISION_CACHE_MAX_ENTRIES,
@@ -850,11 +851,12 @@ class VisionSkill:
     def _allowed_local_roots() -> list[Path]:
         roots: list[Path] = []
         for d in (
-            BASE_DIR / "ocr",
-            DATA_DIR / "ocr",
-            DATA_DIR / "temp",
-            BASE_DIR / "data" / "ocr",
-            BASE_DIR / "data" / "temp",
+            PROJECT_ROOT / "ocr",
+            DOCUMENTS_DIR / "ocr",
+            TEMP_DIR / "ocr",
+            TEMP_DIR,
+            PROJECT_ROOT / "data" / "ocr",
+            PROJECT_ROOT / "data" / "temp",
         ):
             try:
                 roots.append(d.resolve())

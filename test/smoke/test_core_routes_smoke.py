@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-import commands
-from filesvc import FileService
-from handinsvc import HandinService
+import cooper_bot.commands.commands as commands
+from cooper_bot.modules.files.filesvc import FileService
+from cooper_bot.modules.handin.handinsvc import HandinService
 
 
 class _DummyLogger:

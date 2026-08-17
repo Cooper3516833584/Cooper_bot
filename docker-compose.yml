@@ -1,4 +1,3 @@
-version: "3"
 services:
   napcat:
     image: mlikiowa/napcat-docker:latest
@@ -7,7 +6,7 @@ services:
 
     # 账号等敏感信息放在 secrets.env
     env_file:
-      - ./secrets.env
+      - ./config/private/secrets.env
 
     ports:
       - "13001:3001"  # WebSocket
@@ -16,12 +15,12 @@ services:
       - "13000:3000"  # 官方默认 HTTP 端口（留着不冲突，防止你哪天改回默认）
 
     volumes:
-      # 资料库挂载（让 upload_* 能直接读到你的 data/ 里选中的文件）
-      - "./data:/bot_data"
+      # 资料库挂载（让 upload_* 能直接读取 storage/documents 中的文件）
+      - "./storage/documents:/bot_data"
       # 你的“上传目录”挂载（给 upload_group_file / upload_private_file 用）
-      - "./upload_group_file:/data/upload_group_file"
-      - "./upload_private_file:/data/upload_private_file"
+      - "./runtime/staging/group:/data/upload_group_file"
+      - "./runtime/staging/private:/data/upload_private_file"
 
       # 强烈建议：持久化 QQ 数据和 NapCat 配置，否则你一 recreate 容器配置就丢
-      - "./napcat_qq:/app/.config/QQ"
-      - "./napcat_config:/app/napcat/config"
+      - "./runtime/napcat/qq:/app/.config/QQ"
+      - "./runtime/napcat/config:/app/napcat/config"

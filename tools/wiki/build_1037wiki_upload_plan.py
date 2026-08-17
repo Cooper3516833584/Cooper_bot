@@ -6,14 +6,15 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 WIKI_DIR = Path(__file__).resolve().parent
-ROOT = REPO / "data" / "public" / "textbook_and_material"
-DB = REPO / "ai_semantic_store.sqlite3"
+WIKI_STATE_DIR = REPO / "runtime" / "state" / "wiki"
+ROOT = REPO / "storage" / "documents" / "public" / "textbook_and_material"
+DB = REPO / "runtime" / "databases" / "ai" / "semantic_store.sqlite3"
 
-OUT_JSON = WIKI_DIR / "1037wiki_upload_plan.json"
-OUT_CSV = WIKI_DIR / "1037wiki_upload_plan.csv"
-OUT_MD = WIKI_DIR / "1037wiki_upload_plan.md"
+OUT_JSON = WIKI_STATE_DIR / "1037wiki_upload_plan.json"
+OUT_CSV = WIKI_STATE_DIR / "1037wiki_upload_plan.csv"
+OUT_MD = WIKI_STATE_DIR / "1037wiki_upload_plan.md"
 
 PARENT_CATEGORY = "\u8bfe\u7a0b"
 COURSE_MATERIAL = "\u8bfe\u7a0b\u8d44\u6599"

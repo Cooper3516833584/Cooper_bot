@@ -3,8 +3,8 @@ from dataclasses import dataclass
 import re
 from typing import Optional
 
-from config import ADMIN_USERS, GROUP_LEVEL, DEFAULT_LEVEL
-from permsvc import PermService
+from cooper_bot.core.config import ADMIN_USERS, GROUP_LEVEL, DEFAULT_LEVEL
+from cooper_bot.modules.permissions.permsvc import PermService
 
 @dataclass
 class Ctx:

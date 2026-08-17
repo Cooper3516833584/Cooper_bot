@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import zipfile
 
-from handinsvc import HANDIN_HASH_INDEX_FILENAME, HandinService
+from cooper_bot.modules.handin.handinsvc import HANDIN_HASH_INDEX_FILENAME, HandinService
 
 
 class _DummyLog:

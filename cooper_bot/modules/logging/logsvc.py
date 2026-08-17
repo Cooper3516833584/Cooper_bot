@@ -6,8 +6,8 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
-from config import IDLE_SPLIT_SECONDS
-from router import Ctx
+from cooper_bot.core.config import IDLE_SPLIT_SECONDS
+from cooper_bot.core.router import Ctx
 
 
 # Windows 文件/文件夹名不允许这些字符：<>:"/\|?*

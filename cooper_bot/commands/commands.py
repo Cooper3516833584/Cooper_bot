@@ -11,9 +11,9 @@ import time
 import shutil
 import uuid
 import unicodedata
-from filesvc import FileService
-from logsvc import LogService
-from handinsvc import (
+from cooper_bot.modules.files.filesvc import FileService
+from cooper_bot.modules.logging.logsvc import LogService
+from cooper_bot.modules.handin.handinsvc import (
     HANDIN_ALLOWED_REQUIRED_SUFFIXES,
     HandinService,
     extract_name_from_filename,
@@ -24,12 +24,12 @@ from handinsvc import (
     pretty_ts,
     required_suffix_display,
 )
-from command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query, run_list_dir_query
-from router import get_files
-from ziputil import open_fast_zip, write_path as zip_write_path
-from daily_calendar import parse_calendar_date
-from vision_skill import VisionSlot
-from config import (
+from cooper_bot.commands.command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query, run_list_dir_query
+from cooper_bot.core.router import get_files
+from cooper_bot.core.ziputil import open_fast_zip, write_path as zip_write_path
+from cooper_bot.modules.calendar.daily_calendar import parse_calendar_date
+from cooper_bot.modules.vision.vision_skill import VisionSlot
+from cooper_bot.core.config import (
     ADMIN_USERS,
     DATA_DIR,
     UPLOAD_GROUP_HOST_DIR,
@@ -45,14 +45,15 @@ from config import (
     FIND_DIR_LIMIT,
     FIND_FILE_LIMIT,
     AI_BOT_NICK,
+    ANSWER_FILE_PATH,
+    KEYWORD_ANSWER_FILE_PATH,
+    TEMP_DIR,
 )
 if TYPE_CHECKING:
-    from aisvc import AIService
+    from cooper_bot.modules.ai.aisvc import AIService
 LARGE_FILE_WARN_BYTES = int(LARGE_FILE_WARN_MB) * 1024 * 1024
-ANSWER_FILE_PATH = Path(__file__).resolve().parent / "answer.txt"
 _ANSWER_CACHE_MTIME: Optional[float] = None
 _ANSWER_CACHE: Dict[str, List[str]] = {}
-KEYWORD_ANSWER_FILE_PATH = Path(__file__).resolve().parent / "keyword_answer.txt"
 _KEYWORD_ANSWER_CACHE_MTIME: Optional[float] = None
 _KEYWORD_ANSWER_CACHE: Dict[str, List[str]] = {}
 _GROUP_NOTICE_FILE_SUFFIXES = {".pdf", ".doc", ".docx", ".md", ".markdown"}
@@ -1535,7 +1536,7 @@ async def _handle_signin_image(api, ctx, evt: dict, logsvc: LogService, state: B
     _signin_begin_job(task)
     try:
         try:
-            from signin_ocr import recognize_led_time_from_path
+            from cooper_bot.modules.vision.signin_ocr import recognize_led_time_from_path
         except Exception as e:
             logsvc.log.warning(f"signin ocr import failed: err={e}")
             await reply(api, ctx, "signin识别模块暂不可用，请稍后重试。", logsvc)
@@ -3611,7 +3612,7 @@ async def _handle_private_number_choice(api, ctx, text: str, logsvc: LogService,
             state.pending_handin_choose.pop(ctx.user_id, None)
             return True
         safe = handin._safe_component(task.name)
-        out_zip = (DATA_DIR / "temp" / "handin_exports" / f"{safe}_g{task.group_id}_{int(time.time())}.zip")
+        out_zip = (TEMP_DIR / "handin_exports" / f"{safe}_g{task.group_id}_{int(time.time())}.zip")
         ok, msgz, zpath = handin.zip_submissions(task, out_zip)
         if not ok or not zpath:
             await reply(api, ctx, msgz, logsvc)
@@ -4711,7 +4712,7 @@ async def _handle_explicit_command(
                     bad_list.append(f"{idx}({src.name}:不存在)")
                     continue
                 if src.is_dir():
-                    out_dir = (DATA_DIR / "temp" / "get_dir_zip")
+                    out_dir = TEMP_DIR / "get_dir_zip"
                     out_dir.mkdir(parents=True, exist_ok=True)
                     safe_stem = Path(_sanitize_ascii_filename(f"{src.name}.zip")).stem[:40].strip("._-") or "folder"
                     zpath = out_dir / f"{safe_stem}_{int(time.time())}_{uuid.uuid4().hex[:6]}.zip"
@@ -4735,7 +4736,7 @@ async def _handle_explicit_command(
             if len(prepared_items) > int(GET_ZIP_THRESHOLD):
                 label = (state.last_find_label.get(k) or "files").strip() or "files"
                 safe_label = _safe_zip_label(label, default="files")
-                out_dir = (DATA_DIR / "temp" / "get_zip")
+                out_dir = TEMP_DIR / "get_zip"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 outer_zip = out_dir / f"{safe_label}_{int(time.time())}_{uuid.uuid4().hex[:6]}.zip"
                 packed = 0
@@ -4814,7 +4815,7 @@ async def _handle_explicit_command(
                         if ext not in (".zip", ".rar", ".7z"):
                             try:
                                 await reply(api, ctx, f"⚠️ 文件「{shown_name}」源文件发送失败，将改为打包 zip 发送（zip 内保留原文件名），请稍等…", logsvc)
-                                fb_dir = (DATA_DIR / "temp" / "send_fallback")
+                                fb_dir = TEMP_DIR / "send_fallback"
                                 fb_dir.mkdir(parents=True, exist_ok=True)
                                 safe_stem = Path(_sanitize_ascii_filename(p.name)).stem[:40].strip("._-") or "file"
                                 zpath = fb_dir / f"{safe_stem}_{int(time.time())}.zip"
@@ -5086,7 +5087,7 @@ async def _handle_private_zip_name_input(api, ctx, text: str, logsvc: LogService
     base = _safe_zip_label(raw_name, default=default_name)
     if not base:
         base = default_name
-    out_dir = DATA_DIR / "temp" / "handin_batch"
+    out_dir = TEMP_DIR / "handin_batch"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_zip = out_dir / f"{base}.zip"
     if out_zip.exists():
