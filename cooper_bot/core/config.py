@@ -170,6 +170,14 @@ TIMEZONE = "Asia/Shanghai"
 DAILY_CALENDAR_CONFIG_PATH = CONFIG_DIR / "calendar" / "daily_calendar_config.json"
 DAILY_CALENDAR_DATA_DIR = STATE_DIR / "calendar"
 
+# ===== 管理员邮箱新邮件提醒 =====
+# 邮箱账号和 IMAP 凭据统一放在 config/private/secrets.env。
+EMAIL_NOTIFY_ENABLED = _get_env_bool("MAIL_NOTIFY_ENABLED", False)
+EMAIL_NOTIFY_POLL_SECONDS = max(15, int(_get_env("MAIL_NOTIFY_POLL_SECONDS", "60") or "60"))
+EMAIL_NOTIFY_MAX_BODY_CHARS = max(2000, int(_get_env("MAIL_NOTIFY_MAX_BODY_CHARS", "16000") or "16000"))
+EMAIL_NOTIFY_FETCH_BYTES = max(65536, int(_get_env("MAIL_NOTIFY_FETCH_BYTES", "524288") or "524288"))
+EMAIL_NOTIFY_STATE_PATH = STATE_DIR / "email_notify" / "state.json"
+
 # NapCat 本地缓存 temp 映射（用于私聊文件提交：不走网络下载，直接拷贝缓存文件）
 NAPCAT_TEMP_CONTAINER_DIR = "/app/.config/QQ/NapCat/temp"
 NAPCAT_TEMP_HOST_DIR = _get_env_path(

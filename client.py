@@ -26,6 +26,7 @@ from cooper_bot.modules.permissions.permsvc import PermService
 from cooper_bot.modules.handin.handinsvc import HandinService
 from cooper_bot.modules.ai.aisvc import AIService
 from cooper_bot.modules.calendar.daily_calendar import DailyCalendarService
+from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
 
 log = Logger("bot", "INFO")
@@ -89,6 +90,7 @@ async def run_forever():
     aisvc = AIService(log)
     vision_skill = VisionSkill(log)
     calendar_service = DailyCalendarService(log, aisvc)
+    email_notify_service = EmailNotifyService(log, aisvc)
 
     if REBUILD_MATERIAL_SCAN_MARKS_ON_STARTUP:
         try:
@@ -219,6 +221,7 @@ async def run_forever():
                 cleanup_task = asyncio.create_task(logsvc.cleanup_loop())
                 scheduler_task = asyncio.create_task(handin.scheduler_loop(api))
                 calendar_task = asyncio.create_task(calendar_service.scheduler_loop(api))
+                email_notify_task = asyncio.create_task(email_notify_service.scheduler_loop(api))
 
                 try:
                     async for message in ws:
@@ -284,9 +287,15 @@ async def run_forever():
                             )
                             continue
                 finally:
-                    for t in (cleanup_task, scheduler_task, calendar_task):
+                    for t in (cleanup_task, scheduler_task, calendar_task, email_notify_task):
                         t.cancel()
-                    await asyncio.gather(cleanup_task, scheduler_task, calendar_task, return_exceptions=True)
+                    await asyncio.gather(
+                        cleanup_task,
+                        scheduler_task,
+                        calendar_task,
+                        email_notify_task,
+                        return_exceptions=True,
+                    )
 
                     # 连接断开时尽量回收在途任务，避免跨连接残留。
                     pending = list(inflight)
