@@ -204,6 +204,7 @@ async def test_level_three_aichat_gemini_keeps_full_antigravity(dispatch_harness
     aisvc.gemini_chat_with_context.assert_awaited_once()
     assert aisvc.gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
     assert aisvc.gemini_chat_with_context.await_args.args[2] == "gemini"
+    assert aisvc.gemini_chat_with_context.await_args.kwargs["auto_approve_tools"] is True
     assert any("gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
 
 

@@ -358,8 +358,16 @@ class AIService:
             self._chat_with_context_sync, session_key, user_input, msg_id=msg_id, vision_slots=vision_slots
         )
 
-    async def gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
-        return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key)
+    async def gemini_chat(
+        self,
+        user_input: str,
+        model_key: Optional[str] = None,
+        *,
+        auto_approve_tools: bool = False,
+    ) -> str:
+        return await asyncio.to_thread(
+            self._gemini_chat_sync, user_input, model_key, auto_approve_tools=auto_approve_tools
+        )
 
     async def gemini_chat_with_context(
         self,
@@ -369,6 +377,7 @@ class AIService:
         *,
         msg_id: str = "",
         vision_slots: Optional[list] = None,
+        auto_approve_tools: bool = False,
     ) -> str:
         return await asyncio.to_thread(
             self._gemini_chat_with_context_sync,
@@ -377,6 +386,7 @@ class AIService:
             model_key,
             msg_id=msg_id,
             vision_slots=vision_slots,
+            auto_approve_tools=auto_approve_tools,
         )
 
     async def restricted_gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
@@ -658,6 +668,7 @@ class AIService:
         model_name: Optional[str] = None,
         restricted: bool = False,
         timeout_seconds: Optional[float] = None,
+        auto_approve_tools: bool = False,
     ) -> str:
         base_cmd = self._build_gemini_cli_base_command()
         if not base_cmd:
@@ -675,6 +686,8 @@ class AIService:
             cmd.extend(["--log-file", str(agy_log_path)])
             if restricted:
                 cmd.append("--sandbox")
+            elif auto_approve_tools:
+                cmd.append("--dangerously-skip-permissions")
         elif restricted:
             raise RuntimeError("restricted gemini chat requires antigravity cli")
         cli_label = "antigravity cli"
@@ -3000,7 +3013,14 @@ class AIService:
             timeout_seconds=timeout_seconds,
         )
 
-    def _gemini_chat_sync(self, user_input: str, model_key: Optional[str] = None, restricted: bool = False) -> str:
+    def _gemini_chat_sync(
+        self,
+        user_input: str,
+        model_key: Optional[str] = None,
+        restricted: bool = False,
+        *,
+        auto_approve_tools: bool = False,
+    ) -> str:
         if not self.gemini_chat_ready:
             raise RuntimeError("gemini chat not ready")
 
@@ -3013,7 +3033,11 @@ class AIService:
             prompt = self._build_restricted_gemini_cli_prompt(system_prompt, [], content)
             return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
         prompt = self._build_gemini_cli_prompt(system_prompt, [], content)
-        return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
+        return self._run_gemini_cli_sync(
+            prompt,
+            self._resolve_gemini_cli_model(model_key),
+            auto_approve_tools=auto_approve_tools,
+        )
 
     def _chat_with_context_sync(
         self,
@@ -3269,6 +3293,7 @@ class AIService:
         *,
         msg_id: str = "",
         vision_slots: Optional[list] = None,
+        auto_approve_tools: bool = False,
     ) -> str:
         if not self.gemini_chat_ready:
             raise RuntimeError("gemini chat not ready")
@@ -3276,11 +3301,15 @@ class AIService:
         content = str(user_input or "").strip()
         slots = self._normalize_vision_slots(vision_slots)
         if not content and not slots:
-            return self._gemini_chat_sync(content, model_key, restricted)
+            return self._gemini_chat_sync(
+                content, model_key, restricted, auto_approve_tools=auto_approve_tools
+            )
 
         key = str(session_key or "").strip()
         if not key:
-            return self._gemini_chat_sync(content, model_key, restricted)
+            return self._gemini_chat_sync(
+                content, model_key, restricted, auto_approve_tools=auto_approve_tools
+            )
 
         try:
             history = self._load_active_chat_history(key)
@@ -3309,7 +3338,11 @@ class AIService:
             text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
         else:
             prompt = self._build_gemini_cli_prompt(system_prompt, model_history, current_rendered)
-            text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key))
+            text = self._run_gemini_cli_sync(
+                prompt,
+                self._resolve_gemini_cli_model(model_key),
+                auto_approve_tools=auto_approve_tools,
+            )
 
         try:
             self._save_chat_turn(key, content, text, msg_id=msg_id, vision_slots=slots)

@@ -37,7 +37,12 @@ def test_gemini_chat_with_context_uses_history_and_prompts(monkeypatch, tmp_proj
     restricted_flags: list[bool] = []
     seq = {"n": 0}
 
-    def _fake_run(prompt: str, model_name: str | None = None, restricted: bool = False) -> str:
+    def _fake_run(
+        prompt: str,
+        model_name: str | None = None,
+        restricted: bool = False,
+        auto_approve_tools: bool = False,
+    ) -> str:
         seq["n"] += 1
         prompts.append(prompt)
         models.append(str(model_name or ""))
@@ -187,11 +192,12 @@ def test_run_gemini_cli_sync_reads_agy_transcript_when_stdout_empty(monkeypatch,
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
     monkeypatch.setattr("cooper_bot.modules.ai.aisvc.subprocess.run", _fake_subprocess_run)
 
-    out = svc._run_gemini_cli_sync("Reply exactly OK")
+    out = svc._run_gemini_cli_sync("Reply exactly OK", auto_approve_tools=True)
 
     assert out == "OK from transcript"
     cmd = [str(x) for x in captured["cmd"]]
     assert "--log-file" in cmd
+    assert "--dangerously-skip-permissions" in cmd
     assert "--model" in cmd
     assert captured["creationflags"] == getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0)
 
@@ -209,11 +215,17 @@ def test_run_gemini_cli_sync_restricted_uses_agy_sandbox(monkeypatch, tmp_projec
     monkeypatch.setattr(svc, "_resolve_gemini_cli_executable", lambda: "agy")
     monkeypatch.setattr("cooper_bot.modules.ai.aisvc.subprocess.run", _fake_subprocess_run)
 
-    out = svc._run_gemini_cli_sync("Reply exactly OK", "Claude Opus 4.6 (Thinking)", restricted=True)
+    out = svc._run_gemini_cli_sync(
+        "Reply exactly OK",
+        "Claude Opus 4.6 (Thinking)",
+        restricted=True,
+        auto_approve_tools=True,
+    )
 
     assert out == "OK"
     cmd = [str(x) for x in captured["cmd"]]
     assert "--sandbox" in cmd
+    assert "--dangerously-skip-permissions" not in cmd
     assert cmd[cmd.index("--model") + 1] == "Claude Opus 4.6 (Thinking)"
     assert captured["cwd"] == str(svc.gemini_restricted_workdir)
     assert captured["creationflags"] == getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0)

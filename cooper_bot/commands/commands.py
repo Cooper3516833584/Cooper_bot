@@ -3953,7 +3953,8 @@ async def _handle_ai_chat_trigger(
         if aisvc is None:
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
-        restricted_cli = backend in {"gemini", "claude"} and not _ai_chat_allows_full_cli(ctx)
+        full_cli_permissions = backend in {"gemini", "claude"} and _ai_chat_allows_full_cli(ctx)
+        restricted_cli = backend in {"gemini", "claude"} and not full_cli_permissions
         route_backend = "restricted_antigravity" if restricted_cli else ("deepseek" if backend == "default" else backend)
         use_gemini = backend in {"gemini", "claude"}
         model_key = backend if use_gemini else None
@@ -3984,11 +3985,16 @@ async def _handle_ai_chat_trigger(
         try:
             if session_key and callable(chat_with_context_fn):
                 if use_gemini:
+                    gemini_context_kwargs = {
+                        "msg_id": message_id,
+                        "vision_slots": current_slots,
+                    }
+                    if full_cli_permissions:
+                        gemini_context_kwargs["auto_approve_tools"] = True
                     out = (
                         await chat_with_context_fn(
                             session_key, ai_input, model_key,
-                            msg_id=message_id,
-                            vision_slots=current_slots,
+                            **gemini_context_kwargs,
                         )
                     ).strip()
                 else:
@@ -4005,7 +4011,10 @@ async def _handle_ai_chat_trigger(
                     pass
             else:
                 if use_gemini:
-                    out = (await chat_fn(ai_input, model_key)).strip()
+                    if full_cli_permissions:
+                        out = (await chat_fn(ai_input, model_key, auto_approve_tools=True)).strip()
+                    else:
+                        out = (await chat_fn(ai_input, model_key)).strip()
                 else:
                     out = (await chat_fn(ai_input)).strip()
             if out and _is_likely_ai_stuck_repeat(session_key, ai_input, out):
@@ -4014,7 +4023,10 @@ async def _handle_ai_chat_trigger(
                     + ai_input
                 )
                 if use_gemini:
-                    retry_out = (await chat_fn(retry_prompt, model_key)).strip()
+                    if full_cli_permissions:
+                        retry_out = (await chat_fn(retry_prompt, model_key, auto_approve_tools=True)).strip()
+                    else:
+                        retry_out = (await chat_fn(retry_prompt, model_key)).strip()
                 else:
                     retry_out = (await chat_fn(retry_prompt)).strip()
                 if retry_out:
