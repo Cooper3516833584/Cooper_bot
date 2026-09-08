@@ -26,7 +26,7 @@
 | 05 | 上下文与图片 | PASS | `05_handoff.md`、`test_aisvc_kimi_chat.py` |
 | 06 | 统一聊天路由 | PASS | `06_handoff.md` |
 | 07 | 日历联网 | PASS | `07_handoff.md` |
-| 08 | 清理旧实现 | PARTIAL | `08_handoff.md` |
+| 08 | 清理旧实现 | PASS | `08_handoff.md` |
 | 09 | 汇总验收 | BLOCKED_EXTERNAL | `09_acceptance_report.md` |
 | 10 | 部署与回滚 | READY_FOR_DEPLOYMENT | `10_release_report.md` |
 
