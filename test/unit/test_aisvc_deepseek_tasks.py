@@ -42,13 +42,6 @@ def test_deepseek_task_text_keeps_legacy_stateless_payload(monkeypatch) -> None:
     assert captured[0]["reasoning_effort"] == svc._REASONING_EFFORT_HIGH
 
 
-def test_chat_sync_remains_a_temporary_deepseek_task_bridge(monkeypatch) -> None:
-    svc = _new_service()
-    monkeypatch.setattr(svc, "_deepseek_task_text_sync", lambda text: f"legacy:{text}")
-
-    assert svc._chat_sync("hello") == "legacy:hello"
-
-
 @pytest.mark.asyncio
 async def test_deepseek_task_text_async_wrapper_uses_task_path(monkeypatch) -> None:
     svc = _new_service()
