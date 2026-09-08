@@ -516,6 +516,15 @@ class KimiCliRunner:
             return "\n".join(part for part in parts if part).strip()
         return ""
 
+    @staticmethod
+    def _has_unrecognized_assistant_tool_schema(event: dict, names: list[str]) -> bool:
+        if names:
+            return False
+        message = event.get("message") if isinstance(event.get("message"), dict) else event
+        if str(message.get("role") or event.get("type") or "") != "assistant":
+            return False
+        return any("tool" in str(key).lower() for key in message)
+
     @classmethod
     def _parse_jsonl(cls, raw: bytes, request_id: str) -> tuple[str, tuple[str, ...], bool, bool]:
         try:
@@ -539,6 +548,8 @@ class KimiCliRunner:
             if event_type in {"error", "failed"}:
                 raise KimiProtocolError(request_id, "terminal_error")
             names = cls._extract_tool_names(event)
+            if cls._has_unrecognized_assistant_tool_schema(event, names):
+                raise KimiProtocolError(request_id, "unrecognized_tool_schema")
             if names:
                 tool_seen = True
                 tools.extend(names)

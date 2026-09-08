@@ -152,3 +152,12 @@ def test_stream_json_parser_accepts_legacy_and_message_tool_calls(events, expect
     assert tools == expected_tools
     assert observed is True
     assert protocol is True
+
+
+def test_stream_json_parser_rejects_unknown_assistant_tool_schema() -> None:
+    raw = b'{"type":"assistant","content":"ok","tool_use":{"id":"unknown"}}\n'
+
+    with pytest.raises(KimiProtocolError, match="request_id=req-1") as exc_info:
+        KimiCliRunner._parse_jsonl(raw, "req-1")
+
+    assert exc_info.value.detail == "unrecognized_tool_schema"
