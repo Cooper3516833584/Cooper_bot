@@ -280,8 +280,12 @@ class AIService:
         return ""
 
     @property
-    def chat_ready(self) -> bool:
+    def deepseek_task_ready(self) -> bool:
         return bool(self.deepseek_base_url and self.deepseek_api_key and self.system_prompt)
+
+    @property
+    def chat_ready(self) -> bool:
+        return self.deepseek_task_ready
 
     @property
     def gemini_chat_ready(self) -> bool:
@@ -327,6 +331,9 @@ class AIService:
 
     async def chat(self, user_input: str) -> str:
         return await asyncio.to_thread(self._chat_sync, user_input)
+
+    async def deepseek_task_text(self, user_input: str) -> str:
+        return await asyncio.to_thread(self._deepseek_task_text_sync, user_input)
 
     async def classify_email(
         self,
@@ -2898,7 +2905,11 @@ class AIService:
         return out
 
     def _chat_sync(self, user_input: str) -> str:
-        if not self.chat_ready:
+        # Temporary compatibility bridge: phase 06 will move QQ chat to Kimi.
+        return self._deepseek_task_text_sync(user_input)
+
+    def _deepseek_task_text_sync(self, user_input: str) -> str:
+        if not self.deepseek_task_ready:
             raise RuntimeError("chat not ready")
 
         content = str(user_input or "").strip()

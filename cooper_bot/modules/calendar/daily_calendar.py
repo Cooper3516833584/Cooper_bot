@@ -438,10 +438,10 @@ class DailyCalendarService:
 
     async def _render_message(self, target_date: date, snapshot: dict[str, Any], events: list[dict[str, Any]]) -> str:
         base = self._base_message(target_date, snapshot, events)
-        if self.aisvc is None or not bool(getattr(self.aisvc, "chat_ready", False)):
+        if self.aisvc is None or not bool(getattr(self.aisvc, "deepseek_task_ready", False)):
             return base
-        chat = getattr(self.aisvc, "chat", None)
-        if not callable(chat):
+        task_text = getattr(self.aisvc, "deepseek_task_text", None)
+        if not callable(task_text):
             return base
         factual_events = [{"name": x.get("name"), "fact": x.get("fact"), "category": x.get("category")} for x in events]
         prompt = (
@@ -451,7 +451,7 @@ class DailyCalendarService:
             f"日期：{target_date.isoformat()}，日历：{json.dumps(snapshot, ensure_ascii=False)}，事实：{json.dumps(factual_events, ensure_ascii=False)}"
         )
         try:
-            note = self._sanitize_generated_text(await chat(prompt))
+            note = self._sanitize_generated_text(await task_text(prompt))
         except Exception as e:
             self._warning(f"daily calendar DeepSeek render failed: {str(e)[:180]}")
             note = ""

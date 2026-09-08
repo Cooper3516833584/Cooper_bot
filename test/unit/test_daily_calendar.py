@@ -27,6 +27,7 @@ class _CalendarAI:
     def __init__(self, web_reply: str = "") -> None:
         self.gemini_chat_ready = bool(web_reply)
         self.chat_ready = False
+        self.deepseek_task_ready = False
         self._web_reply = web_reply
         self.calls: list[tuple[str, str, int]] = []
 
@@ -162,6 +163,49 @@ def test_merge_events_enriches_holiday_and_keeps_solar_festival_and_term(tmp_pat
 
     assert [event["name"] for event in events] == ["端午节", "父亲节", "夏至"]
     assert events[0]["fact"] == "今日为端午节假期最后一天。"
+
+
+@pytest.mark.asyncio
+async def test_render_message_uses_explicit_deepseek_task_interface(tmp_path) -> None:
+    ai = SimpleNamespace(
+        deepseek_task_ready=True,
+        deepseek_task_text=AsyncMock(return_value="今天值得记住。"),
+        chat=AsyncMock(side_effect=AssertionError("calendar must not call QQ chat")),
+    )
+    service = _service(tmp_path, ai)
+
+    message = await service._render_message(
+        date(2026, 6, 26),
+        {"weekday": "五", "lunar": "五月十一", "solar_terms": []},
+        [{"name": "测试日", "fact": "已核验事实", "category": "official"}],
+    )
+
+    ai.deepseek_task_text.assert_awaited_once()
+    ai.chat.assert_not_awaited()
+    assert "今天值得记住。" in message
+
+
+@pytest.mark.asyncio
+async def test_render_message_keeps_template_when_deepseek_task_is_unavailable(tmp_path) -> None:
+    ai = SimpleNamespace(
+        deepseek_task_ready=False,
+        chat_ready=True,
+        chat=AsyncMock(side_effect=AssertionError("calendar must not call QQ chat")),
+    )
+    service = _service(tmp_path, ai)
+
+    message = await service._render_message(
+        date(2026, 6, 26),
+        {"weekday": "五", "lunar": "五月十一", "solar_terms": []},
+        [{"name": "测试日", "fact": "已核验事实", "category": "official"}],
+    )
+
+    ai.chat.assert_not_awaited()
+    assert message == service._base_message(
+        date(2026, 6, 26),
+        {"weekday": "五", "lunar": "五月十一", "solar_terms": []},
+        [{"name": "测试日", "fact": "已核验事实", "category": "official"}],
+    )
 
 
 @pytest.mark.asyncio
