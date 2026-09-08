@@ -89,7 +89,6 @@ class KimiProfile:
 class KimiSettings:
     enabled: bool
     cli_path: str
-    expected_version: str
     model: str
     public: KimiProfile
     admin: KimiProfile
@@ -108,6 +107,12 @@ class KimiReadiness:
     calendar_web_ready: bool
     computer_ready: bool
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class KimiRuntimeInfo:
+    executable: str
+    version: str
 
 
 @dataclass(frozen=True)
@@ -146,7 +151,6 @@ def load_kimi_settings() -> KimiSettings:
     return KimiSettings(
         enabled=bool(config.AI_KIMI_ENABLED),
         cli_path=str(config.AI_KIMI_CLI_PATH or "").strip(),
-        expected_version=str(config.AI_KIMI_EXPECTED_VERSION or "").strip(),
         model=str(config.AI_KIMI_MODEL or "").strip(),
         public=KimiProfile(
             name="public",
@@ -206,8 +210,6 @@ def validate_kimi_settings(
         errors.append("kimi_disabled")
     if not executable:
         errors.append("kimi_cli_missing")
-    if not settings.expected_version:
-        errors.append("kimi_expected_version_missing")
     if settings.public.home == settings.admin.home:
         errors.append("kimi_profile_homes_not_isolated")
     if _path_is_within(settings.public.workdir, Path(config.PROJECT_ROOT)):
@@ -239,7 +241,6 @@ def validate_kimi_settings(
         in {
             "kimi_disabled",
             "kimi_cli_missing",
-            "kimi_expected_version_missing",
             "kimi_profile_homes_not_isolated",
             "kimi_public_workdir_inside_project",
         }
@@ -257,6 +258,32 @@ def validate_kimi_settings(
         computer_ready=False,
         errors=tuple(errors),
     )
+
+
+async def detect_kimi_runtime_info(
+    cli_path: str,
+    *,
+    executable_resolver: Callable[[str], Optional[str]] = shutil.which,
+    timeout_seconds: float = 5.0,
+) -> KimiRuntimeInfo:
+    """Return diagnostic version data only; it never influences readiness."""
+    executable = executable_resolver(str(cli_path or "")) if cli_path else None
+    if not executable:
+        return KimiRuntimeInfo("", "unknown")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(executable),
+            "--version",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=max(0.1, float(timeout_seconds)))
+        if process.returncode == 0:
+            return KimiRuntimeInfo(str(executable), stdout[:1024].decode("utf-8", errors="replace").strip() or "unknown")
+    except Exception:
+        pass
+    return KimiRuntimeInfo(str(executable), "unknown")
 
 
 def _windows_argv_units(argv: tuple[str, ...]) -> int:

@@ -276,7 +276,6 @@ AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
 _KIMI_PUBLIC_WORKDIR_DEFAULT = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "Cooper_bot" / "kimi_public"
 AI_KIMI_ENABLED = _get_env_bool("AI_KIMI_ENABLED", True)
 AI_KIMI_CLI_PATH = _get_env("AI_KIMI_CLI_PATH", "kimi")
-AI_KIMI_EXPECTED_VERSION = _get_env("AI_KIMI_EXPECTED_VERSION", "0.34.0")
 AI_KIMI_MODEL = _get_env("AI_KIMI_MODEL", "")
 AI_KIMI_PUBLIC_HOME = _get_env_path("AI_KIMI_PUBLIC_HOME", RUNTIME_DIR / "kimi" / "public")
 AI_KIMI_ADMIN_HOME = _get_env_path("AI_KIMI_ADMIN_HOME", RUNTIME_DIR / "kimi" / "admin")

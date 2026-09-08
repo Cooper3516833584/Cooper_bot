@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from cooper_bot.modules.ai.kimi_cli import (
     ADMIN_TOOLS,
     PUBLIC_TOOLS,
     KimiProfile,
     KimiSettings,
     build_kimi_env,
+    detect_kimi_runtime_info,
     validate_kimi_settings,
 )
 
@@ -30,7 +33,6 @@ def _settings(tmp_path: Path, *, public_workdir: Path | None = None) -> KimiSett
     return KimiSettings(
         enabled=True,
         cli_path="kimi-test",
-        expected_version="0.34.0",
         model="",
         public=KimiProfile("public", public_home, work_public, public_agent, public_home / "empty_skills", PUBLIC_TOOLS),
         admin=KimiProfile("admin", admin_home, work_admin, admin_agent, admin_home / "empty_skills", ADMIN_TOOLS),
@@ -97,3 +99,16 @@ def test_child_environment_keeps_only_explicit_system_values(tmp_path) -> None:
         "SystemRoot": "C:/Windows",
         "KIMI_CODE_HOME": str(settings.public.home),
     }
+
+
+@pytest.mark.asyncio
+async def test_runtime_version_is_diagnostic_and_not_a_readiness_gate(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.PROJECT_ROOT", tmp_path / "project")
+
+    readiness = validate_kimi_settings(settings, executable_resolver=lambda _path: "C:/tools/kimi.exe")
+    info = await detect_kimi_runtime_info("missing", executable_resolver=lambda _path: None)
+
+    assert readiness.configured is True
+    assert "kimi_expected_version_missing" not in readiness.errors
+    assert info.version == "unknown"

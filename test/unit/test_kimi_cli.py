@@ -28,7 +28,7 @@ def _runner(tmp_path: Path, script_body: str, *, argv_budget: int = 24000) -> Ki
     agent = tmp_path / "agent.md"
     agent.write_text("---\nsubagents: []\n---\n", encoding="utf-8")
     profile = KimiProfile("public", home, workdir, agent, skills, ("WebSearch",))
-    settings = KimiSettings(True, sys.executable, "0.34.0", "", profile, profile, 2.0, 2.0, 1, False, False)
+    settings = KimiSettings(True, sys.executable, "", profile, profile, 2.0, 2.0, 1, False, False)
     return KimiCliRunner(
         settings,
         executable_resolver=lambda _path: sys.executable,
