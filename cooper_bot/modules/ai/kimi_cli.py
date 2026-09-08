@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -110,6 +111,12 @@ class KimiReadiness:
 
 
 @dataclass(frozen=True)
+class PublicPolicyCheck:
+    valid: bool
+    errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class KimiRuntimeInfo:
     executable: str
     version: str
@@ -199,6 +206,54 @@ def _validate_agent(profile: KimiProfile) -> Optional[str]:
     return None
 
 
+def validate_public_home_policy(profile: KimiProfile) -> PublicPolicyCheck:
+    """Verify the public home has a strict, global WebSearch-only boundary."""
+    errors: list[str] = []
+    config_path = profile.home / "config.toml"
+    try:
+        with config_path.open("rb") as fh:
+            raw = tomllib.load(fh)
+    except FileNotFoundError:
+        errors.append("kimi_public_config_missing")
+        raw = {}
+    except (OSError, tomllib.TOMLDecodeError):
+        errors.append("kimi_public_config_invalid")
+        raw = {}
+    tools = raw.get("tools") if isinstance(raw, dict) else None
+    enabled = tools.get("enabled") if isinstance(tools, dict) else None
+    if enabled is None:
+        errors.append("kimi_public_tools_policy_missing")
+    elif not isinstance(enabled, list) or set(enabled) != {"WebSearch"} or len(enabled) != 1:
+        errors.append("kimi_public_tools_policy_unsafe")
+    if isinstance(raw, dict) and raw.get("extra_agent_dirs"):
+        errors.append("kimi_public_extra_agent_dirs_enabled")
+    if isinstance(raw, dict) and raw.get("extra_skill_dirs"):
+        errors.append("kimi_public_extra_skill_dirs_enabled")
+    if isinstance(raw, dict) and raw.get("merge_all_available_skills") is not False:
+        errors.append("kimi_public_merge_all_skills_enabled")
+    if isinstance(raw, dict) and raw.get("builtin_product_skills") is not False:
+        errors.append("kimi_public_builtin_product_skills_enabled")
+    mcp_path = profile.home / "mcp.json"
+    if mcp_path.exists():
+        try:
+            mcp_raw = json.loads(mcp_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            errors.append("kimi_public_mcp_config_invalid")
+        else:
+            servers = mcp_raw.get("mcpServers") if isinstance(mcp_raw, dict) else None
+            if servers:
+                errors.append("kimi_public_mcp_enabled")
+    if profile.skills_dir.is_dir():
+        try:
+            if any(profile.skills_dir.iterdir()):
+                errors.append("kimi_public_skills_not_empty")
+        except OSError:
+            errors.append("kimi_public_skills_not_empty")
+    if (profile.workdir / ".kimi-code").exists():
+        errors.append("kimi_public_project_config_present")
+    return PublicPolicyCheck(not errors, tuple(errors))
+
+
 def validate_kimi_settings(
     settings: KimiSettings,
     *,
@@ -233,6 +288,8 @@ def validate_kimi_settings(
     admin_error = _validate_agent(settings.admin)
     if admin_error:
         errors.append(admin_error)
+    public_policy = validate_public_home_policy(settings.public)
+    errors.extend(public_policy.errors)
 
     configured = not any(
         item

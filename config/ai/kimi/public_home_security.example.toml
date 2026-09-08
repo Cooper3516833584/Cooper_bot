@@ -1,0 +1,8 @@
+# Merge these public-only safety settings into AI_KIMI_PUBLIC_HOME/config.toml.
+# Retain the existing provider, model, and authentication configuration.
+
+merge_all_available_skills = false
+builtin_product_skills = false
+
+[tools]
+enabled = ["WebSearch"]

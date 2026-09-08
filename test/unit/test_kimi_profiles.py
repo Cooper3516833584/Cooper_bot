@@ -26,6 +26,13 @@ def _settings(tmp_path: Path, *, public_workdir: Path | None = None) -> KimiSett
     work_admin = tmp_path / "admin_workdir"
     for path in (public_home, admin_home, work_public, work_admin, public_home / "empty_skills", admin_home / "empty_skills"):
         path.mkdir(parents=True, exist_ok=True)
+    (public_home / "config.toml").write_text(
+        'merge_all_available_skills = false\n'
+        'builtin_product_skills = false\n\n'
+        '[tools]\n'
+        'enabled = ["WebSearch"]\n',
+        encoding="utf-8",
+    )
     public_agent = tmp_path / "public.md"
     admin_agent = tmp_path / "admin.md"
     _write_agent(public_agent, PUBLIC_TOOLS)
@@ -99,6 +106,38 @@ def test_child_environment_keeps_only_explicit_system_values(tmp_path) -> None:
         "SystemRoot": "C:/Windows",
         "KIMI_CODE_HOME": str(settings.public.home),
     }
+
+
+@pytest.mark.parametrize(
+    ("config_text", "expected_error"),
+    [
+        ('[tools]\nenabled = []\n', "kimi_public_tools_policy_unsafe"),
+        ('[tools]\nenabled = ["WebSearch", "Bash"]\n', "kimi_public_tools_policy_unsafe"),
+        ('merge_all_available_skills = false\nbuiltin_product_skills = false\n', "kimi_public_tools_policy_missing"),
+    ],
+)
+def test_public_policy_rejects_unsafe_tool_allowlists(tmp_path, monkeypatch, config_text, expected_error) -> None:
+    settings = _settings(tmp_path)
+    settings.public.home.joinpath("config.toml").write_text(config_text, encoding="utf-8")
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.PROJECT_ROOT", tmp_path / "project")
+
+    readiness = validate_kimi_settings(settings, executable_resolver=lambda _path: "C:/tools/kimi.exe")
+
+    assert readiness.public_profile_valid is False
+    assert expected_error in readiness.errors
+
+
+def test_public_policy_rejects_mcp_and_nonempty_skills(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    settings.public.home.joinpath("mcp.json").write_text('{"mcpServers":{"unsafe":{}}}', encoding="utf-8")
+    settings.public.skills_dir.joinpath("skill.md").write_text("unsafe", encoding="utf-8")
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.PROJECT_ROOT", tmp_path / "project")
+
+    readiness = validate_kimi_settings(settings, executable_resolver=lambda _path: "C:/tools/kimi.exe")
+
+    assert readiness.public_profile_valid is False
+    assert "kimi_public_mcp_enabled" in readiness.errors
+    assert "kimi_public_skills_not_empty" in readiness.errors
 
 
 @pytest.mark.asyncio
