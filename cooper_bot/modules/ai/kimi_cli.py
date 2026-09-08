@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import tomllib
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional
@@ -45,6 +47,10 @@ _MAX_STDERR_BYTES = 64 * 1024
 _DEFAULT_QUEUE_TIMEOUT_SECONDS = 8.0
 _DEFAULT_MAX_QUEUE = 12
 _WINDOWS_ARGV_BUDGET = 24000
+_LEGACY_URP_CALL_RE = re.compile(
+    r"<system_urp_calling>\s*<url>(?P<url>[^<]+)</url>\s*<method>GET</method>\s*</system_urp_calling>\s*",
+    re.IGNORECASE,
+)
 
 
 class KimiCliError(RuntimeError):
@@ -477,6 +483,28 @@ class KimiCliRunner:
         return b"".join(chunks)
 
     @staticmethod
+    def _extract_legacy_urp_tool_names(content: str) -> list[str]:
+        """Adapt Kimi 0.34's structured WebSearch marker in assistant content."""
+        text = str(content or "")
+        if "<system_urp_calling>" not in text:
+            return []
+        matches = list(_LEGACY_URP_CALL_RE.finditer(text))
+        if not matches:
+            return ["UnknownURP"]
+        names: list[str] = []
+        for match in matches:
+            parsed = urlparse(match.group("url").strip())
+            if parsed.scheme == "https" and parsed.netloc.lower() in {"google.com", "www.google.com"} and parsed.path == "/search":
+                names.append("WebSearch")
+            else:
+                names.append("UnknownURP")
+        return names
+
+    @staticmethod
+    def _strip_legacy_urp_blocks(content: str) -> str:
+        return _LEGACY_URP_CALL_RE.sub("", str(content or "")).strip()
+
+    @staticmethod
     def _extract_tool_names(event: dict) -> list[str]:
         names: list[str] = []
         for candidate in (event, event.get("message")):
@@ -485,6 +513,10 @@ class KimiCliRunner:
             direct = candidate.get("name") or candidate.get("tool_name")
             if isinstance(direct, str) and direct.strip():
                 names.append(direct.strip())
+            role = str(candidate.get("role") or event.get("type") or "")
+            content = candidate.get("content")
+            if role == "assistant" and isinstance(content, str):
+                names.extend(KimiCliRunner._extract_legacy_urp_tool_names(content))
             calls = candidate.get("tool_calls")
             if not isinstance(calls, list):
                 continue
@@ -506,7 +538,7 @@ class KimiCliRunner:
             return None
         content = message.get("content")
         if isinstance(content, str):
-            return content.strip()
+            return KimiCliRunner._strip_legacy_urp_blocks(content)
         if isinstance(content, list):
             parts = [
                 str(block.get("text") or "").strip()

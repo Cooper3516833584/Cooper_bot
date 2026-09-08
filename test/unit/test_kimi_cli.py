@@ -142,6 +142,7 @@ async def test_public_websearch_is_allowed_and_admin_bash_is_not_restricted(tmp_
         ([{"type": "assistant", "message": {"role": "assistant", "tool_calls": [{"name": "Bash"}]}}, {"type": "assistant", "content": "ok"}], ("Bash",), "ok"),
         ([{"message": {"role": "assistant", "tool_calls": [{"function": {"name": "Read", "arguments": "{}"}}]}}, {"type": "assistant", "content": "ok"}], ("Read",), "ok"),
         ([{"tool_calls": [{"function": {"name": "WebSearch"}}]}, {"message": {"role": "assistant", "content": [{"type": "text", "text": "block answer"}]}}], ("WebSearch",), "block answer"),
+        ([{"type": "assistant", "content": "<system_urp_calling>\n<url>https://www.google.com/search?q=capital+of+France</url>\n<method>GET</method>\n</system_urp_calling>\nParis"}], ("WebSearch",), "Paris"),
     ],
 )
 def test_stream_json_parser_accepts_legacy_and_message_tool_calls(events, expected_tools, expected_text) -> None:
@@ -162,3 +163,14 @@ def test_stream_json_parser_rejects_unknown_assistant_tool_schema() -> None:
         KimiCliRunner._parse_jsonl(raw, "req-1")
 
     assert exc_info.value.detail == "unrecognized_tool_schema"
+
+
+def test_stream_json_parser_fails_closed_on_unknown_legacy_urp_target() -> None:
+    raw = b'{"type":"assistant","content":"<system_urp_calling><url>https://example.test/private</url><method>GET</method></system_urp_calling>ok"}\n'
+
+    text, tools, observed, protocol = KimiCliRunner._parse_jsonl(raw, "req-1")
+
+    assert text == "ok"
+    assert tools == ("UnknownURP",)
+    assert observed is True
+    assert protocol is True
