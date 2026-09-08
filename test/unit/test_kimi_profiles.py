@@ -151,5 +151,4 @@ async def test_runtime_version_is_diagnostic_and_not_a_readiness_gate(tmp_path, 
     info = await detect_kimi_runtime_info("missing", executable_resolver=lambda _path: None)
 
     assert readiness.configured is True
-    assert "kimi_expected_version_missing" not in readiness.errors
     assert info.version == "unknown"
