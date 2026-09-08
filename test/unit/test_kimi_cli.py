@@ -51,7 +51,7 @@ async def test_runner_keeps_prompt_as_one_argv_value_and_filters_tool_events(tmp
         "print(json.dumps({'type': 'tool_call', 'name': 'WebSearch'}))\n"
         "print(json.dumps({'type': 'assistant', 'content': sys.argv[-1]}))\n",
     )
-    prompt = 'line1\n" && % --not-a-flag 😀'
+    prompt = 'line1\n--agent-file C:/attacker/admin.md KIMI_CODE_HOME=C:/attacker Bash " && % --not-a-flag 😀'
 
     result = await runner.run(_request(prompt))
 
@@ -96,11 +96,12 @@ async def test_runner_rejects_oversized_windows_argument_before_spawn(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_public_forbidden_tool_discards_reply_and_latches_unhealthy(tmp_path) -> None:
+@pytest.mark.parametrize("tool_name", ("Bash", "Read", "Write", "Edit", "FetchURL", "Agent"))
+async def test_public_forbidden_tool_discards_reply_and_latches_unhealthy(tmp_path, tool_name) -> None:
     runner = _runner(
         tmp_path,
         "import json\n"
-        "print(json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'tool_calls': [{'name': 'Bash'}]}}))\n"
+        f"print(json.dumps({{'type': 'assistant', 'message': {{'role': 'assistant', 'tool_calls': [{{'name': {tool_name!r}}}]}}}}))\n"
         "print(json.dumps({'type': 'assistant', 'content': 'must not return'}))\n",
     )
 
