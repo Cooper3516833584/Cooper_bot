@@ -3015,51 +3015,6 @@ class AIService:
             "summary": str(obj.get("summary") or "").strip(),
         }
 
-    def _restricted_gemini_calendar_chat_sync(
-        self,
-        user_input: str,
-        model_key: Optional[str] = None,
-        timeout_seconds: Optional[float] = None,
-    ) -> str:
-        if not self.gemini_chat_ready:
-            raise RuntimeError("gemini chat not ready")
-        content = str(user_input or "").strip()
-        if not content:
-            raise RuntimeError("calendar web request is empty")
-        prompt = self._build_restricted_gemini_cli_prompt("", [], content)
-        return self._run_gemini_cli_sync(
-            prompt,
-            self._resolve_gemini_cli_model(model_key),
-            restricted=True,
-            timeout_seconds=timeout_seconds,
-        )
-
-    def _gemini_chat_sync(
-        self,
-        user_input: str,
-        model_key: Optional[str] = None,
-        restricted: bool = False,
-        *,
-        auto_approve_tools: bool = False,
-    ) -> str:
-        if not self.gemini_chat_ready:
-            raise RuntimeError("gemini chat not ready")
-
-        content = str(user_input or "").strip()
-        if not content:
-            return "想聊点啥？发我一句话就行。"
-
-        system_prompt = self._append_chat_automation_boundary(self.system_prompt)
-        if restricted:
-            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, [], content)
-            return self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
-        prompt = self._build_gemini_cli_prompt(system_prompt, [], content)
-        return self._run_gemini_cli_sync(
-            prompt,
-            self._resolve_gemini_cli_model(model_key),
-            auto_approve_tools=auto_approve_tools,
-        )
-
     def _chat_with_context_sync(
         self,
         session_key: str,
@@ -3303,72 +3258,6 @@ class AIService:
             text = self._strip_web_search_marker(text)
         if not text:
             raise RuntimeError("empty chat response")
-        return text
-
-    def _gemini_chat_with_context_sync(
-        self,
-        session_key: str,
-        user_input: str,
-        model_key: Optional[str] = None,
-        restricted: bool = False,
-        *,
-        msg_id: str = "",
-        vision_slots: Optional[list] = None,
-        auto_approve_tools: bool = False,
-    ) -> str:
-        if not self.gemini_chat_ready:
-            raise RuntimeError("gemini chat not ready")
-
-        content = str(user_input or "").strip()
-        slots = self._normalize_vision_slots(vision_slots)
-        if not content and not slots:
-            return self._gemini_chat_sync(
-                content, model_key, restricted, auto_approve_tools=auto_approve_tools
-            )
-
-        key = str(session_key or "").strip()
-        if not key:
-            return self._gemini_chat_sync(
-                content, model_key, restricted, auto_approve_tools=auto_approve_tools
-            )
-
-        try:
-            history = self._load_active_chat_history(key)
-            backend_key = (
-                "claude"
-                if str(model_key or "").strip().lower()
-                in {"claude", "opus", "opus4.6", "claude-opus"}
-                else "gemini"
-            )
-            history = self._select_history_for_backend(history, backend_key)
-            model_history = self._materialize_history_for_model(history)
-        except Exception as e:
-            self.log.warning(f"AI chat context read failed, fallback to stateless gemini: session={key[:80]} err={e}")
-            history = []
-            model_history = []
-
-        # 当前消息：基础文字 + 视觉 slots 渲染
-        current_message = {"role": "user", "content": content}
-        if slots:
-            current_message["_vision"] = slots
-        current_rendered = self._render_chat_message_content(current_message)
-
-        system_prompt = self._append_chat_automation_boundary(self._select_chat_system_prompt(key) or self.system_prompt)
-        if restricted:
-            prompt = self._build_restricted_gemini_cli_prompt(system_prompt, model_history, current_rendered)
-            text = self._run_gemini_cli_sync(prompt, self._resolve_gemini_cli_model(model_key), restricted=True)
-        else:
-            prompt = self._build_gemini_cli_prompt(system_prompt, model_history, current_rendered)
-            text = self._run_gemini_cli_sync(
-                prompt,
-                self._resolve_gemini_cli_model(model_key),
-                auto_approve_tools=auto_approve_tools,
-            )
-
-        try:
-            self._save_chat_turn(key, content, text, msg_id=msg_id, vision_slots=slots)
-        except Exception as e:
-            self.log.warning(f"AI chat context write failed, keep stateless next turn: session={key[:80]} err={e}")
         return text
 
     def _normalize_chat_history_item(self, item: object) -> Optional[Dict[str, str]]:
