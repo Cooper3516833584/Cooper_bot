@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from cooper_bot.modules.vision.vision_skill import VisionSlot
+from cooper_bot.modules.ai.kimi_cli import KimiCliRunner, KimiRunRequest, load_kimi_settings
 
 from cooper_bot.core.config import (
     AI_API_KEY_PATH,
@@ -136,6 +137,7 @@ class AIService:
     )
     _BACKEND_HISTORY_LIMITS = {
         "deepseek": 300,
+        "kimi": 100,
         "gemini": 100,
         "claude": 100,
     }
@@ -202,6 +204,7 @@ class AIService:
         self._lock = threading.RLock()
         self._chat_sessions_lock = threading.RLock()
         self._chat_sessions: Dict[str, Dict[str, object]] = {}
+        self._kimi_runner = KimiCliRunner(load_kimi_settings())
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
         self._semantic_entry_by_rel: Dict[str, Tuple[dict, np.ndarray]] = {}
@@ -334,6 +337,69 @@ class AIService:
 
     async def deepseek_task_text(self, user_input: str) -> str:
         return await asyncio.to_thread(self._deepseek_task_text_sync, user_input)
+
+    @staticmethod
+    def _kimi_storage_key(base_key: str, *, allow_computer: bool, actor_user_id: Optional[int]) -> str:
+        key = str(base_key or "").strip()
+        if not allow_computer:
+            return key
+        try:
+            actor = int(actor_user_id or 0)
+        except (TypeError, ValueError):
+            actor = 0
+        if actor <= 0 or not key or key.startswith("admin:"):
+            raise RuntimeError("invalid admin chat context")
+        return f"admin:{actor}:{key}"
+
+    def _build_kimi_prompt(self, base_key: str, history: List[Dict[str, str]], current: str, *, purpose: str) -> str:
+        return json.dumps(
+            {
+                "purpose": purpose,
+                "system_instructions": self._select_chat_system_prompt(base_key) or self.system_prompt,
+                "conversation_history": self._materialize_history_for_model(history),
+                "latest_user_request": current,
+            },
+            ensure_ascii=False,
+        )
+
+    async def kimi_chat_with_context(
+        self,
+        session_key: str,
+        user_input: str,
+        *,
+        msg_id: str = "",
+        vision_slots: Optional[list] = None,
+        allow_computer: bool = False,
+        actor_user_id: Optional[int] = None,
+    ) -> str:
+        base_key = str(session_key or "").strip()
+        storage_key = self._kimi_storage_key(base_key, allow_computer=allow_computer, actor_user_id=actor_user_id)
+        slots = self._normalize_vision_slots(vision_slots)
+        content = str(user_input or "").strip()
+        current = self._render_chat_message_content({"role": "user", "content": content, "_vision": slots} if slots else {"role": "user", "content": content})
+        history = self._select_history_for_backend(self._load_active_chat_history(storage_key), "kimi") if storage_key else []
+        request = KimiRunRequest(
+            prompt=self._build_kimi_prompt(base_key, history, current, purpose="qq_chat"),
+            profile="admin" if allow_computer else "public",
+            timeout_seconds=self._kimi_runner.settings.admin_timeout_seconds if allow_computer else self._kimi_runner.settings.timeout_seconds,
+            request_id=str(msg_id or f"kimi-{time.time_ns()}"),
+            purpose="qq_chat",
+        )
+        result = await self._kimi_runner.run(request)
+        text = str(result.text or "").strip()
+        if not text:
+            raise RuntimeError("empty kimi response")
+        if storage_key:
+            self._save_chat_turn(storage_key, content, text, msg_id=msg_id, vision_slots=slots)
+        return text
+
+    async def kimi_chat(self, user_input: str, *, allow_computer: bool = False, actor_user_id: Optional[int] = None) -> str:
+        return await self.kimi_chat_with_context(
+            "private:stateless",
+            user_input,
+            allow_computer=allow_computer,
+            actor_user_id=actor_user_id,
+        )
 
     async def classify_email(
         self,
