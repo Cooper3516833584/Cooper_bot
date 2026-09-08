@@ -21,7 +21,7 @@
 | --- | --- | --- |
 | 01 | 固定基线与 CLI 合同 | BLOCKED_EXTERNAL | `01_baseline.md`、`01_callsite_inventory.md`、`01_cli_contract.md`、`01_handoff.md` |
 | 02 | 保护 DeepSeek 非聊天 | PASS | `02_handoff.md` |
-| 03 | 配置与 profiles | NOT_STARTED | — |
+| 03 | 配置与 profiles | BLOCKED_EXTERNAL | `03_handoff.md` |
 | 04 | CLI 运行器 | NOT_STARTED | — |
 | 05 | 上下文与图片 | NOT_STARTED | — |
 | 06 | 统一聊天路由 | NOT_STARTED | — |

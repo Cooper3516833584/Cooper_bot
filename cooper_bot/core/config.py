@@ -83,6 +83,20 @@ def _get_env_path(name: str, default: Path) -> Path:
         return p
     return (BASE_DIR / p).resolve()
 
+def _get_env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(_get_env(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return float(default)
+    return max(float(minimum), min(value, float(maximum)))
+
+def _get_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(_get_env(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return int(default)
+    return max(int(minimum), min(value, int(maximum)))
+
 def _parse_int_set(s: str) -> set[int]:
     out: set[int] = set()
     for part in re.split(r"[\s,，]+", (s or "").strip()):
@@ -256,6 +270,26 @@ AI_WEB_SEARCH_ENABLED = _get_env("AI_WEB_SEARCH_ENABLED", "1") == "1"
 AI_WEB_SEARCH_MODEL = _get_env("AI_WEB_SEARCH_MODEL", "")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
+
+# ===== Kimi Code CLI（QQ 自由聊天迁移配置）=====
+# Kimi 的 provider/认证独立保存在各 profile home，绝不复用 api_key.txt。
+_KIMI_PUBLIC_WORKDIR_DEFAULT = Path(os.getenv("LOCALAPPDATA") or Path.home()) / "Cooper_bot" / "kimi_public"
+AI_KIMI_ENABLED = _get_env_bool("AI_KIMI_ENABLED", True)
+AI_KIMI_CLI_PATH = _get_env("AI_KIMI_CLI_PATH", "kimi")
+AI_KIMI_EXPECTED_VERSION = _get_env("AI_KIMI_EXPECTED_VERSION", "0.34.0")
+AI_KIMI_MODEL = _get_env("AI_KIMI_MODEL", "")
+AI_KIMI_PUBLIC_HOME = _get_env_path("AI_KIMI_PUBLIC_HOME", RUNTIME_DIR / "kimi" / "public")
+AI_KIMI_ADMIN_HOME = _get_env_path("AI_KIMI_ADMIN_HOME", RUNTIME_DIR / "kimi" / "admin")
+AI_KIMI_PUBLIC_WORKDIR = _get_env_path("AI_KIMI_PUBLIC_WORKDIR", _KIMI_PUBLIC_WORKDIR_DEFAULT)
+AI_KIMI_ADMIN_WORKDIR = _get_env_path("AI_KIMI_ADMIN_WORKDIR", WORKSPACES_DIR / "kimi_admin")
+AI_KIMI_PUBLIC_AGENT_PATH = _get_env_path("AI_KIMI_PUBLIC_AGENT_PATH", AI_CONFIG_DIR / "kimi" / "public.md")
+AI_KIMI_ADMIN_AGENT_PATH = _get_env_path("AI_KIMI_ADMIN_AGENT_PATH", AI_CONFIG_DIR / "kimi" / "admin.md")
+AI_KIMI_TIMEOUT_SECONDS = _get_env_float("AI_KIMI_TIMEOUT_SECONDS", 120.0, 10.0, 600.0)
+AI_KIMI_ADMIN_TIMEOUT_SECONDS = _get_env_float("AI_KIMI_ADMIN_TIMEOUT_SECONDS", 480.0, 10.0, 600.0)
+AI_KIMI_MAX_CONCURRENCY = _get_env_int("AI_KIMI_MAX_CONCURRENCY", 3, 1, 16)
+AI_KIMI_ADMIN_ENABLED = _get_env_bool("AI_KIMI_ADMIN_ENABLED", False)
+AI_KIMI_ALLOW_GROUP_COMPUTER = _get_env_bool("AI_KIMI_ALLOW_GROUP_COMPUTER", False)
+
 AI_GEMINI_CLI_PATH = _get_env("AI_GEMINI_CLI_PATH", "agy")
 AI_GEMINI_MODEL = _get_env("AI_GEMINI_MODEL", "Gemini 3.1 Pro (High)")
 AI_CLAUDE_MODEL = _get_env("AI_CLAUDE_MODEL", "Claude Opus 4.6 (Thinking)")
