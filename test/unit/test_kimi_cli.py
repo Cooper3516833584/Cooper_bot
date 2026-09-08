@@ -91,3 +91,24 @@ async def test_runner_rejects_oversized_windows_argument_before_spawn(tmp_path, 
 
     with pytest.raises(KimiInputTooLargeError, match="request_id=req-1"):
         await runner.run(_request("😀" * 1000))
+
+
+@pytest.mark.parametrize(
+    ("events", "expected_tools", "expected_text"),
+    [
+        ([{"type": "tool_call", "name": "WebSearch"}, {"type": "assistant", "content": "ok"}], ("WebSearch",), "ok"),
+        ([{"type": "tool", "tool_name": "WebSearch"}, {"type": "assistant", "content": "ok"}], ("WebSearch",), "ok"),
+        ([{"type": "assistant", "message": {"role": "assistant", "tool_calls": [{"name": "Bash"}]}}, {"type": "assistant", "content": "ok"}], ("Bash",), "ok"),
+        ([{"message": {"role": "assistant", "tool_calls": [{"function": {"name": "Read", "arguments": "{}"}}]}}, {"type": "assistant", "content": "ok"}], ("Read",), "ok"),
+        ([{"tool_calls": [{"function": {"name": "WebSearch"}}]}, {"message": {"role": "assistant", "content": [{"type": "text", "text": "block answer"}]}}], ("WebSearch",), "block answer"),
+    ],
+)
+def test_stream_json_parser_accepts_legacy_and_message_tool_calls(events, expected_tools, expected_text) -> None:
+    raw = ("\n".join(__import__("json").dumps(event) for event in events) + "\n").encode()
+
+    text, tools, observed, protocol = KimiCliRunner._parse_jsonl(raw, "req-1")
+
+    assert text == expected_text
+    assert tools == expected_tools
+    assert observed is True
+    assert protocol is True

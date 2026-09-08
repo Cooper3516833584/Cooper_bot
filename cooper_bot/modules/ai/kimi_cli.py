@@ -138,6 +138,7 @@ class KimiRunResult:
     exit_code: int
     tool_names: tuple[str, ...]
     tool_call_observed: bool
+    protocol_observed: bool
 
 
 def build_kimi_env(profile: KimiProfile, source_env: Optional[Mapping[str, str]] = None) -> dict[str, str]:
@@ -451,7 +452,47 @@ class KimiCliRunner:
         return b"".join(chunks)
 
     @staticmethod
-    def _parse_jsonl(raw: bytes, request_id: str) -> tuple[str, tuple[str, ...], bool]:
+    def _extract_tool_names(event: dict) -> list[str]:
+        names: list[str] = []
+        for candidate in (event, event.get("message")):
+            if not isinstance(candidate, dict):
+                continue
+            direct = candidate.get("name") or candidate.get("tool_name")
+            if isinstance(direct, str) and direct.strip():
+                names.append(direct.strip())
+            calls = candidate.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name") or call.get("tool_name")
+                function = call.get("function")
+                if not name and isinstance(function, dict):
+                    name = function.get("name")
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
+        return names
+
+    @staticmethod
+    def _extract_assistant_text(event: dict) -> Optional[str]:
+        message = event.get("message") if isinstance(event.get("message"), dict) else event
+        if str(message.get("role") or event.get("type") or "") != "assistant":
+            return None
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = [
+                str(block.get("text") or "").strip()
+                for block in content
+                if isinstance(block, dict) and str(block.get("type") or "") in {"text", "output_text"}
+            ]
+            return "\n".join(part for part in parts if part).strip()
+        return ""
+
+    @classmethod
+    def _parse_jsonl(cls, raw: bytes, request_id: str) -> tuple[str, tuple[str, ...], bool, bool]:
         try:
             lines = raw.decode("utf-8").splitlines()
         except UnicodeDecodeError as exc:
@@ -459,6 +500,7 @@ class KimiCliRunner:
         final_text = ""
         tools: list[str] = []
         tool_seen = False
+        protocol_seen = False
         for line in lines:
             if not line.strip():
                 continue
@@ -471,24 +513,23 @@ class KimiCliRunner:
             event_type = str(event.get("type") or "")
             if event_type in {"error", "failed"}:
                 raise KimiProtocolError(request_id, "terminal_error")
-            if event_type in {"tool_call", "tool", "tool_result"}:
+            names = cls._extract_tool_names(event)
+            if names:
                 tool_seen = True
-                name = str(event.get("name") or event.get("tool_name") or "").strip()
-                if name:
-                    tools.append(name)
-                continue
-            content = event.get("content")
-            if event_type == "assistant" and isinstance(content, str):
-                final_text = content.strip()
-                continue
-            message = event.get("message")
-            if isinstance(message, dict) and str(message.get("role") or "") == "assistant":
-                content = message.get("content")
-                if isinstance(content, str):
-                    final_text = content.strip()
+                tools.extend(names)
+                protocol_seen = True
+            text = cls._extract_assistant_text(event)
+            if text is not None:
+                protocol_seen = True
+                if text:
+                    final_text = text
+            elif event_type in {"tool_call", "tool", "tool_result", "tool_message", "usage", "done"}:
+                protocol_seen = True
+        if not protocol_seen:
+            raise KimiProtocolError(request_id, "unrecognized_protocol")
         if not final_text:
             raise KimiEmptyReplyError(request_id)
-        return final_text, tuple(dict.fromkeys(tools)), tool_seen
+        return final_text, tuple(dict.fromkeys(tools)), tool_seen, protocol_seen
 
     async def _stop_process(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
@@ -537,8 +578,8 @@ class KimiCliRunner:
             await stderr_task
             if process.returncode != 0:
                 raise KimiProtocolError(request.request_id, "process_failed")
-            text, tools, tool_seen = self._parse_jsonl(stdout, request.request_id)
-            return KimiRunResult(text, request.request_id, int(process.returncode), tools, tool_seen)
+            text, tools, tool_seen, protocol_seen = self._parse_jsonl(stdout, request.request_id)
+            return KimiRunResult(text, request.request_id, int(process.returncode), tools, tool_seen, protocol_seen)
         except asyncio.CancelledError:
             if process is not None:
                 await self._stop_process(process)
