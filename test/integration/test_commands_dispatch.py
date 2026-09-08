@@ -112,7 +112,6 @@ class _FakeAIService:
     def __init__(self) -> None:
         self.bot_nick = "Cooper_bot"
         self.chat_ready = True
-        self.gemini_chat_ready = True
         self.notice_ready = True
         self.semantic_ready = False
         self.fallback_error_reply = "fallback"
@@ -120,10 +119,6 @@ class _FakeAIService:
         self.remember_assistant_message = Mock()
         self.chat_with_context = AsyncMock(return_value="fake-ai-reply")
         self.chat = AsyncMock(return_value="fake-ai-reply")
-        self.gemini_chat_with_context = AsyncMock(return_value="gemini-ai-reply")
-        self.gemini_chat = AsyncMock(return_value="gemini-ai-reply")
-        self.restricted_gemini_chat_with_context = AsyncMock(return_value="restricted-gemini-ai-reply")
-        self.restricted_gemini_chat = AsyncMock(return_value="restricted-gemini-ai-reply")
         self.extract_notice_url_head = AsyncMock(return_value="")
         self.classify_notice = AsyncMock(return_value=False)
         self.reason_notice = AsyncMock(return_value="")

@@ -42,6 +42,35 @@ async def test_kimi_admin_history_does_not_read_public_group_history() -> None:
 
 
 @pytest.mark.asyncio
+async def test_kimi_context_includes_vision_and_saves_only_base_text() -> None:
+    svc = AIService(_Log())
+    svc.system_prompt = "system"
+    runner = _Runner()
+    svc._kimi_runner = runner
+
+    await svc.kimi_chat_with_context(
+        "private:10001",
+        "多少钱？",
+        msg_id="1",
+        vision_slots=[
+            {
+                "slot_id": "1:1",
+                "index": 1,
+                "segment_type": "image",
+                "status": "ready",
+                "description": "类型：产品照片；画面：RTX 5090",
+            }
+        ],
+    )
+
+    prompt = json.loads(runner.requests[0].prompt)
+    assert "[视觉内容1] 类型：产品照片；画面：RTX 5090" in prompt["latest_user_request"]
+    history = svc._load_active_chat_history("private:10001")
+    assert history[0]["content"] == "多少钱？"
+    assert "[视觉内容1]" not in history[0]["content"]
+
+
+@pytest.mark.asyncio
 async def test_calendar_web_query_requires_observed_websearch(monkeypatch) -> None:
     svc = AIService(_Log())
     runner = _Runner()

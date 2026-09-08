@@ -93,7 +93,6 @@ class _FakeAIService:
     def __init__(self) -> None:
         self.bot_nick = "Cooper_bot"
         self.chat_ready = True
-        self.gemini_chat_ready = True
         self.notice_ready = False
         self.semantic_ready = False
         self.fallback_error_reply = "fallback"
@@ -101,10 +100,6 @@ class _FakeAIService:
         self.remember_assistant_message = Mock()
         self.chat_with_context = AsyncMock(return_value="fake-ai-reply")
         self.chat = AsyncMock(return_value="fake-ai-reply")
-        self.gemini_chat_with_context = AsyncMock(return_value="gemini-ai-reply")
-        self.gemini_chat = AsyncMock(return_value="gemini-ai-reply")
-        self.restricted_gemini_chat_with_context = AsyncMock(return_value="restricted-gemini-ai-reply")
-        self.restricted_gemini_chat = AsyncMock(return_value="restricted-gemini-ai-reply")
         self.semantic_find_paths = AsyncMock(return_value=[])
         # 视觉 slot 接口（dispatch 层测试用）
         self.collect_unresolved_vision_slots = Mock(return_value=[])
@@ -202,13 +197,11 @@ def test_select_history_windows() -> None:
     history = _make_history(350)
     ds = svc._select_history_for_backend(history, "deepseek")
     assert len(ds) == 300
-    gm = svc._select_history_for_backend(history, "gemini")
-    assert len(gm) == 100
-    cl = svc._select_history_for_backend(history, "claude")
-    assert len(cl) == 100
-    # 第 150 条：deepseek 可见、gemini/claude 不可见
+    kimi = svc._select_history_for_backend(history, "kimi")
+    assert len(kimi) == 100
+    # 第 150 条：DeepSeek 任务窗口可见，Kimi 聊天窗口不可见。
     assert "msg-150" in {m["content"] for m in ds}
-    assert "msg-150" not in {m["content"] for m in gm}
+    assert "msg-150" not in {m["content"] for m in kimi}
 
 
 def test_normalize_vision_slots_filters_invalid() -> None:
@@ -272,7 +265,7 @@ def test_materialize_history_removes_internal_fields() -> None:
 def test_collect_unresolved_by_backend_window() -> None:
     svc = _new_aisvc()
     # 构造 150 条历史，第 1 条（index 0）带 unresolved slot：
-    # 150 条里 index 0 在 deepseek 300 窗口内，但不在 gemini/claude 最后 100 条窗口内
+    # 150 条里 index 0 在 DeepSeek 任务窗口内，但不在 Kimi 的最后 100 条窗口内。
     history = _make_history(150)
     history[0] = {
         "role": "user",
@@ -285,10 +278,8 @@ def test_collect_unresolved_by_backend_window() -> None:
 
     deepseek = svc.collect_unresolved_vision_slots("group:1", "deepseek")
     assert len(deepseek) == 1  # 300 窗口内可见
-    gemini = svc.collect_unresolved_vision_slots("group:1", "gemini")
-    assert gemini == []  # 最后 100 条窗口内不可见（第 1 条）
-    claude = svc.collect_unresolved_vision_slots("group:1", "claude")
-    assert claude == []
+    kimi = svc.collect_unresolved_vision_slots("group:1", "kimi")
+    assert kimi == []  # 最后 100 条窗口内不可见（第 1 条）
 
 
 def test_apply_vision_resolutions_by_slot_id() -> None:
@@ -697,67 +688,6 @@ async def test_dispatch_group_mention_image_resolves_history_slots(dispatch_harn
     }
     assert "old:1" in resolved_slot_ids
     aisvc.apply_vision_resolutions.assert_called_once()
-
-
-# ============ 剩余问题 regression tests ============
-
-
-def test_deepseek_web_search_keeps_current_vision(monkeypatch) -> None:
-    svc = _new_aisvc()
-    svc.web_search_enabled = True
-    payloads: list[dict[str, Any]] = []
-
-    def _fake_post_json(_url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
-        _ = timeout
-        payloads.append(payload)
-        if len(payloads) == 1:
-            return {"choices": [{"message": {"content": "[WEB_SEARCH]某显卡最新价格"}}]}
-        return {"choices": [{"message": {"content": "整合回答"}}]}
-
-    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
-    monkeypatch.setattr(svc, "_web_search_fetch_sources_sync", lambda _q: "搜索素材")
-    slots = [
-        {"slot_id": "1:1", "index": 1, "segment_type": "image", "status": "ready", "description": "类型：产品照片；画面：RTX 5090"}
-    ]
-
-    out = svc._chat_with_context_sync("private:10001", "多少钱？", msg_id="1", vision_slots=slots)
-    assert out == "整合回答"
-    assert len(payloads) == 2
-    # 联网整合阶段 user content 必须包含当前图片描述
-    second_user = payloads[1]["messages"][-1]["content"]
-    assert "多少钱？" in second_user
-    assert "[视觉内容1] 类型：产品照片；画面：RTX 5090" in second_user
-    # 历史保存仍为基础文本
-    history = svc._load_active_chat_history("private:10001")
-    assert history[0]["content"] == "多少钱？"
-    assert "[视觉内容1]" not in history[0]["content"]
-
-
-def test_deepseek_web_search_fallback_keeps_current_vision(monkeypatch) -> None:
-    svc = _new_aisvc()
-    svc.web_search_enabled = True
-    payloads: list[dict[str, Any]] = []
-
-    def _fake_post_json(_url: str, payload: dict, _api_key: str, timeout: float = 90.0) -> dict:
-        _ = timeout
-        payloads.append(payload)
-        if len(payloads) == 1:
-            return {"choices": [{"message": {"content": "[WEB_SEARCH]查询"}}]}
-        return {"choices": [{"message": {"content": "回退回答"}}]}
-
-    def _boom(_q: str) -> str:
-        raise RuntimeError("search failed")
-
-    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
-    monkeypatch.setattr(svc, "_web_search_fetch_sources_sync", _boom)
-    slots = [
-        {"slot_id": "1:1", "index": 1, "segment_type": "image", "status": "ready", "description": "类型：产品照片；画面：RTX 5090"}
-    ]
-
-    out = svc._chat_with_context_sync("private:10001", "多少钱？", msg_id="1", vision_slots=slots)
-    assert out == "回退回答"
-    fallback_user = payloads[1]["messages"][-1]["content"]
-    assert "[视觉内容1] 类型：产品照片；画面：RTX 5090" in fallback_user
 
 
 @pytest.mark.asyncio
