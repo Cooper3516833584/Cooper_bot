@@ -98,6 +98,7 @@ def test_child_environment_keeps_only_explicit_system_values(tmp_path) -> None:
             "TOKEN": "qq-token",
             "MAIL_PASSWORD": "mail-password",
             "KIMI_CODE_LEGACY_FLAG": "legacy-engine",
+            "KIMI_CODE_EXPERIMENTAL_FLAG": "1",
         },
     )
 
@@ -106,6 +107,7 @@ def test_child_environment_keeps_only_explicit_system_values(tmp_path) -> None:
         "SystemRoot": "C:/Windows",
         "KIMI_CODE_HOME": str(settings.public.home),
     }
+    assert "KIMI_CODE_EXPERIMENTAL_FLAG" not in env
 
 
 @pytest.mark.parametrize(

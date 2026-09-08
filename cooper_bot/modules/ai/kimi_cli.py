@@ -76,6 +76,10 @@ class KimiInputTooLargeError(KimiCliError):
     code = "kimi_input_too_large"
 
 
+class KimiSecurityViolation(KimiCliError):
+    code = "kimi_security_violation"
+
+
 @dataclass(frozen=True)
 class KimiProfile:
     name: str
@@ -120,6 +124,18 @@ class PublicPolicyCheck:
 class KimiRuntimeInfo:
     executable: str
     version: str
+
+
+@dataclass(frozen=True)
+class KimiCapabilityReport:
+    cli_available: bool
+    version: str
+    protocol_ok: bool
+    public_policy_static_ok: bool
+    public_forbidden_tools_blocked: bool
+    public_websearch_ready: bool
+    admin_bash_ready: bool
+    errors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -380,6 +396,15 @@ class KimiCliRunner:
         self._argv_budget = max(1024, int(argv_budget))
         self._closing = False
         self._processes: set[asyncio.subprocess.Process] = set()
+        self._public_security_healthy = True
+
+    @property
+    def public_security_healthy(self) -> bool:
+        return self._public_security_healthy
+
+    def reset_public_security_state(self) -> None:
+        """Permit an explicit trusted re-probe after a public security fault."""
+        self._public_security_healthy = True
 
     def _profile_for(self, name: str) -> KimiProfile:
         if name == "public":
@@ -550,6 +575,8 @@ class KimiCliRunner:
     async def run(self, request: KimiRunRequest) -> KimiRunResult:
         if self._closing:
             raise KimiBusyError(request.request_id)
+        if request.profile == "public" and not self._public_security_healthy:
+            raise KimiSecurityViolation(request.request_id, "public_profile_unhealthy")
         profile = self._profile_for(request.profile)
         argv = self._build_argv(request, profile)
         admin_acquired, global_acquired = await self._acquire_slot(request)
@@ -579,7 +606,13 @@ class KimiCliRunner:
             if process.returncode != 0:
                 raise KimiProtocolError(request.request_id, "process_failed")
             text, tools, tool_seen, protocol_seen = self._parse_jsonl(stdout, request.request_id)
-            return KimiRunResult(text, request.request_id, int(process.returncode), tools, tool_seen, protocol_seen)
+            result = KimiRunResult(text, request.request_id, int(process.returncode), tools, tool_seen, protocol_seen)
+            if request.profile == "public":
+                forbidden = set(result.tool_names).difference(PUBLIC_TOOLS)
+                if forbidden:
+                    self._public_security_healthy = False
+                    raise KimiSecurityViolation(request.request_id, "forbidden_tool_observed")
+            return result
         except asyncio.CancelledError:
             if process is not None:
                 await self._stop_process(process)

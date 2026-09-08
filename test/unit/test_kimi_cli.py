@@ -12,12 +12,14 @@ from cooper_bot.modules.ai.kimi_cli import (
     KimiProfile,
     KimiProtocolError,
     KimiRunRequest,
+    KimiSecurityViolation,
     KimiSettings,
     KimiTimeoutError,
 )
 
 
 def _runner(tmp_path: Path, script_body: str, *, argv_budget: int = 24000) -> KimiCliRunner:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     script = tmp_path / "fake_kimi.py"
     script.write_text(script_body, encoding="utf-8")
     home = tmp_path / "home"
@@ -91,6 +93,44 @@ async def test_runner_rejects_oversized_windows_argument_before_spawn(tmp_path, 
 
     with pytest.raises(KimiInputTooLargeError, match="request_id=req-1"):
         await runner.run(_request("😀" * 1000))
+
+
+@pytest.mark.asyncio
+async def test_public_forbidden_tool_discards_reply_and_latches_unhealthy(tmp_path) -> None:
+    runner = _runner(
+        tmp_path,
+        "import json\n"
+        "print(json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'tool_calls': [{'name': 'Bash'}]}}))\n"
+        "print(json.dumps({'type': 'assistant', 'content': 'must not return'}))\n",
+    )
+
+    with pytest.raises(KimiSecurityViolation, match="request_id=req-1") as exc_info:
+        await runner.run(_request())
+    assert exc_info.value.detail == "forbidden_tool_observed"
+    assert runner.public_security_healthy is False
+
+    with pytest.raises(KimiSecurityViolation, match="request_id=req-1") as unhealthy:
+        await runner.run(_request())
+    assert unhealthy.value.detail == "public_profile_unhealthy"
+
+
+@pytest.mark.asyncio
+async def test_public_websearch_is_allowed_and_admin_bash_is_not_restricted(tmp_path) -> None:
+    runner = _runner(
+        tmp_path,
+        "import json\n"
+        "print(json.dumps({'type': 'tool_call', 'name': 'WebSearch'}))\n"
+        "print(json.dumps({'type': 'assistant', 'content': 'ok'}))\n",
+    )
+
+    assert (await runner.run(_request())).tool_names == ("WebSearch",)
+    admin_runner = _runner(
+        tmp_path / "admin",
+        "import json\n"
+        "print(json.dumps({'type': 'tool_call', 'name': 'Bash'}))\n"
+        "print(json.dumps({'type': 'assistant', 'content': 'ok'}))\n",
+    )
+    assert (await admin_runner.run(KimiRunRequest("hello", "admin", 2.0, "admin-1", "computer_probe"))).text == "ok"
 
 
 @pytest.mark.parametrize(

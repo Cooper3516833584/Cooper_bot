@@ -29,6 +29,7 @@ async def test_kimi_admin_history_does_not_read_public_group_history() -> None:
     svc.system_prompt = "system"
     runner = _Runner()
     svc._kimi_runner = runner
+    svc._public_runtime_safe = True
     svc._save_chat_turn("group:20001", "public-message", "public-reply")
 
     out = await svc.kimi_chat_with_context("group:20001", "admin-message", allow_computer=True, actor_user_id=900001)
@@ -42,11 +43,13 @@ async def test_kimi_admin_history_does_not_read_public_group_history() -> None:
 
 
 @pytest.mark.asyncio
-async def test_kimi_context_includes_vision_and_saves_only_base_text() -> None:
+async def test_kimi_context_includes_vision_and_saves_only_base_text(monkeypatch) -> None:
     svc = AIService(_Log())
     svc.system_prompt = "system"
     runner = _Runner()
     svc._kimi_runner = runner
+    svc._public_runtime_safe = True
+    monkeypatch.setattr("cooper_bot.modules.ai.aisvc.validate_kimi_settings", lambda _settings: SimpleNamespace(public_profile_valid=True))
 
     await svc.kimi_chat_with_context(
         "private:10001",
@@ -76,6 +79,7 @@ async def test_calendar_web_query_requires_observed_websearch(monkeypatch) -> No
     runner = _Runner()
     runner.settings = SimpleNamespace(timeout_seconds=120.0, admin_timeout_seconds=480.0)
     svc._kimi_runner = runner
+    svc._public_runtime_safe = True
     monkeypatch.setattr("cooper_bot.modules.ai.aisvc.validate_kimi_settings", lambda _settings: SimpleNamespace(public_profile_valid=True))
 
     with pytest.raises(RuntimeError, match="not observed"):
@@ -88,3 +92,62 @@ async def test_calendar_web_query_requires_observed_websearch(monkeypatch) -> No
     runner.run = _search_result
     assert await svc.calendar_web_query("查日历") == "{}"
     assert svc.calendar_web_ready is True
+
+
+@pytest.mark.asyncio
+async def test_capability_probe_requires_protocol_tools_and_matching_cache(monkeypatch, tmp_path) -> None:
+    svc = AIService(_Log())
+
+    class _ProbeRunner:
+        def __init__(self) -> None:
+            self.settings = SimpleNamespace(
+                timeout_seconds=30.0,
+                admin_timeout_seconds=30.0,
+                admin_enabled=True,
+                public=SimpleNamespace(workdir=tmp_path),
+            )
+
+        def reset_public_security_state(self):
+            return
+
+        async def run(self, request):
+            if request.purpose == "public_websearch_probe":
+                return SimpleNamespace(text="Paris", tool_call_observed=True, tool_names=("WebSearch",), protocol_observed=True)
+            if request.purpose == "computer_probe":
+                return SimpleNamespace(text="KIMI_COMPUTER_PROBE", tool_call_observed=True, tool_names=("Bash",), protocol_observed=True)
+            return SimpleNamespace(text="tool unavailable", tool_call_observed=False, tool_names=(), protocol_observed=True)
+
+    svc._kimi_runner = _ProbeRunner()
+    svc._kimi_capability_cache_path = tmp_path / "kimi_capabilities.json"
+    monkeypatch.setattr(
+        "cooper_bot.modules.ai.aisvc.validate_kimi_settings",
+        lambda _settings: SimpleNamespace(public_profile_valid=True, admin_profile_valid=True, errors=()),
+    )
+
+    async def _fingerprint():
+        return ({"version": "future-version-string", "public_config_sha256": "a"}, True)
+
+    monkeypatch.setattr(svc, "_kimi_capability_fingerprint", _fingerprint)
+    report = await svc.probe_kimi_capabilities()
+
+    assert report.public_forbidden_tools_blocked is True
+    assert report.public_websearch_ready is True
+    assert report.admin_bash_ready is True
+    assert svc.chat_ready is True
+    assert svc.calendar_web_ready is True
+
+    restored = AIService(_Log())
+    restored._kimi_runner = _ProbeRunner()
+    restored._kimi_capability_cache_path = svc._kimi_capability_cache_path
+    monkeypatch.setattr(restored, "_kimi_capability_fingerprint", _fingerprint)
+    cached = await restored.load_kimi_capability_cache()
+    assert cached.version == "future-version-string"
+    assert restored.chat_ready is True
+
+    async def _changed_fingerprint():
+        return ({"version": "new-version", "public_config_sha256": "a"}, True)
+
+    monkeypatch.setattr(restored, "_kimi_capability_fingerprint", _changed_fingerprint)
+    invalidated = await restored.load_kimi_capability_cache()
+    assert invalidated.public_forbidden_tools_blocked is False
+    assert restored.chat_ready is False

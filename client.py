@@ -92,6 +92,13 @@ async def run_forever():
     calendar_service = DailyCalendarService(log, aisvc)
     email_notify_service = EmailNotifyService(log, aisvc)
 
+    try:
+        kimi_report = await aisvc.load_kimi_capability_cache()
+        if not kimi_report.public_forbidden_tools_blocked:
+            log.warning(f"Kimi public profile blocked pending capability probe (version={kimi_report.version})")
+    except Exception as e:
+        log.warning(f"Kimi capability cache check failed; public profile remains blocked: {e}")
+
     if REBUILD_MATERIAL_SCAN_MARKS_ON_STARTUP:
         try:
             mark_stats = await aisvc.rebuild_material_scan_marks_from_current_layout()

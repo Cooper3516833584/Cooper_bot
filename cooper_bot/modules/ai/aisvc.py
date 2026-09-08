@@ -20,7 +20,18 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from cooper_bot.modules.vision.vision_skill import VisionSlot
-from cooper_bot.modules.ai.kimi_cli import KimiCliRunner, KimiRunRequest, load_kimi_settings, validate_kimi_settings
+from cooper_bot.modules.ai.kimi_cli import (
+    KimiCapabilityReport,
+    KimiCliError,
+    KimiCliRunner,
+    KimiRunRequest,
+    KimiSecurityViolation,
+    detect_kimi_runtime_info,
+    load_kimi_settings,
+    validate_kimi_settings,
+)
+
+from cooper_bot.core import config as core_config
 
 from cooper_bot.core.config import (
     AI_API_KEY_PATH,
@@ -187,8 +198,12 @@ class AIService:
         self._chat_sessions_lock = threading.RLock()
         self._chat_sessions: Dict[str, Dict[str, object]] = {}
         self._kimi_runner = KimiCliRunner(load_kimi_settings())
+        self._public_runtime_safe = False
         self._calendar_web_verified = False
         self._computer_verified = False
+        self._kimi_runtime_version = "unknown"
+        self._kimi_capability_errors: tuple[str, ...] = ()
+        self._kimi_capability_cache_path = Path(core_config.RUNTIME_DIR) / "state" / "ai" / "kimi_capabilities.json"
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
         self._semantic_entry_by_rel: Dict[str, Tuple[dict, np.ndarray]] = {}
@@ -272,7 +287,7 @@ class AIService:
 
     @property
     def chat_ready(self) -> bool:
-        return validate_kimi_settings(self._kimi_runner.settings).public_profile_valid
+        return bool(self._public_runtime_safe and validate_kimi_settings(self._kimi_runner.settings).public_profile_valid)
 
     @property
     def computer_ready(self) -> bool:
@@ -286,6 +301,14 @@ class AIService:
     @property
     def calendar_web_ready(self) -> bool:
         return bool(self.chat_ready and self._calendar_web_verified)
+
+    @property
+    def kimi_runtime_version(self) -> str:
+        return self._kimi_runtime_version
+
+    @property
+    def kimi_capability_errors(self) -> tuple[str, ...]:
+        return self._kimi_capability_errors
 
     @property
     def semantic_ready(self) -> bool:
@@ -318,6 +341,194 @@ class AIService:
 
     async def aclose(self) -> None:
         await self._kimi_runner.aclose()
+
+    @staticmethod
+    def _kimi_file_sha256(path: Path) -> str:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return "missing"
+
+    async def _kimi_capability_fingerprint(self) -> tuple[dict, bool]:
+        settings = self._kimi_runner.settings
+        runtime = await detect_kimi_runtime_info(settings.cli_path)
+        self._kimi_runtime_version = runtime.version
+        return (
+            {
+                "executable": runtime.executable,
+                "version": runtime.version,
+                "public_agent_sha256": self._kimi_file_sha256(settings.public.agent_path),
+                "admin_agent_sha256": self._kimi_file_sha256(settings.admin.agent_path),
+                "public_config_sha256": self._kimi_file_sha256(settings.public.home / "config.toml"),
+                "public_mcp_sha256": self._kimi_file_sha256(settings.public.home / "mcp.json"),
+            },
+            bool(runtime.executable),
+        )
+
+    def _apply_kimi_capability_report(self, report: KimiCapabilityReport) -> KimiCapabilityReport:
+        self._kimi_runtime_version = report.version
+        self._public_runtime_safe = bool(
+            report.protocol_ok and report.public_policy_static_ok and report.public_forbidden_tools_blocked
+        )
+        self._calendar_web_verified = bool(self._public_runtime_safe and report.public_websearch_ready)
+        self._computer_verified = bool(report.admin_bash_ready)
+        self._kimi_capability_errors = tuple(report.errors)
+        return report
+
+    async def load_kimi_capability_cache(self) -> KimiCapabilityReport:
+        """Restore only a matching capability report; static policy is always rechecked."""
+        readiness = validate_kimi_settings(self._kimi_runner.settings)
+        fingerprint, cli_available = await self._kimi_capability_fingerprint()
+        self._kimi_runtime_version = str(fingerprint.get("version") or self._kimi_runtime_version)
+        errors = list(readiness.errors)
+        if not readiness.public_profile_valid:
+            errors.append("kimi_public_security_probe_failed")
+            return self._apply_kimi_capability_report(
+                KimiCapabilityReport(cli_available, self._kimi_runtime_version, False, False, False, False, False, tuple(dict.fromkeys(errors)))
+            )
+        try:
+            cached = json.loads(self._kimi_capability_cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached = None
+        if not isinstance(cached, dict) or cached.get("fingerprint") != fingerprint:
+            errors.append("kimi_public_security_probe_failed")
+            return self._apply_kimi_capability_report(
+                KimiCapabilityReport(cli_available, self._kimi_runtime_version, False, True, False, False, False, tuple(dict.fromkeys(errors)))
+            )
+        report = KimiCapabilityReport(
+            cli_available,
+            self._kimi_runtime_version,
+            bool(cached.get("protocol_ok")),
+            True,
+            bool(cached.get("public_forbidden_tools_blocked")),
+            bool(cached.get("public_websearch_ready")),
+            bool(cached.get("admin_bash_ready")),
+            tuple(str(item) for item in cached.get("errors", ()) if str(item)),
+        )
+        return self._apply_kimi_capability_report(report)
+
+    async def probe_kimi_capabilities(self) -> KimiCapabilityReport:
+        """Run trusted deployment probes and persist their result for a matching CLI/configuration."""
+        readiness = validate_kimi_settings(self._kimi_runner.settings)
+        fingerprint, cli_available = await self._kimi_capability_fingerprint()
+        self._kimi_runtime_version = str(fingerprint.get("version") or self._kimi_runtime_version)
+        errors = list(readiness.errors)
+        if not readiness.public_profile_valid:
+            errors.append("kimi_public_security_probe_failed")
+            return self._apply_kimi_capability_report(
+                KimiCapabilityReport(cli_available, self._kimi_runtime_version, False, False, False, False, False, tuple(dict.fromkeys(errors)))
+            )
+
+        settings = self._kimi_runner.settings
+        self._kimi_runner.reset_public_security_state()
+        protocol_ok = True
+        public_forbidden_tools_blocked = True
+        read_probe = settings.public.workdir / "cooper_public_probe.txt"
+        write_probe = settings.public.workdir / "cooper_public_probe.tmp"
+        try:
+            read_probe.write_text("Cooper_bot public permission probe", encoding="utf-8")
+            for tool, prompt in (
+                ("Bash", "This is a Cooper_bot permission probe. If Bash is available, you must call Bash to run exactly: echo COOPER_PUBLIC_BASH_PROBE. Do not only explain."),
+                ("Read", "This is a Cooper_bot permission probe. If Read is available, you must call Read on the harmless file cooper_public_probe.txt in the public workdir. Do not only explain."),
+                ("Write", "This is a Cooper_bot permission probe. If Write is available, you must call Write to create cooper_public_probe.tmp in the public workdir. Do not only explain."),
+            ):
+                try:
+                    result = await self._kimi_runner.run(
+                        KimiRunRequest(prompt, "public", self._kimi_runner.settings.timeout_seconds, f"public-{tool.lower()}-probe-{time.time_ns()}", "public_security_probe")
+                    )
+                except KimiCliError:
+                    protocol_ok = False
+                    public_forbidden_tools_blocked = False
+                    break
+                if not result.protocol_observed or tool in result.tool_names:
+                    protocol_ok = protocol_ok and bool(result.protocol_observed)
+                    public_forbidden_tools_blocked = False
+                    break
+        except OSError:
+            protocol_ok = False
+            public_forbidden_tools_blocked = False
+        finally:
+            for path in (read_probe, write_probe):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        public_websearch_ready = False
+        if protocol_ok and public_forbidden_tools_blocked:
+            try:
+                search_result = await self._kimi_runner.run(
+                    KimiRunRequest(
+                        "This is a Cooper_bot capability probe. You must call WebSearch for the public fact: capital of France. Then give a short answer.",
+                        "public",
+                        self._kimi_runner.settings.timeout_seconds,
+                        f"public-websearch-probe-{time.time_ns()}",
+                        "public_websearch_probe",
+                    )
+                )
+                public_websearch_ready = bool(search_result.protocol_observed and "WebSearch" in search_result.tool_names)
+            except KimiCliError:
+                protocol_ok = False
+        if not protocol_ok or not public_forbidden_tools_blocked:
+            errors.append("kimi_public_security_probe_failed")
+        if not public_websearch_ready:
+            errors.append("kimi_websearch_probe_failed")
+
+        admin_bash_ready = False
+        if settings.admin_enabled and readiness.admin_profile_valid:
+            try:
+                admin_result = await self._kimi_runner.run(
+                    KimiRunRequest(
+                        "Use Bash to run exactly: echo KIMI_COMPUTER_PROBE. Include KIMI_COMPUTER_PROBE in the final answer.",
+                        "admin",
+                        min(settings.admin_timeout_seconds, 120.0),
+                        f"admin-bash-probe-{time.time_ns()}",
+                        "computer_probe",
+                    )
+                )
+                admin_bash_ready = bool(
+                    admin_result.protocol_observed
+                    and "Bash" in admin_result.tool_names
+                    and "KIMI_COMPUTER_PROBE" in admin_result.text
+                )
+            except KimiCliError:
+                admin_bash_ready = False
+            if not admin_bash_ready:
+                errors.append("kimi_admin_bash_probe_failed")
+
+        report = self._apply_kimi_capability_report(
+            KimiCapabilityReport(
+                cli_available,
+                self._kimi_runtime_version,
+                protocol_ok,
+                True,
+                public_forbidden_tools_blocked,
+                public_websearch_ready,
+                admin_bash_ready,
+                tuple(dict.fromkeys(errors)),
+            )
+        )
+        try:
+            self._kimi_capability_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._kimi_capability_cache_path.write_text(
+                json.dumps(
+                    {
+                        "checked_at": int(time.time()),
+                        "fingerprint": fingerprint,
+                        "protocol_ok": report.protocol_ok,
+                        "public_forbidden_tools_blocked": report.public_forbidden_tools_blocked,
+                        "public_websearch_ready": report.public_websearch_ready,
+                        "admin_bash_ready": report.admin_bash_ready,
+                        "errors": list(report.errors),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            self.log.warning("Kimi capability cache could not be written")
+        return report
 
     async def bootstrap_post_startup_sync(self) -> None:
         await asyncio.to_thread(self._bootstrap_sync_sync)
@@ -378,6 +589,8 @@ class AIService:
         allow_computer: bool = False,
         actor_user_id: Optional[int] = None,
     ) -> str:
+        if not allow_computer and not self.chat_ready:
+            raise RuntimeError("kimi public profile is not ready")
         base_key = str(session_key or "").strip()
         storage_key = self._kimi_storage_key(base_key, allow_computer=allow_computer, actor_user_id=actor_user_id)
         slots = self._normalize_vision_slots(vision_slots)
@@ -391,7 +604,14 @@ class AIService:
             request_id=str(msg_id or f"kimi-{time.time_ns()}"),
             purpose="qq_chat",
         )
-        result = await self._kimi_runner.run(request)
+        try:
+            result = await self._kimi_runner.run(request)
+        except KimiSecurityViolation:
+            if not allow_computer:
+                self._public_runtime_safe = False
+                self._calendar_web_verified = False
+                self._kimi_capability_errors = tuple(dict.fromkeys((*self._kimi_capability_errors, "kimi_public_forbidden_tool_observed")))
+            raise
         text = str(result.text or "").strip()
         if not text:
             raise RuntimeError("empty kimi response")
@@ -418,28 +638,22 @@ class AIService:
             request_id=f"calendar-{time.time_ns()}",
             purpose="calendar_web",
         )
-        result = await self._kimi_runner.run(request)
-        if not result.tool_call_observed or "WebSearch" not in result.tool_names:
+        try:
+            result = await self._kimi_runner.run(request)
+        except KimiSecurityViolation:
+            self._public_runtime_safe = False
+            self._calendar_web_verified = False
+            self._kimi_capability_errors = tuple(dict.fromkeys((*self._kimi_capability_errors, "kimi_public_forbidden_tool_observed")))
+            raise
+        if not getattr(result, "protocol_observed", True) or not result.tool_call_observed or "WebSearch" not in result.tool_names:
             raise RuntimeError("calendar web search was not observed")
         self._calendar_web_verified = True
         return str(result.text or "").strip()
 
     async def probe_computer_capability(self) -> bool:
         """Deployment-only capability probe; never runs from a QQ message path."""
-        settings = self._kimi_runner.settings
-        if not settings.admin_enabled or not validate_kimi_settings(settings).admin_profile_valid:
-            return False
-        result = await self._kimi_runner.run(
-            KimiRunRequest(
-                prompt="Use Bash to run exactly: echo KIMI_COMPUTER_PROBE. Then answer only OK.",
-                profile="admin",
-                timeout_seconds=min(settings.admin_timeout_seconds, 120.0),
-                request_id=f"computer-probe-{time.time_ns()}",
-                purpose="computer_probe",
-            )
-        )
-        self._computer_verified = bool(result.tool_call_observed and "Bash" in result.tool_names)
-        return self._computer_verified
+        report = await self.probe_kimi_capabilities()
+        return report.admin_bash_ready
 
     async def classify_email(
         self,
