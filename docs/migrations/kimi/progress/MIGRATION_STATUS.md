@@ -23,11 +23,11 @@
 | 02 | 保护 DeepSeek 非聊天 | PASS | `02_handoff.md` |
 | 03 | 配置与 profiles | BLOCKED_EXTERNAL | `03_handoff.md` |
 | 04 | CLI 运行器 | BLOCKED_EXTERNAL | `04_handoff.md` |
-| 05 | 上下文与图片 | NOT_STARTED | — |
-| 06 | 统一聊天路由 | NOT_STARTED | — |
-| 07 | 日历联网 | NOT_STARTED | — |
-| 08 | 清理旧实现 | NOT_STARTED | — |
-| 09 | 汇总验收 | NOT_STARTED | — |
-| 10 | 部署与回滚 | NOT_STARTED | — |
+| 05 | 上下文与图片 | PASS | `05_handoff.md`、`test_aisvc_kimi_chat.py` |
+| 06 | 统一聊天路由 | PASS | `06_handoff.md` |
+| 07 | 日历联网 | PASS | `07_handoff.md` |
+| 08 | 清理旧实现 | PARTIAL | `08_handoff.md` |
+| 09 | 汇总验收 | BLOCKED_EXTERNAL | `09_acceptance_report.md` |
+| 10 | 部署与回滚 | READY_FOR_DEPLOYMENT | `10_release_report.md` |
 
 `BLOCKED_EXTERNAL` 不表示 Kimi 不可用；它表示阶段 01 所要求的隔离 profile、真实 JSONL 协议、搜索与运行时工具边界尚未在无业务密钥的临时环境完成验证。

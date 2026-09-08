@@ -365,7 +365,7 @@ async def test_command_fixed_answer_precedes_private_aichat(dispatch_harness, mo
 
 
 @pytest.mark.asyncio
-async def test_command_aichat_private_uppercase_c_uses_restricted_antigravity(dispatch_harness) -> None:
+async def test_command_aichat_private_uppercase_c_is_sent_to_kimi_as_plain_text(dispatch_harness) -> None:
     ctx = _make_ctx(scene="private_friend", group_id=None, level=1)
     filesvc = _make_filesvc_stub()
     aisvc = _FakeAIService()
@@ -383,15 +383,40 @@ async def test_command_aichat_private_uppercase_c_uses_restricted_antigravity(di
         aisvc=aisvc,
     )
 
-    aisvc.restricted_gemini_chat_with_context.assert_awaited_once()
-    assert aisvc.restricted_gemini_chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
-    model_input = aisvc.restricted_gemini_chat_with_context.await_args.args[1]
-    assert aisvc.restricted_gemini_chat_with_context.await_args.args[2] == "claude"
+    aisvc.chat_with_context.assert_awaited_once()
+    assert aisvc.chat_with_context.await_args.args[0] == f"private:{ctx.user_id}"
+    model_input = aisvc.chat_with_context.await_args.args[1]
     assert "发言人QQ:" not in model_input
-    assert model_input == "hello"
-    aisvc.gemini_chat_with_context.assert_not_awaited()
-    aisvc.chat_with_context.assert_not_awaited()
-    assert any("restricted-gemini-ai-reply" in one["text"] for one in dispatch_harness.messages)
+    assert model_input == "C\nhello"
+    assert any("fake-ai-reply" in one["text"] for one in dispatch_harness.messages)
+
+
+@pytest.mark.asyncio
+async def test_group_computer_reply_is_private_and_uses_isolated_admin_context(dispatch_harness, monkeypatch) -> None:
+    ctx = _make_ctx(scene="group", group_id=20001, level=3, user_id=10001)
+    aisvc = _FakeAIService()
+    aisvc.computer_ready = True
+    perm = Mock()
+    perm.get_level.return_value = 3
+    monkeypatch.setattr(commands, "AI_KIMI_ADMIN_ENABLED", True)
+    monkeypatch.setattr(commands, "AI_KIMI_ALLOW_GROUP_COMPUTER", True)
+
+    handled = await commands._handle_ai_chat_trigger(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        evt={"post_type": "message", "message_type": "group"},
+        logsvc=_DummyLogService(),
+        aisvc=aisvc,
+        t="",
+        forced_ai_input="打开测试文件",
+        perm=perm,
+    )
+
+    assert handled is True
+    aisvc.chat_with_context.assert_awaited_once()
+    assert aisvc.chat_with_context.await_args.kwargs["allow_computer"] is True
+    assert aisvc.chat_with_context.await_args.kwargs["actor_user_id"] == ctx.user_id
+    assert dispatch_harness.messages[-1]["force_private_user_id"] == ctx.user_id
 
 
 @pytest.mark.asyncio
@@ -659,7 +684,7 @@ async def test_group_aichat_strips_cq_at_and_uses_sender_qq(dispatch_harness) ->
 
 
 @pytest.mark.asyncio
-async def test_aichat_repeat_guard_retries_with_stateless_chat(dispatch_harness) -> None:
+async def test_aichat_does_not_automatically_repeat_kimi_request(dispatch_harness) -> None:
     filesvc = _make_filesvc_stub()
     ctx = _make_ctx(scene="private_friend", group_id=None, level=1, user_id=10001)
 
@@ -695,8 +720,8 @@ async def test_aichat_repeat_guard_retries_with_stateless_chat(dispatch_harness)
     )
 
     assert aisvc.chat_with_context.await_count == 2
-    aisvc.chat.assert_awaited_once()
-    assert any(one["text"] == "retry-output" for one in dispatch_harness.messages)
+    aisvc.chat.assert_not_awaited()
+    assert sum(one["text"] == "same-output" for one in dispatch_harness.messages) == 2
 
 
 @pytest.mark.asyncio

@@ -25,14 +25,13 @@ class _Log:
 
 class _CalendarAI:
     def __init__(self, web_reply: str = "") -> None:
-        self.gemini_chat_ready = bool(web_reply)
-        self.chat_ready = False
+        self.chat_ready = bool(web_reply)
         self.deepseek_task_ready = False
         self._web_reply = web_reply
-        self.calls: list[tuple[str, str, int]] = []
+        self.calls: list[tuple[str, int]] = []
 
-    async def restricted_gemini_calendar_chat(self, prompt: str, *, model_key: str, timeout_seconds: int) -> str:
-        self.calls.append((prompt, model_key, timeout_seconds))
+    async def calendar_web_query(self, prompt: str, *, timeout_seconds: int) -> str:
+        self.calls.append((prompt, timeout_seconds))
         return self._web_reply
 
 
@@ -44,8 +43,6 @@ def _service(tmp_path, ai=None) -> DailyCalendarService:
                 "groups": {
                     "1087250737": {
                         "enabled": True,
-                        "primary_web_model": "gemini",
-                        "secondary_web_model": "claude",
                         "web_timeout_seconds": 20,
                     }
                 }
@@ -110,7 +107,7 @@ async def test_generate_accepts_official_web_event_and_uses_deepseek_fallback_te
 
     assert result.special is True
     assert "国家级纪念日示例" in result.message
-    assert ai.calls and ai.calls[0][1:] == ("gemini", 20)
+    assert ai.calls and ai.calls[0][1:] == (20,)
 
 
 @pytest.mark.asyncio

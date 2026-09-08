@@ -20,21 +20,14 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from cooper_bot.modules.vision.vision_skill import VisionSlot
-from cooper_bot.modules.ai.kimi_cli import KimiCliRunner, KimiRunRequest, load_kimi_settings
+from cooper_bot.modules.ai.kimi_cli import KimiCliRunner, KimiRunRequest, load_kimi_settings, validate_kimi_settings
 
 from cooper_bot.core.config import (
     AI_API_KEY_PATH,
     AI_BOT_NICK,
     AI_CHAT_MODEL,
-    AI_CLAUDE_MODEL,
     AI_EMBED_MODEL,
     AI_FALLBACK_ERROR_REPLY,
-    AI_GEMINI_CLI_PATH,
-    AI_GEMINI_MODEL,
-    AI_GEMINI_POLICY_PATH,
-    AI_GEMINI_RESTRICTED_WORKDIR,
-    AI_GEMINI_TIMEOUT_SECONDS,
-    AI_GEMINI_WORKDIR,
     AI_INDEX_PATH,
     AI_MATERIAL_DIR,
     AI_MATERIAL_SCAN_MARKS_PATH,
@@ -50,7 +43,6 @@ from cooper_bot.core.config import (
     AI_GROUP_NOTICE_PROMPTS_PATH,
     AI_PRIVATE_CHAT_PROMPTS_PATH,
     AI_SEMANTIC_STORE_PATH,
-    BASE_DIR,
     ENABLE_OCR,
 )
 
@@ -102,7 +94,6 @@ class AIService:
     _EBOOK_SUFFIXES = {".epub", ".mobi"}
     _CHAT_CONTEXT_TTL_SECONDS = 30.0 * 60.0
     _CHAT_CONTEXT_MAX_MESSAGES = 300
-    _GEMINI_CHAT_CONTEXT_MAX_MESSAGES = 100
     _CHAT_TEMPERATURE = 0.65
     _AUTO_ORGANIZE_TBD_DIRNAME = "TBD"
     _AUTO_ORGANIZE_EBOOK_SUBJECT = "课外书"
@@ -138,8 +129,6 @@ class AIService:
     _BACKEND_HISTORY_LIMITS = {
         "deepseek": 300,
         "kimi": 100,
-        "gemini": 100,
-        "claude": 100,
     }
     _WEB_SEARCH_JUDGE_PROMPT = (
         "# 联网需求判定\n"
@@ -182,13 +171,6 @@ class AIService:
         self.web_search_enabled = bool(AI_WEB_SEARCH_ENABLED)
         self.web_search_model = str(AI_WEB_SEARCH_MODEL or self._DEEPSEEK_V4_FLASH_MODEL)
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
-        self.gemini_cli_path = str(AI_GEMINI_CLI_PATH or "").strip()
-        self.gemini_model = str(AI_GEMINI_MODEL or "").strip()
-        self.claude_model = str(AI_CLAUDE_MODEL or "Claude Opus 4.6 (Thinking)").strip()
-        self.gemini_policy_path = Path(AI_GEMINI_POLICY_PATH)
-        self.gemini_workdir = Path(AI_GEMINI_WORKDIR)
-        self.gemini_restricted_workdir = Path(AI_GEMINI_RESTRICTED_WORKDIR)
-        self.gemini_timeout_seconds = max(10.0, float(AI_GEMINI_TIMEOUT_SECONDS or 120.0))
         self.search_limit = max(1, int(AI_SEARCH_LIMIT))
         self.search_min_similarity = float(AI_SEARCH_MIN_SIMILARITY)
         self.system_prompt = str(AI_SYSTEM_PROMPT or "").strip()
@@ -205,6 +187,8 @@ class AIService:
         self._chat_sessions_lock = threading.RLock()
         self._chat_sessions: Dict[str, Dict[str, object]] = {}
         self._kimi_runner = KimiCliRunner(load_kimi_settings())
+        self._calendar_web_verified = False
+        self._computer_verified = False
         self._semantic_meta: List[dict] = []
         self._semantic_norm_vectors: np.ndarray = np.empty((0, 0), dtype=np.float64)
         self._semantic_entry_by_rel: Dict[str, Tuple[dict, np.ndarray]] = {}
@@ -288,11 +272,20 @@ class AIService:
 
     @property
     def chat_ready(self) -> bool:
-        return self.deepseek_task_ready
+        return validate_kimi_settings(self._kimi_runner.settings).public_profile_valid
 
     @property
-    def gemini_chat_ready(self) -> bool:
-        return bool(self._resolve_gemini_cli_executable() and self.gemini_policy_path.is_file())
+    def computer_ready(self) -> bool:
+        settings = self._kimi_runner.settings
+        return bool(
+            self._computer_verified
+            and settings.admin_enabled
+            and validate_kimi_settings(settings).admin_profile_valid
+        )
+
+    @property
+    def calendar_web_ready(self) -> bool:
+        return bool(self.chat_ready and self._calendar_web_verified)
 
     @property
     def semantic_ready(self) -> bool:
@@ -323,6 +316,9 @@ class AIService:
     async def bootstrap_sync(self) -> None:
         await asyncio.to_thread(self._bootstrap_quick_sync_sync)
 
+    async def aclose(self) -> None:
+        await self._kimi_runner.aclose()
+
     async def bootstrap_post_startup_sync(self) -> None:
         await asyncio.to_thread(self._bootstrap_sync_sync)
 
@@ -332,8 +328,18 @@ class AIService:
     async def semantic_find_paths(self, demand: str, limit: Optional[int] = None) -> List[Path]:
         return await asyncio.to_thread(self._semantic_find_paths_sync, demand, limit)
 
-    async def chat(self, user_input: str) -> str:
-        return await asyncio.to_thread(self._chat_sync, user_input)
+    async def chat(
+        self,
+        user_input: str,
+        *,
+        allow_computer: bool = False,
+        actor_user_id: Optional[int] = None,
+    ) -> str:
+        return await self.kimi_chat(
+            user_input,
+            allow_computer=allow_computer,
+            actor_user_id=actor_user_id,
+        )
 
     async def deepseek_task_text(self, user_input: str) -> str:
         return await asyncio.to_thread(self._deepseek_task_text_sync, user_input)
@@ -401,6 +407,40 @@ class AIService:
             actor_user_id=actor_user_id,
         )
 
+    async def calendar_web_query(self, user_input: str, *, timeout_seconds: Optional[float] = None) -> str:
+        """Run one stateless public Kimi query and require a WebSearch observation."""
+        if not self.chat_ready:
+            raise RuntimeError("kimi public profile is not ready")
+        request = KimiRunRequest(
+            prompt=str(user_input or ""),
+            profile="public",
+            timeout_seconds=max(10.0, min(float(timeout_seconds or self._kimi_runner.settings.timeout_seconds), 120.0)),
+            request_id=f"calendar-{time.time_ns()}",
+            purpose="calendar_web",
+        )
+        result = await self._kimi_runner.run(request)
+        if not result.tool_call_observed or "WebSearch" not in result.tool_names:
+            raise RuntimeError("calendar web search was not observed")
+        self._calendar_web_verified = True
+        return str(result.text or "").strip()
+
+    async def probe_computer_capability(self) -> bool:
+        """Deployment-only capability probe; never runs from a QQ message path."""
+        settings = self._kimi_runner.settings
+        if not settings.admin_enabled or not validate_kimi_settings(settings).admin_profile_valid:
+            return False
+        result = await self._kimi_runner.run(
+            KimiRunRequest(
+                prompt="Use Bash to run exactly: echo KIMI_COMPUTER_PROBE. Then answer only OK.",
+                profile="admin",
+                timeout_seconds=min(settings.admin_timeout_seconds, 120.0),
+                request_id=f"computer-probe-{time.time_ns()}",
+                purpose="computer_probe",
+            )
+        )
+        self._computer_verified = bool(result.tool_call_observed and "Bash" in result.tool_names)
+        return self._computer_verified
+
     async def classify_email(
         self,
         *,
@@ -426,76 +466,16 @@ class AIService:
         *,
         msg_id: str = "",
         vision_slots: Optional[list] = None,
+        allow_computer: bool = False,
+        actor_user_id: Optional[int] = None,
     ) -> str:
-        return await asyncio.to_thread(
-            self._chat_with_context_sync, session_key, user_input, msg_id=msg_id, vision_slots=vision_slots
-        )
-
-    async def gemini_chat(
-        self,
-        user_input: str,
-        model_key: Optional[str] = None,
-        *,
-        auto_approve_tools: bool = False,
-    ) -> str:
-        return await asyncio.to_thread(
-            self._gemini_chat_sync, user_input, model_key, auto_approve_tools=auto_approve_tools
-        )
-
-    async def gemini_chat_with_context(
-        self,
-        session_key: str,
-        user_input: str,
-        model_key: Optional[str] = None,
-        *,
-        msg_id: str = "",
-        vision_slots: Optional[list] = None,
-        auto_approve_tools: bool = False,
-    ) -> str:
-        return await asyncio.to_thread(
-            self._gemini_chat_with_context_sync,
+        return await self.kimi_chat_with_context(
             session_key,
             user_input,
-            model_key,
             msg_id=msg_id,
             vision_slots=vision_slots,
-            auto_approve_tools=auto_approve_tools,
-        )
-
-    async def restricted_gemini_chat(self, user_input: str, model_key: Optional[str] = None) -> str:
-        return await asyncio.to_thread(self._gemini_chat_sync, user_input, model_key, True)
-
-    async def restricted_gemini_chat_with_context(
-        self,
-        session_key: str,
-        user_input: str,
-        model_key: Optional[str] = None,
-        *,
-        msg_id: str = "",
-        vision_slots: Optional[list] = None,
-    ) -> str:
-        return await asyncio.to_thread(
-            self._gemini_chat_with_context_sync,
-            session_key,
-            user_input,
-            model_key,
-            True,
-            msg_id=msg_id,
-            vision_slots=vision_slots,
-        )
-
-    async def restricted_gemini_calendar_chat(
-        self,
-        user_input: str,
-        model_key: Optional[str] = None,
-        timeout_seconds: Optional[float] = None,
-    ) -> str:
-        """Run a stateless, web-search-only Antigravity request with an isolated timeout."""
-        return await asyncio.to_thread(
-            self._restricted_gemini_calendar_chat_sync,
-            user_input,
-            model_key,
-            timeout_seconds,
+            allow_computer=allow_computer,
+            actor_user_id=actor_user_id,
         )
 
     def remember_user_message(
@@ -510,42 +490,6 @@ class AIService:
 
     def remember_assistant_message(self, session_key: str, message_text: str) -> None:
         self._remember_chat_message(session_key, "assistant", message_text)
-
-    def _resolve_gemini_cli_executable(self) -> str:
-        raw = str(self.gemini_cli_path or "").strip()
-        if not raw:
-            return ""
-        try:
-            direct = Path(raw).expanduser()
-        except Exception:
-            direct = None
-        if direct is not None and direct.is_file():
-            return str(direct)
-        resolved = shutil.which(raw)
-        if resolved:
-            return str(resolved)
-        if direct is not None and (not direct.is_absolute()):
-            try:
-                candidate = (Path(BASE_DIR) / direct).resolve()
-            except Exception:
-                candidate = None
-            if candidate is not None and candidate.is_file():
-                return str(candidate)
-        return ""
-
-    def _build_gemini_cli_base_command(self) -> List[str]:
-        cli_exe = self._resolve_gemini_cli_executable()
-        if not cli_exe:
-            return []
-
-        cli_path = Path(cli_exe)
-        suffix = cli_path.suffix.lower()
-        if suffix in {".cmd", ".bat", ".ps1"}:
-            node_path = cli_path.with_name("node.exe")
-            js_path = cli_path.parent / "node_modules" / "@google" / "gemini-cli" / "bundle" / "gemini.js"
-            if node_path.is_file() and js_path.is_file():
-                return [str(node_path), str(js_path)]
-        return [str(cli_path)]
 
     def _history_limit_for_backend(self, backend: str) -> int:
         key = str(backend or "").strip().lower()

@@ -1,7 +1,7 @@
 {
   "_help": [
     "每日重要日提醒仅按 groups 中配置的群启用。",
-    "联网检索优先使用 Gemini；仅在临时服务错误时尝试 Claude。",
+    "联网检索使用 Kimi Code 的公开 WebSearch 能力；未观察到实际搜索时降级为本地日历。",
     "dry_run 为 true 时只生成并缓存结果，不向群发送。"
   ],
   "groups": {
@@ -10,8 +10,6 @@
       "send_time": "09:00",
       "send_when_empty": false,
       "send_catch_up_until": "12:00",
-      "primary_web_model": "gemini",
-      "secondary_web_model": "claude",
       "web_timeout_seconds": 45,
       "dry_run": false
     }

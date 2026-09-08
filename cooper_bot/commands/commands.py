@@ -45,6 +45,8 @@ from cooper_bot.core.config import (
     FIND_DIR_LIMIT,
     FIND_FILE_LIMIT,
     AI_BOT_NICK,
+    AI_KIMI_ADMIN_ENABLED,
+    AI_KIMI_ALLOW_GROUP_COMPUTER,
     ANSWER_FILE_PATH,
     KEYWORD_ANSWER_FILE_PATH,
     TEMP_DIR,
@@ -62,8 +64,6 @@ _GROUP_NOTICE_MAX_CANDIDATES = 3
 _GROUP_NOTICE_DEDUP_SECONDS = 60.0
 _RECENT_REPLY_DEDUP_SECONDS = 2.0
 _RECENT_REPLY_KEYS: Dict[str, float] = {}
-_AI_REPEAT_GUARD_SECONDS = 5.0 * 60.0
-_AI_REPEAT_GUARD: Dict[str, dict] = {}
 _STATE_SWEEP_MIN_INTERVAL_SECONDS = 30.0
 _STATE_TTL_LAST_FIND_SECONDS = 30.0 * 60.0
 _STATE_TTL_PENDING_HANDIN_SECONDS = 6.0 * 60.0 * 60.0
@@ -138,36 +138,6 @@ def _claim_recent_reply(key: str, ttl_seconds: float = _RECENT_REPLY_DEDUP_SECON
     return True
 
 
-def _normalize_ai_guard_text(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s or "").strip())
-
-
-def _is_likely_ai_stuck_repeat(session_key: Optional[str], user_input: str, assistant_output: str) -> bool:
-    key = str(session_key or "").strip() or "__stateless__"
-    now = time.time()
-    stale_before = now - float(_AI_REPEAT_GUARD_SECONDS)
-    for k, item in list(_AI_REPEAT_GUARD.items()):
-        if not isinstance(item, dict):
-            _AI_REPEAT_GUARD.pop(k, None)
-            continue
-        try:
-            ts = float(item.get("ts") or 0.0)
-        except Exception:
-            ts = 0.0
-        if ts < stale_before:
-            _AI_REPEAT_GUARD.pop(k, None)
-
-    user_norm = _normalize_ai_guard_text(user_input)
-    out_norm = _normalize_ai_guard_text(assistant_output)
-    repeated = False
-    prev = _AI_REPEAT_GUARD.get(key)
-    if isinstance(prev, dict):
-        prev_out = _normalize_ai_guard_text(str(prev.get("out") or ""))
-        if prev_out and out_norm and (prev_out == out_norm):
-            repeated = True
-
-    _AI_REPEAT_GUARD[key] = {"user": user_norm, "out": out_norm, "ts": now}
-    return repeated
 def _normalize_answer_q(s: str) -> str:
     # 触发词匹配：忽略首尾空白、大小写，内部连续空白视为一个空格
     return re.sub(r"\s+", " ", (s or "").strip()).casefold()
@@ -2048,44 +2018,30 @@ def extract_ai_chat_trigger_text(
 
 def _split_ai_chat_backend(ai_input: str) -> Tuple[str, str]:
     text = str(ai_input or "").strip()
-    if not text:
-        return "default", ""
-    low = text.lower()
-    if low.startswith("antigravity"):
-        return "gemini", text[11:].strip()
-    if low.startswith("gemini"):
-        return "gemini", text[6:].strip()
-    if low.startswith("claude"):
-        return "claude", text[6:].strip()
-    if text[:1] in {"g", "G"}:
-        return "gemini", text[1:].strip()
-    if text[:1] in {"c", "C"}:
-        return "claude", text[1:].strip()
     return "default", text
 
 
-def _is_antigravity_busy_error(err: object) -> bool:
-    low = str(err or "").lower()
-    return (
-        "no capacity available" in low
-        or "servers are experiencing high traffic" in low
-        or "high traffic right now" in low
-        or "resource exhausted" in low
-        or "service busy" in low
-        or "unavailable (code 503)" in low
-    )
-
-
-def _antigravity_busy_reply(backend: str) -> str:
-    model = "Claude Opus 4.6" if backend == "claude" else "Gemini 3.1 Pro"
-    return f"antigravity 的 {model} 当前服务繁忙，上游暂时没有可用容量，请稍后再试。"
-
-
-def _ai_chat_allows_full_cli(ctx) -> bool:
+def _ai_chat_allows_kimi_computer(ctx, perm=None) -> bool:
+    """Computer access needs both an individually-admin user and enabled scope."""
+    if not AI_KIMI_ADMIN_ENABLED:
+        return False
     try:
-        return int(getattr(ctx, "level", 0) or 0) >= 3
+        user_id = int(getattr(ctx, "user_id", 0) or 0)
+        context_level = int(getattr(ctx, "level", 0) or 0)
     except Exception:
         return False
+    if user_id <= 0 or context_level < 3:
+        return False
+    personal_admin = user_id in ADMIN_USERS
+    if not personal_admin and perm is not None:
+        try:
+            personal_admin = int(perm.get_level(user_id)) >= 3
+        except Exception:
+            personal_admin = False
+    if not personal_admin:
+        return False
+    scene = str(getattr(ctx, "scene", "") or "")
+    return scene != "group" or bool(AI_KIMI_ALLOW_GROUP_COMPUTER)
 
 
 def _ai_chat_session_key(ctx) -> Optional[str]:
@@ -3903,6 +3859,7 @@ async def _handle_ai_chat_trigger(
     vision_skill=None,
     current_slots: Optional[list] = None,
     message_id: str = "",
+    perm=None,
 ):
     current_slots = list(current_slots or [])
     has_visual = bool(current_slots)
@@ -3918,7 +3875,7 @@ async def _handle_ai_chat_trigger(
         if trigger_text is None:
             return False
     backend, clean_trigger_text = _split_ai_chat_backend(trigger_text)
-    backend_key = "deepseek" if backend == "default" else backend
+    backend_key = "kimi"
     session_key = _ai_chat_session_key(ctx)
 
     # 视觉：历史补解析（按当前后端窗口）+ 当前消息图片统一解析
@@ -3953,87 +3910,61 @@ async def _handle_ai_chat_trigger(
         if aisvc is None:
             await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
             return True
-        full_cli_permissions = backend in {"gemini", "claude"} and _ai_chat_allows_full_cli(ctx)
-        restricted_cli = backend in {"gemini", "claude"} and not full_cli_permissions
-        route_backend = "restricted_antigravity" if restricted_cli else ("deepseek" if backend == "default" else backend)
-        use_gemini = backend in {"gemini", "claude"}
-        model_key = backend if use_gemini else None
-        if use_gemini:
-            ready = bool(getattr(aisvc, "gemini_chat_ready", False))
-        else:
-            ready = bool(getattr(aisvc, "chat_ready", False))
+        allow_computer = _ai_chat_allows_kimi_computer(ctx, perm)
+        route_backend = "kimi_admin" if allow_computer else "kimi_public"
+        ready = bool(
+            getattr(aisvc, "computer_ready", False)
+            if allow_computer
+            else getattr(aisvc, "chat_ready", False)
+        )
         if not ready:
-            if use_gemini:
-                msg = "antigravity 联网聊天暂时不可用（antigravity CLI 未就绪）。"
-            else:
-                msg = "AI 聊天暂时不可用（配置未就绪）。"
+            msg = (
+                "电脑助手暂时不可用（Kimi 管理员配置未就绪）。"
+                if allow_computer
+                else "AI 聊天暂时不可用（Kimi 配置未就绪）。"
+            )
             await reply(api, ctx, msg, logsvc)
             return True
-        if use_gemini:
-            if restricted_cli:
-                chat_with_context_fn = getattr(aisvc, "restricted_gemini_chat_with_context", None)
-                chat_fn = getattr(aisvc, "restricted_gemini_chat", None)
-            else:
-                chat_with_context_fn = getattr(aisvc, "gemini_chat_with_context", None)
-                chat_fn = getattr(aisvc, "gemini_chat", None)
-        else:
-            chat_with_context_fn = getattr(aisvc, "chat_with_context", None)
-            chat_fn = getattr(aisvc, "chat", None)
+        chat_with_context_fn = getattr(aisvc, "chat_with_context", None)
+        chat_fn = getattr(aisvc, "chat", None)
         if not callable(chat_fn):
-            await reply(api, ctx, "AI 聊天暂时不可用（配置未就绪）。", logsvc)
+            await reply(api, ctx, "AI 聊天暂时不可用（Kimi 配置未就绪）。", logsvc)
             return True
         try:
             if session_key and callable(chat_with_context_fn):
-                if use_gemini:
-                    gemini_context_kwargs = {
-                        "msg_id": message_id,
-                        "vision_slots": current_slots,
-                    }
-                    if full_cli_permissions:
-                        gemini_context_kwargs["auto_approve_tools"] = True
-                    out = (
-                        await chat_with_context_fn(
-                            session_key, ai_input, model_key,
-                            **gemini_context_kwargs,
-                        )
-                    ).strip()
-                else:
-                    out = (
-                        await chat_with_context_fn(
-                            session_key, ai_input,
-                            msg_id=message_id,
-                            vision_slots=current_slots,
-                        )
-                    ).strip()
+                context_kwargs = {
+                    "msg_id": message_id,
+                    "vision_slots": current_slots,
+                }
+                if allow_computer:
+                    context_kwargs.update(
+                        allow_computer=True,
+                        actor_user_id=ctx.user_id,
+                    )
+                out = (
+                    await chat_with_context_fn(
+                        session_key, ai_input,
+                        **context_kwargs,
+                    )
+                ).strip()
                 try:
                     setattr(ctx, "_skip_reply_context_once", True)
                 except Exception:
                     pass
             else:
-                if use_gemini:
-                    if full_cli_permissions:
-                        out = (await chat_fn(ai_input, model_key, auto_approve_tools=True)).strip()
-                    else:
-                        out = (await chat_fn(ai_input, model_key)).strip()
+                if allow_computer:
+                    out = (await chat_fn(ai_input, allow_computer=True, actor_user_id=ctx.user_id)).strip()
                 else:
                     out = (await chat_fn(ai_input)).strip()
-            if out and _is_likely_ai_stuck_repeat(session_key, ai_input, out):
-                retry_prompt = (
-                    "你刚才出现了机械复读。请只根据这条新消息给出新的、准确的回复，不要复述上一条答案。\n"
-                    + ai_input
-                )
-                if use_gemini:
-                    if full_cli_permissions:
-                        retry_out = (await chat_fn(retry_prompt, model_key, auto_approve_tools=True)).strip()
-                    else:
-                        retry_out = (await chat_fn(retry_prompt, model_key)).strip()
-                else:
-                    retry_out = (await chat_fn(retry_prompt)).strip()
-                if retry_out:
-                    out = retry_out
             if not out:
                 out = "我这边没收到有效回复，稍后再试一次。"
-            await reply(api, ctx, out, logsvc)
+            await reply(
+                api,
+                ctx,
+                out,
+                logsvc,
+                force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None,
+            )
         except Exception as e:
             try:
                 logsvc.log.warning(
@@ -4042,8 +3973,14 @@ async def _handle_ai_chat_trigger(
                 )
             except Exception:
                 pass
-            fallback_text = _antigravity_busy_reply(backend) if use_gemini and _is_antigravity_busy_error(e) else aisvc.fallback_error_reply
-            fallback_sent = await reply(api, ctx, fallback_text, logsvc)
+            fallback_text = aisvc.fallback_error_reply
+            fallback_sent = await reply(
+                api,
+                ctx,
+                fallback_text,
+                logsvc,
+                force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None,
+            )
             if fallback_sent is False and ctx.scene == "group":
                 await reply(api, ctx, fallback_text, logsvc, force_private_user_id=ctx.user_id)
             await notify_admin_error(api, ctx, f"aichat/{route_backend}", e, logsvc)
@@ -4369,13 +4306,11 @@ async def _handle_explicit_command(
             ])
         lines.extend([
             "",
-            "AI聊天（默认 DeepSeek）：",
+            "AI聊天（Kimi Code）：",
             "群聊：@Cooper_bot + 内容",
-            "群聊（联网搜索 Gemini）：@Cooper_bot g内容（g/G 后面可不加空格）",
-            "群聊（联网搜索 Claude）：@Cooper_bot c内容（c/C 后面可不加空格）",
             "私聊：直接发送文本内容",
-            "私聊（联网搜索 Gemini）：g内容（g/G 后面可不加空格）",
-            "私聊（联网搜索 Claude）：c内容（c/C 后面可不加空格）",
+            "g/c 开头的文字会按原文发送，不再切换聊天后端。",
+            "管理员电脑操作默认仅允许私聊；群内启用须单独配置，并始终私聊回传。",
         ])
         if ctx.level >= 2:
             lines.extend([
@@ -4978,6 +4913,7 @@ async def dispatch(
             vision_skill=vision_skill,
             current_slots=current_slots,
             message_id=message_id,
+            perm=perm,
         ):
             return
         _remember_non_ai_once()
@@ -5000,6 +4936,7 @@ async def dispatch(
         vision_skill=vision_skill,
         current_slots=current_slots,
         message_id=message_id,
+        perm=perm,
     ):
         return
     _remember_non_ai_once()
