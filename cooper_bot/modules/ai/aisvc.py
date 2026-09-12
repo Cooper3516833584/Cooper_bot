@@ -2978,7 +2978,7 @@ class AIService:
         # which can leak to the user instead of producing the final answer.
         base_system = self._without_web_search_judge(system_prompt)
         compose_system = f"{base_system}\n\n{self._WEB_SEARCH_COMPOSE_PROMPT.strip()}"
-        prompt = f"用户当前问题：\n{str(user_content or '').strip()}\n\n【联网搜索结果】\n{str(material or '').strip()}"
+        prompt = f"用户当前问题：\n{str(user_content or '').strip()}\n\n联网搜索结果：\n{str(material or '').strip()}"
         messages: List[dict] = [{"role": "system", "content": compose_system}]
         for message in history or []:
             if not isinstance(message, dict):

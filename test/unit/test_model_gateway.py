@@ -450,8 +450,12 @@ def test_http_post_json_rejects_non_json_body(monkeypatch) -> None:
 
     monkeypatch.setattr(model_gateway.urllib.request, "urlopen", lambda *_a, **_k: _Resp())
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(model_gateway.ModelGatewayError) as excinfo:
         model_gateway.http_post_json("https://x", {"a": 1}, "k")
+
+    # 协议/解析类错误统一落到 ModelGatewayError，不是 timeout 也不是 HTTP 错误。
+    assert not isinstance(excinfo.value, TimeoutError)
+    assert not isinstance(excinfo.value, model_gateway.ModelGatewayHTTPError)
 
 
 def test_post_json_with_headers_serializes_utf8_payload(monkeypatch) -> None:

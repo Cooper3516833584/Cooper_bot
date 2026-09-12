@@ -12,8 +12,13 @@ provider 一览：
     embedding  向量化（/find 语义检索与资料索引）
     vision     图片描述（qwen，与 DeepSeek 无关，集群聊图片解析）
 
-凭据仍取自 ``config/private/api_key.txt``：非空行 1-2 行是 DeepSeek base/key，
-3-4 行是 embedding base/key，5-6 行是 vision base/key（vision 优先用环境变量）。
+凭据取自 ``config/private/api_key.txt`` 的固定行位（空行必须保留位置，代表该行留空）：
+
+    第 1 行 DeepSeek base url    第 2 行 DeepSeek api key
+    第 3 行 Embedding base url   第 4 行 Embedding api key
+    第 5 行 Vision base url      第 6 行 Vision api key
+
+Vision 优先使用环境变量 / secrets.env；缺行按空字符串补齐，不抛异常。
 """
 from __future__ import annotations
 
@@ -260,13 +265,13 @@ def post_json_with_headers(url: str, payload: dict, headers: dict, timeout: floa
 
     txt = raw.decode("utf-8", errors="replace").strip()
     if not txt:
-        raise RuntimeError("empty response")
+        raise ModelGatewayError("empty response")
     try:
         obj = json.loads(txt)
     except Exception as e:
-        raise RuntimeError(f"json decode failed: {e}")
+        raise ModelGatewayError(f"json decode failed: {e}")
     if not isinstance(obj, dict):
-        raise RuntimeError("invalid response type")
+        raise ModelGatewayError("invalid response type")
     return obj
 
 
