@@ -209,7 +209,7 @@ async def test_deepseek_email_classifier_uses_json_mode(monkeypatch) -> None:
             ]
         }
 
-    monkeypatch.setattr(service, "_post_json", _fake_post)
+    monkeypatch.setattr("cooper_bot.modules.ai.model_gateway.http_post_json", _fake_post)
 
     result = await service.classify_email(
         sender="security@example.com",

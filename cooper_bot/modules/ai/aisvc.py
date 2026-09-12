@@ -30,6 +30,15 @@ from cooper_bot.modules.ai.kimi_cli import (
     load_kimi_settings,
     validate_kimi_settings,
 )
+from cooper_bot.modules.ai.model_gateway import (
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_SEARCH_MODEL,
+    ModelGateway,
+    ProviderConfig,
+    build_providers,
+    read_api_key_lines,
+    search_results_to_text,
+)
 
 from cooper_bot.core import config as core_config
 
@@ -83,11 +92,6 @@ except Exception:  # pragma: no cover - optional dependency
     BeautifulSoup = None
 
 try:
-    from openai import OpenAI  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    OpenAI = None
-
-try:
     from rapidocr_onnxruntime import RapidOCR  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     RapidOCR = None
@@ -118,10 +122,6 @@ class AIService:
     _NEW_FILE_EMBED_MAX_CONCURRENCY = 4
     _MISPLACED_REVIEW_MAX_CANDIDATES = 24
     _ORGANIZE_PROGRESS_EVERY = 5
-    _DEEPSEEK_V4_FLASH_MODEL = "deepseek-v4-flash"
-    _DEEPSEEK_V4_PRO_MODEL = "deepseek-v4-pro"
-    _THINKING_DISABLED = {"type": "disabled"}
-    _THINKING_ENABLED = {"type": "enabled"}
     _REASONING_EFFORT_HIGH = "high"
     _NOTICE_SILENT_TOKEN = "[静默]"
     _CHAT_AUTOMATION_BOUNDARY_PROMPT = (
@@ -150,10 +150,6 @@ class AIService:
         "除这一行外禁止输出任何其他字符，特别是禁止先给出猜测性回答。\n"
         "其余问题请正常作答；涉及你不确定的事实性内容时，明确告知\"我不确定\"，禁止编造。"
     )
-    _WEB_SEARCH_FETCH_SYSTEM_PROMPT = (
-        "你是一个联网搜索执行器。用户会给你一个搜索查询词。\n"
-        "请调用 web_search 工具完成搜索，等待工具返回结果即可，不要自己编造或总结。"
-    )
     _WEB_SEARCH_COMPOSE_PROMPT = (
         "# 联网信息整合回答\n"
         "用户的问题需要实时信息，下面是联网搜索返回的资料（可能有噪声、过时或互相矛盾）：\n"
@@ -178,9 +174,9 @@ class AIService:
         self.incremental_store_path = Path(AI_SEMANTIC_STORE_PATH)
 
         self.bot_nick = str(AI_BOT_NICK or "Cooper_bot")
-        self.chat_model = str(AI_CHAT_MODEL or self._DEEPSEEK_V4_PRO_MODEL)
+        self.chat_model = str(AI_CHAT_MODEL or DEFAULT_CHAT_MODEL)
         self.web_search_enabled = bool(AI_WEB_SEARCH_ENABLED)
-        self.web_search_model = str(AI_WEB_SEARCH_MODEL or self._DEEPSEEK_V4_FLASH_MODEL)
+        self.web_search_model = str(AI_WEB_SEARCH_MODEL or DEFAULT_SEARCH_MODEL)
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
         self.search_limit = max(1, int(AI_SEARCH_LIMIT))
         self.search_min_similarity = float(AI_SEARCH_MIN_SIMILARITY)
@@ -193,6 +189,13 @@ class AIService:
         self.deepseek_api_key = ""
         self.embedding_base_url = ""
         self.embedding_api_key = ""
+
+        # 所有模型请求统一走 gateway；它按下面这些属性在每次调用时组装 provider 配置。
+        self.gateway = ModelGateway(
+            log,
+            api_key_path=self.api_key_path,
+            provider_source=self._provider_configs,
+        )
 
         self._lock = threading.RLock()
         self._chat_sessions_lock = threading.RLock()
@@ -219,25 +222,6 @@ class AIService:
         self._group_chat_prompt_cache_mtime: Optional[float] = None
         self._group_chat_prompt_cache: Dict[str, object] = {"default": {}, "groups": {}}
 
-    def _build_chat_payload(
-        self,
-        messages: List[dict],
-        temperature: float,
-        response_format: Optional[dict] = None,
-        enable_thinking: bool = False,
-    ) -> dict:
-        payload = {
-            "model": str(self.chat_model or self._DEEPSEEK_V4_PRO_MODEL),
-            "messages": list(messages),
-            "temperature": float(temperature),
-            "thinking": dict(self._THINKING_ENABLED if enable_thinking else self._THINKING_DISABLED),
-        }
-        if enable_thinking:
-            payload["reasoning_effort"] = self._REASONING_EFFORT_HIGH
-        if response_format is not None:
-            payload["response_format"] = response_format
-        return payload
-
     def _append_chat_automation_boundary(self, system_prompt: str) -> str:
         prompt = str(system_prompt or "").strip()
         boundary = self._CHAT_AUTOMATION_BOUNDARY_PROMPT.strip()
@@ -251,35 +235,6 @@ class AIService:
         if vision_boundary and vision_boundary not in out:
             out = f"{out}\n\n{vision_boundary}"
         return out
-
-    def _get_deepseek_sdk_base_url(self) -> str:
-        return (self.deepseek_base_url or "https://api.deepseek.com").rstrip("/")
-
-    def _create_deepseek_client(self):
-        if OpenAI is None:
-            raise RuntimeError("openai sdk is not installed")
-        return OpenAI(api_key=self.deepseek_api_key, base_url=self._get_deepseek_sdk_base_url())
-
-    def _create_reasoner_completion(self, client, messages: List[dict], temperature: float):
-        return client.chat.completions.create(
-            model=self._DEEPSEEK_V4_FLASH_MODEL,
-            messages=list(messages),
-            temperature=float(temperature),
-            reasoning_effort=self._REASONING_EFFORT_HIGH,
-            extra_body={"thinking": dict(self._THINKING_ENABLED)},
-        )
-
-    def _extract_sdk_chat_text(self, resp: object) -> str:
-        try:
-            return str(resp.choices[0].message.content or "").strip()
-        except Exception:
-            pass
-        if hasattr(resp, "model_dump"):
-            try:
-                return self._extract_chat_text(resp.model_dump())
-            except Exception:
-                return ""
-        return ""
 
     @property
     def deepseek_task_ready(self) -> bool:
@@ -334,7 +289,7 @@ class AIService:
 
     @property
     def notice_ready(self) -> bool:
-        return bool(self.deepseek_api_key and OpenAI is not None)
+        return bool(self.deepseek_base_url and self.deepseek_api_key)
 
     async def bootstrap_sync(self) -> None:
         await asyncio.to_thread(self._bootstrap_quick_sync_sync)
@@ -2281,14 +2236,12 @@ class AIService:
         return target
 
     def _ask_subject_decision(self, prompt: str, timeout: float = 90.0) -> dict:
-        payload = self._build_chat_payload(
+        text = self.gateway.chat(
             [{"role": "user", "content": str(prompt or "")}],
-            0.0,
-            response_format={"type": "json_object"},
+            temperature=0.0,
+            json_mode=True,
+            timeout=float(timeout),
         )
-        url = self._join_url(self.deepseek_base_url, "chat/completions")
-        data = self._post_json(url, payload, self.deepseek_api_key, timeout=float(timeout))
-        text = self._extract_chat_text(data)
         obj = self._parse_json_object(text)
         if obj is None:
             raise RuntimeError("decision json parse failed")
@@ -2772,13 +2725,7 @@ class AIService:
         )
 
     def _load_api_config(self) -> None:
-        lines: List[str] = []
-        try:
-            lines = [x.strip() for x in self.api_key_path.read_text(encoding="utf-8").splitlines() if x.strip()]
-        except Exception as e:
-            self.log.warning(f"AI 配置：读取 api_key.txt 失败: {e}")
-            return
-
+        lines = read_api_key_lines(self.api_key_path, self.log)
         if len(lines) < 4:
             self.log.warning("AI 配置：api_key.txt 至少需要 4 行（deepseek base/key + embedding base/key）")
             return
@@ -2788,6 +2735,22 @@ class AIService:
         self.embedding_base_url = lines[2].rstrip("/")
         self.embedding_api_key = lines[3]
         self.log.info("AI 配置：已加载 DeepSeek 与 Embedding API")
+
+    def _provider_configs(self) -> Dict[str, ProviderConfig]:
+        """把当前模型名与凭据组装成 provider 表，供 gateway 在每次调用时读取。
+
+        AIService 上的 chat_model / deepseek_base_url 等属性仍是唯一写入口，
+        请求体拼装与端点选择全部由 gateway 负责。
+        """
+        return build_providers(
+            deepseek_base_url=self.deepseek_base_url,
+            deepseek_api_key=self.deepseek_api_key,
+            embedding_base_url=self.embedding_base_url,
+            embedding_api_key=self.embedding_api_key,
+            chat_model=self.chat_model,
+            search_model=self.web_search_model,
+            embed_model=self.embed_model,
+        )
 
     def _reload_semantic_cache(self) -> None:
         metadata_by_rel: Dict[str, dict] = {}
@@ -2871,30 +2834,25 @@ class AIService:
         if not content:
             return "想聊点啥？发我一句话就行。"
 
-        payload = self._build_chat_payload(
+        judged_system = self._append_web_search_judge(
+            self._append_chat_automation_boundary(self.system_prompt)
+        )
+        text = self.gateway.chat(
             [
-                {
-                    "role": "system",
-                    "content": self._append_web_search_judge(self._append_chat_automation_boundary(self.system_prompt)),
-                },
+                {"role": "system", "content": judged_system},
                 {"role": "user", "content": content},
             ],
-            self._CHAT_TEMPERATURE,
-            enable_thinking=True,
+            temperature=self._CHAT_TEMPERATURE,
+            thinking=True,
+            reasoning_effort=self._REASONING_EFFORT_HIGH,
+            timeout=90.0,
         )
-        url = self._join_url(self.deepseek_base_url, "chat/completions")
-        data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
-        text = self._extract_chat_text(data)
         if self.web_search_enabled:
             query = self._parse_web_search_marker(text)
             if query:
                 try:
                     material = self._web_search_fetch_sources_sync(query)
-                    text = self._web_search_compose_final_sync(
-                        self._append_web_search_judge(self._append_chat_automation_boundary(self.system_prompt)),
-                        content,
-                        material,
-                    )
+                    text = self._web_search_compose_final_sync(judged_system, content, material)
                 except Exception as e:
                     self.log.warning(f"AI web search failed, fallback to plain chat: err={e}")
                     text = self._web_search_fallback_chat_sync(
@@ -2937,17 +2895,16 @@ class AIService:
             "has_attachment": bool(has_attachment),
             "attachment_names": [str(x)[:300] for x in attachment_names[:10]],
         }
-        payload = self._build_chat_payload(
+        text = self.gateway.chat(
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(mail_data, ensure_ascii=False)},
             ],
-            0.0,
-            response_format={"type": "json_object"},
+            temperature=0.0,
+            json_mode=True,
+            timeout=45.0,
         )
-        url = self._join_url(self.deepseek_base_url, "chat/completions")
-        data = self._post_json(url, payload, self.deepseek_api_key, timeout=45.0)
-        obj = self._parse_json_object(self._extract_chat_text(data))
+        obj = self._parse_json_object(text)
         if obj is None:
             raise RuntimeError("email classification json parse failed")
 
@@ -2983,78 +2940,12 @@ class AIService:
         return query or None
 
     def _web_search_fetch_sources_sync(self, query: str) -> str:
-        """调用 v4-flash（Responses API + web_search）执行联网搜索，返回搜索素材文本。"""
-        if not self.deepseek_api_key:
-            raise RuntimeError("deepseek api key not ready")
-        q = str(query or "").strip()
-        if not q:
-            raise RuntimeError("empty web search query")
-        payload = {
-            "model": str(self.web_search_model or self._DEEPSEEK_V4_FLASH_MODEL),
-            "input": [
-                {"role": "system", "content": self._WEB_SEARCH_FETCH_SYSTEM_PROMPT},
-                {"role": "user", "content": q},
-            ],
-            "tools": [{"type": "web_search"}],
-            "tool_choice": {"type": "web_search"},
-        }
-        url = self._join_url(self.deepseek_base_url, "responses")
-        data = self._post_json(url, payload, self.deepseek_api_key, timeout=60.0)
-        material = self._extract_responses_search_sources(data)
+        """执行联网搜索并把结构化结果整理成素材文本。"""
+        results = self.gateway.search_web(str(query or "").strip(), timeout=60.0)
+        material = search_results_to_text(results)
         if not material:
             raise RuntimeError("web search returned no usable sources")
         return material
-
-    @staticmethod
-    def _extract_responses_search_sources(resp: dict) -> str:
-        """从 DeepSeek Responses API 响应中提取搜索素材文本；无素材返回空串。"""
-        output = (resp or {}).get("output")
-        if not isinstance(output, list):
-            return ""
-        parts: List[str] = []
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            itype = item.get("type")
-            if itype == "function_call":
-                args = str(item.get("arguments") or "")
-                try:
-                    obj = json.loads(args)
-                except Exception:
-                    obj = {}
-                if not isinstance(obj, dict):
-                    continue
-                results = obj.get("search_results")
-                if not isinstance(results, list):
-                    continue
-                for r in results:
-                    if not isinstance(r, dict):
-                        continue
-                    block = []
-                    title = str(r.get("title") or "").strip()
-                    url = str(r.get("url") or "").strip()
-                    content = str(r.get("content") or "").strip()
-                    if title:
-                        block.append(f"标题：{title}")
-                    if url:
-                        block.append(f"来源：{url}")
-                    if content:
-                        block.append(content)
-                    if block:
-                        parts.append("\n".join(block))
-            elif itype == "message":
-                content_items = item.get("content")
-                if not isinstance(content_items, list):
-                    continue
-                texts = []
-                for c in content_items:
-                    if isinstance(c, dict) and c.get("type") == "output_text":
-                        t = str(c.get("text") or "").strip()
-                        if t:
-                            texts.append(t)
-                if texts:
-                    parts.append("【搜索结果摘要】\n" + "\n".join(texts))
-        return "\n\n".join(parts).strip()
 
     def _web_search_compose_final_sync(
         self,
@@ -3064,7 +2955,7 @@ class AIService:
         *,
         history: Optional[List[dict]] = None,
     ) -> str:
-        """将原始问题（含当前视觉渲染）与搜索素材交给 v4-pro 整合，返回最终回答文本。"""
+        """将原始问题（含当前视觉渲染）与搜索素材交给文本模型整合，返回最终回答文本。"""
         # The search-decision prompt is only for the first pass. Keeping it in
         # the compose pass makes the model emit the internal marker again,
         # which can leak to the user instead of producing the final answer.
@@ -3079,14 +2970,13 @@ class AIService:
             if role in ("user", "assistant"):
                 messages.append({"role": role, "content": str(message.get("content") or "")})
         messages.append({"role": "user", "content": prompt})
-        payload = self._build_chat_payload(
+        text = self.gateway.chat(
             messages,
-            self._CHAT_TEMPERATURE,
-            enable_thinking=True,
+            temperature=self._CHAT_TEMPERATURE,
+            thinking=True,
+            reasoning_effort=self._REASONING_EFFORT_HIGH,
+            timeout=90.0,
         )
-        url = self._join_url(self.deepseek_base_url, "chat/completions")
-        data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
-        text = self._extract_chat_text(data)
         text = self._strip_web_search_marker(text)
         if not text:
             raise RuntimeError("empty web search final response")
@@ -3108,15 +2998,14 @@ class AIService:
         return s.strip()
 
     def _web_search_fallback_chat_sync(self, messages: List[dict]) -> str:
-        """联网失效时用不含联网判定指令的 prompt 重新请求 v4-pro，按普通模式回答。"""
-        payload = self._build_chat_payload(
+        """联网失效时用不含联网判定指令的 prompt 重新请求，按普通模式回答。"""
+        text = self.gateway.chat(
             list(messages),
-            self._CHAT_TEMPERATURE,
-            enable_thinking=True,
+            temperature=self._CHAT_TEMPERATURE,
+            thinking=True,
+            reasoning_effort=self._REASONING_EFFORT_HIGH,
+            timeout=90.0,
         )
-        url = self._join_url(self.deepseek_base_url, "chat/completions")
-        data = self._post_json(url, payload, self.deepseek_api_key, timeout=90.0)
-        text = self._extract_chat_text(data)
         query = self._parse_web_search_marker(text)
         if query:
             text = self._strip_web_search_marker(text)
@@ -3583,94 +3472,6 @@ class AIService:
         cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
         return cleaned[:max_chars]
 
-    def _classify_notice_sync(self, source: str, snippet: str) -> bool:
-        if not self.deepseek_api_key:
-            return False
-        if OpenAI is None:
-            return False
-
-        content = str(snippet or "").strip()
-        if not content:
-            return False
-        if len(content) > 6000:
-            content = content[:6000]
-
-        client = self._create_deepseek_client()
-        prompt = (
-            "你是 QQ 群消息过滤器。\n"
-            "请判断下面内容是否属于“需要同学执行动作/流程/截止日期”的通知。\n"
-            "如果是纯学习资料/课件/教材/日历/介绍，请只输出：[静默]\n"
-            "如果是需要执行动作的通知，请只输出：[通知]\n"
-            "禁止输出任何其他字符。\n\n"
-            f"来源：{source or '未知来源'}\n\n"
-            f"内容片段：\n{content}"
-        )
-        try:
-            resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.0)
-            raw = self._extract_sdk_chat_text(resp)
-            out = self.sanitize_reasoner_output(raw)
-            if out == "[通知]":
-                self.log.info(f"群通知解析：分类结果=通知 source={source[:120]}")
-                return True
-            if out == self._NOTICE_SILENT_TOKEN:
-                self.log.info(f"群通知解析：分类结果=静默 source={source[:120]}")
-            elif out:
-                self.log.info(f"群通知解析：分类结果=非标准输出但放行 source={source[:120]} output={out[:80]}")
-            else:
-                self.log.info(f"群通知解析：分类结果=空输出 source={source[:120]}")
-            return (out != self._NOTICE_SILENT_TOKEN) and bool(out)
-        except Exception as e:
-            self.log.warning(f"群通知解析：分类调用失败 source={source[:120]} err={e}")
-            return False
-
-    def _reason_notice_sync(self, source: str, snippet: str) -> str:
-        if not self.deepseek_api_key:
-            raise RuntimeError("deepseek api key not ready")
-        if OpenAI is None:
-            raise RuntimeError("openai sdk is not installed")
-
-        content = str(snippet or "").strip()
-        if not content:
-            return self._NOTICE_SILENT_TOKEN
-        # 通知类尽量使用完整文本；极端长文档才截断，避免超大请求。
-        if len(content) > 120000:
-            content = content[:120000]
-
-        client = self._create_deepseek_client()
-
-        prompt = (
-            "【角色设定】\n"
-            "你是 QQ 群里的 AI 助手 Cooper_bot。\n\n"
-            "【任务】\n"
-            "根据给定通知全文，生成一份简洁清晰的省流说明。\n"
-            "只提取原文中明确出现的信息，不要补充、猜测或外推。\n"
-            "报名方式、费用、地点等信息仅在原文明确出现时才写入；未出现就直接省略。\n\n"
-            "【输出格式（纯文本，不要*）】\n"
-            "📢 【省流通知】[核心标题]\n"
-            "🎯 核心事由：[一句话概括]\n"
-            "🙋‍♂️ 涉及人员：[全体同学/团员/班委/指定人群]\n"
-            "✅ 需要做什么：\n"
-            "1. ...\n"
-            "2. ...\n"
-            "3. ...\n"
-            "⏰ 截止时间：[若无则写“无明确截止时间”]\n\n"
-            "【风格要求】\n"
-            "- 保持简洁，控制在 6~10 行。\n"
-            "- 可用 emoji。\n"
-            "- 不要 Markdown，不要星号(*)，不要代码块。\n"
-            "- 禁止输出“原文未提及/未知/暂无/待通知”等占位语。\n"
-            "- 除上述模板外，不要额外追加字段。\n\n"
-            "【输入来源】\n"
-            f"{source or '未知来源'}\n\n"
-            "【通知全文/片段】\n"
-            f"{content}"
-        )
-
-        resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.2)
-        raw = self._extract_sdk_chat_text(resp)
-        out = self.sanitize_reasoner_output(raw)
-        return out or self._NOTICE_SILENT_TOKEN
-
     def _classify_notice_sync_v2(
         self,
         source: str,
@@ -3679,8 +3480,6 @@ class AIService:
         kind: str = "notice",
     ) -> bool:
         if not self.deepseek_api_key:
-            return False
-        if OpenAI is None:
             return False
 
         content = str(snippet or "").strip()
@@ -3692,10 +3491,14 @@ class AIService:
         lines = self._select_notice_prompt_lines(group_id, kind, "classify")
         prompt = self._render_notice_prompt(lines, source, content)
 
-        client = self._create_deepseek_client()
         try:
-            resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.0)
-            raw = self._extract_sdk_chat_text(resp)
+            raw = self.gateway.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                thinking=True,
+                reasoning_effort=self._REASONING_EFFORT_HIGH,
+                timeout=600.0,
+            )
             out = self.sanitize_reasoner_output(raw)
             if out == "[通知]":
                 self.log.info(f"群通知解析：分类结果=通知 source={source[:120]}")
@@ -3720,8 +3523,6 @@ class AIService:
     ) -> str:
         if not self.deepseek_api_key:
             raise RuntimeError("deepseek api key not ready")
-        if OpenAI is None:
-            raise RuntimeError("openai sdk is not installed")
 
         content = str(snippet or "").strip()
         if not content:
@@ -3732,9 +3533,13 @@ class AIService:
         lines = self._select_notice_prompt_lines(group_id, kind, "reason")
         prompt = self._render_notice_prompt(lines, source, content)
 
-        client = self._create_deepseek_client()
-        resp = self._create_reasoner_completion(client, [{"role": "user", "content": prompt}], 0.2)
-        raw = self._extract_sdk_chat_text(resp)
+        raw = self.gateway.chat(
+            [{"role": "user", "content": prompt}],
+            temperature=0.2,
+            thinking=True,
+            reasoning_effort=self._REASONING_EFFORT_HIGH,
+            timeout=600.0,
+        )
         out = self.sanitize_reasoner_output(raw)
         return out or self._NOTICE_SILENT_TOKEN
 
@@ -3822,13 +3627,6 @@ class AIService:
             "vector": vector_arr,
         }
 
-    def _build_index_entry(self, rel: str) -> dict:
-        ctx = self._run_new_file_pipeline(rel, hint=None, build_vector=False)
-        item = ctx.get("index_item")
-        if isinstance(item, dict):
-            return item
-        raise RuntimeError(f"failed to build index item: {rel}")
-
     def _build_vector_for_index_item(self, item: dict) -> Optional[np.ndarray]:
         combined_text = self._make_embedding_text(item)
         vec = self._embed_text(combined_text)
@@ -3887,15 +3685,13 @@ class AIService:
                 '{"keywords":["词1","词2"],"summary":"一句精简说明"}'
             )
 
-        payload = self._build_chat_payload(
-            [{"role": "user", "content": prompt}],
-            0.1,
-            response_format={"type": "json_object"},
-        )
-        url = self._join_url(self.deepseek_base_url, "chat/completions")
         try:
-            data = self._post_json(url, payload, self.deepseek_api_key, timeout=120.0)
-            text = self._extract_chat_text(data)
+            text = self.gateway.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.1,
+                json_mode=True,
+                timeout=120.0,
+            )
             parsed = self._parse_summary_json(text)
             if parsed:
                 return parsed
@@ -3904,18 +3700,7 @@ class AIService:
         return self._fallback_summary(subject, filename, file_type)
 
     def _embed_text(self, text: str) -> Optional[List[float]]:
-        if not self.embedding_base_url or not self.embedding_api_key:
-            return None
-        payload = {"model": self.embed_model, "input": str(text or "")}
-        url = self._join_url(self.embedding_base_url, "embeddings")
-        try:
-            data = self._post_json(url, payload, self.embedding_api_key, timeout=90.0)
-            arr = (((data or {}).get("data") or [{}])[0] or {}).get("embedding")
-            if isinstance(arr, list) and arr:
-                return [float(x) for x in arr]
-        except Exception as e:
-            self.log.warning(f"AI 向量：embedding 请求失败: {e}")
-        return None
+        return self.gateway.embed(str(text or ""), timeout=90.0)
 
     def _make_embedding_text(self, item: dict) -> str:
         subject = str(item.get("subject") or "")
@@ -4736,19 +4521,6 @@ class AIService:
         return parts[0] if parts else "unknown"
 
     @staticmethod
-    def _join_url(base: str, endpoint: str) -> str:
-        b = str(base or "").rstrip("/")
-        e = str(endpoint or "").lstrip("/")
-        return f"{b}/{e}"
-
-    @staticmethod
-    def _extract_chat_text(resp: dict) -> str:
-        try:
-            return str((((resp or {}).get("choices") or [{}])[0] or {}).get("message", {}).get("content") or "").strip()
-        except Exception:
-            return ""
-
-    @staticmethod
     def _parse_summary_json(text: str) -> Optional[dict]:
         raw = str(text or "").strip()
         if not raw:
@@ -4816,36 +4588,3 @@ class AIService:
             seen.add(k)
             out.append(k)
         return {"keywords": out[:10], "summary": f"{subject}资料：{filename}"}
-
-    @staticmethod
-    def _post_json(url: str, payload: dict, api_key: str, timeout: float = 60.0) -> dict:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url=url, data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "application/json")
-        if api_key:
-            req.add_header("Authorization", f"Bearer {api_key}")
-
-        try:
-            with urllib.request.urlopen(req, timeout=float(timeout)) as resp:
-                raw = resp.read()
-        except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                detail = str(e)
-            raise RuntimeError(f"http {e.code}: {detail[:300]}")
-        except Exception as e:
-            raise RuntimeError(str(e))
-
-        txt = raw.decode("utf-8", errors="replace").strip()
-        if not txt:
-            raise RuntimeError("empty response")
-        try:
-            obj = json.loads(txt)
-        except Exception as e:
-            raise RuntimeError(f"json decode failed: {e}")
-        if not isinstance(obj, dict):
-            raise RuntimeError("invalid response type")
-        return obj

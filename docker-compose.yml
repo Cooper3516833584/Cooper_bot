@@ -17,6 +17,8 @@ services:
     volumes:
       # 资料库挂载（让 upload_* 能直接读取 storage/documents 中的文件）
       - "./storage/documents:/bot_data"
+      # 连续文本自动回复所用图片（只暴露这个专用目录）
+      - "./storage/auto_replies/images:/bot_auto_replies:ro"
       # 你的“上传目录”挂载（给 upload_group_file / upload_private_file 用）
       - "./runtime/staging/group:/data/upload_group_file"
       - "./runtime/staging/private:/data/upload_private_file"

@@ -25,6 +25,7 @@ from cooper_bot.commands.commands import dispatch, BotState, conv_key, notify_ad
 from cooper_bot.modules.permissions.permsvc import PermService
 from cooper_bot.modules.handin.handinsvc import HandinService
 from cooper_bot.modules.ai.aisvc import AIService
+from cooper_bot.modules.ai.search_bridge import start_kimi_search_bridge
 from cooper_bot.modules.calendar.daily_calendar import DailyCalendarService
 from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
@@ -91,6 +92,8 @@ async def run_forever():
     vision_skill = VisionSkill(log)
     calendar_service = DailyCalendarService(log, aisvc)
     email_notify_service = EmailNotifyService(log, aisvc)
+    # Kimi CLI 的 WebSearch 需要一个搜索服务端点；失败只记日志，不影响其他功能。
+    start_kimi_search_bridge(log)
 
     try:
         kimi_report = await aisvc.load_kimi_capability_cache()

@@ -30,22 +30,19 @@ from typing import Optional
 from PIL import Image, ImageDraw, UnidentifiedImageError
 
 import cooper_bot.core.config as config
+from cooper_bot.modules.ai.model_gateway import ModelGateway, VISION_PROVIDER
 from cooper_bot.core.config import (
     TEMP_DIR,
     PROJECT_ROOT,
     DOCUMENTS_DIR,
-    VISION_API_KEY,
-    VISION_BASE_URL,
     VISION_CACHE_MAX_ENTRIES,
     VISION_CACHE_TTL_SECONDS,
     VISION_CAPTURE_CONTEXT_IMAGES,
     VISION_DESCRIPTION_MAX_CHARS,
-    VISION_ENABLED,
     VISION_MAX_CONCURRENCY,
     VISION_MAX_EDGE,
     VISION_MAX_IMAGE_BYTES,
     VISION_MAX_IMAGES_PER_MESSAGE,
-    VISION_MODEL,
     VISION_NEGATIVE_CACHE_TTL_SECONDS,
     VISION_TIMEOUT_SECONDS,
 )
@@ -265,6 +262,7 @@ class VisionSkill:
     """统一视觉描述 Skill。
 
     依赖注入（便于测试）：
+    - gateway: ModelGateway 实例（默认自建，从 config 读取视觉 provider）
     - client: AsyncOpenAI 兼容客户端
     - downloader: async (url: str) -> bytes 下载器
     - clock: () -> float 时间函数
@@ -277,12 +275,17 @@ class VisionSkill:
         client=None,
         downloader=None,
         clock=None,
+        gateway=None,
     ):
         self.log = log
-        self.enabled = bool(VISION_ENABLED)
-        self.api_key = str(VISION_API_KEY or "").strip()
-        self.base_url = str(VISION_BASE_URL or "").strip().rstrip("/")
-        self.model = str(VISION_MODEL or "").strip()
+        # 视觉 provider 的凭据与模型名统一由 model_gateway 解析；下面这些属性保持
+        # 原有名字供外部读取，实际请求也经 gateway 发出。
+        self.gateway = gateway or ModelGateway(log)
+        vision_provider = self.gateway.provider(VISION_PROVIDER)
+        self.enabled = bool(vision_provider.enabled)
+        self.api_key = str(vision_provider.api_key or "").strip()
+        self.base_url = str(vision_provider.base_url or "").strip().rstrip("/")
+        self.model = str(vision_provider.model or "").strip()
         self.timeout_seconds = max(5.0, float(VISION_TIMEOUT_SECONDS or 20.0))
         self.max_images_per_message = max(1, int(VISION_MAX_IMAGES_PER_MESSAGE or 3))
         self.max_image_bytes = max(64 * 1024, int(VISION_MAX_IMAGE_BYTES or 8 * 1024 * 1024))
@@ -312,6 +315,7 @@ class VisionSkill:
 
     @property
     def ready(self) -> bool:
+        # 请求客户端由 gateway 负责创建；注入 client 的测试路径不经此判断。
         return bool(
             self.enabled
             and self.api_key
@@ -319,16 +323,6 @@ class VisionSkill:
             and self.model
             and AsyncOpenAI is not None
         )
-
-    def _get_client(self):
-        if self._client is None:
-            self._client = AsyncOpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-                timeout=self.timeout_seconds,
-                max_retries=1,
-            )
-        return self._client
 
     def _get_semaphore(self) -> asyncio.Semaphore:
         if self._semaphore is None:
@@ -920,31 +914,13 @@ class VisionSkill:
     # ---------- API 调用 ----------
 
     async def _call_vision_api(self, data_url: str) -> str:
-        client = self._get_client()
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _VISION_SYSTEM_PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ]
-        kwargs: dict = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": _VISION_MAX_OUTPUT_TOKENS,
-        }
-        try:
-            completion = await client.chat.completions.create(**kwargs)
-        except TypeError:
-            kwargs.pop("max_tokens", None)
-            completion = await client.chat.completions.create(**kwargs)
-        try:
-            return str(completion.choices[0].message.content or "").strip()
-        except Exception:
-            return ""
+        return await self.gateway.vision_describe(
+            data_url,
+            system_prompt=_VISION_SYSTEM_PROMPT,
+            max_tokens=_VISION_MAX_OUTPUT_TOKENS,
+            timeout=self.timeout_seconds,
+            client=self._client,
+        )
 
     def _format_vision_text(self, raw: str) -> str:
         obj = _parse_vision_json(raw)

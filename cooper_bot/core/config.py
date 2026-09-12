@@ -26,6 +26,7 @@ NAPCAT_DIR = RUNTIME_DIR / "napcat"
 PRIVATE_CONFIG_DIR = CONFIG_DIR / "private"
 AI_CONFIG_DIR = CONFIG_DIR / "ai"
 REPLIES_DIR = CONFIG_DIR / "replies"
+AUTO_REPLY_IMAGES_DIR = STORAGE_DIR / "auto_replies" / "images"
 WIKI_CONFIG_DIR = CONFIG_DIR / "wiki"
 
 # ========== 读取敏感配置（secrets.env） ==========
@@ -262,12 +263,16 @@ AI_GROUP_NOTICE_PROMPTS_PATH = AI_CONFIG_DIR / "group_notice_prompts.json"
 AI_PRIVATE_CHAT_PROMPTS_PATH = AI_CONFIG_DIR / "private_chat_prompts.json"
 ANSWER_FILE_PATH = REPLIES_DIR / "answer.txt"
 KEYWORD_ANSWER_FILE_PATH = REPLIES_DIR / "keyword_answer.txt"
+CONSECUTIVE_REPLY_CONFIG_PATH = REPLIES_DIR / "consecutive_reply.json"
+# docker-compose 将 AUTO_REPLY_IMAGES_DIR 挂载到这个路径，供 CQ 图片消息读取。
+AUTO_REPLY_IMAGES_CONTAINER_DIR = "/bot_auto_replies"
 WIKI_CATEGORIES_PATH = WIKI_CONFIG_DIR / "1037wiki_categories.json"
 WIKI_STATE_DIR = STATE_DIR / "wiki"
 
-AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-v4-pro")
-AI_WEB_SEARCH_ENABLED = _get_env("AI_WEB_SEARCH_ENABLED", "1") == "1"
-AI_WEB_SEARCH_MODEL = _get_env("AI_WEB_SEARCH_MODEL", "")
+# 端点实测（GET /models）只公布 deepseek-flash 与 deepseek-v4-pro；联网检索同样用 flash。
+AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-flash")
+AI_WEB_SEARCH_ENABLED = _get_env_bool("AI_WEB_SEARCH_ENABLED", True)
+AI_WEB_SEARCH_MODEL = _get_env("AI_WEB_SEARCH_MODEL", "deepseek-flash")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
 
@@ -288,6 +293,10 @@ AI_KIMI_ADMIN_TIMEOUT_SECONDS = _get_env_float("AI_KIMI_ADMIN_TIMEOUT_SECONDS", 
 AI_KIMI_MAX_CONCURRENCY = _get_env_int("AI_KIMI_MAX_CONCURRENCY", 3, 1, 16)
 AI_KIMI_ADMIN_ENABLED = _get_env_bool("AI_KIMI_ADMIN_ENABLED", False)
 AI_KIMI_ALLOW_GROUP_COMPUTER = _get_env_bool("AI_KIMI_ALLOW_GROUP_COMPUTER", False)
+# Kimi 搜索桥：把 CLI 的 WebSearch 请求转成 DeepSeek 联网搜索（只绑 127.0.0.1）。
+AI_KIMI_SEARCH_BRIDGE_ENABLED = _get_env_bool("AI_KIMI_SEARCH_BRIDGE_ENABLED", True)
+AI_KIMI_SEARCH_BRIDGE_PORT = _get_env_int("AI_KIMI_SEARCH_BRIDGE_PORT", 18783, 1, 65535)
+AI_KIMI_SEARCH_BRIDGE_TIMEOUT_SECONDS = _get_env_float("AI_KIMI_SEARCH_BRIDGE_TIMEOUT_SECONDS", 90.0, 5.0, 300.0)
 
 AI_SEARCH_LIMIT = int(_get_env("AI_SEARCH_LIMIT", "10") or "10")
 AI_SEARCH_MIN_SIMILARITY = float(_get_env("AI_SEARCH_MIN_SIMILARITY", "0.35") or "0.35")

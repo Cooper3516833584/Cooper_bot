@@ -32,7 +32,7 @@ def test_deepseek_task_text_keeps_legacy_stateless_payload(monkeypatch) -> None:
         captured.append(payload)
         return {"choices": [{"message": {"content": "task-reply"}}]}
 
-    monkeypatch.setattr(svc, "_post_json", _fake_post_json)
+    monkeypatch.setattr("cooper_bot.modules.ai.model_gateway.http_post_json", _fake_post_json)
 
     assert svc.deepseek_task_ready is True
     assert svc._deepseek_task_text_sync("生成日历文案") == "task-reply"

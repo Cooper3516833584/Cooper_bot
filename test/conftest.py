@@ -260,7 +260,7 @@ def _block_external_services(monkeypatch: pytest.MonkeyPatch) -> None:
         if request_mod is not None:
             monkeypatch.setattr(request_mod, "urlopen", _blocked, raising=False)
 
-    _patch_module_attr(monkeypatch, "cooper_bot.modules.ai.aisvc", "OpenAI", None)
+    _patch_module_attr(monkeypatch, "cooper_bot.modules.ai.model_gateway", "AsyncOpenAI", None)
     _patch_module_attr(monkeypatch, "cooper_bot.modules.ai.aisvc", "RapidOCR", None)
 
 

@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 import asyncio
 import html
+import json
 import re
 import time
 import shutil
 import uuid
 import unicodedata
+from urllib.parse import quote
 from cooper_bot.modules.files.filesvc import FileService
 from cooper_bot.modules.logging.logsvc import LogService
 from cooper_bot.modules.handin.handinsvc import (
@@ -49,6 +51,9 @@ from cooper_bot.core.config import (
     AI_KIMI_ALLOW_GROUP_COMPUTER,
     ANSWER_FILE_PATH,
     KEYWORD_ANSWER_FILE_PATH,
+    CONSECUTIVE_REPLY_CONFIG_PATH,
+    AUTO_REPLY_IMAGES_DIR,
+    AUTO_REPLY_IMAGES_CONTAINER_DIR,
     TEMP_DIR,
 )
 if TYPE_CHECKING:
@@ -58,6 +63,8 @@ _ANSWER_CACHE_MTIME: Optional[float] = None
 _ANSWER_CACHE: Dict[str, List[str]] = {}
 _KEYWORD_ANSWER_CACHE_MTIME: Optional[float] = None
 _KEYWORD_ANSWER_CACHE: Dict[str, List[str]] = {}
+_CONSECUTIVE_REPLY_CACHE_MTIME: Optional[float] = None
+_CONSECUTIVE_REPLY_CACHE: Dict[int, Dict[str, dict]] = {}
 _GROUP_NOTICE_FILE_SUFFIXES = {".pdf", ".doc", ".docx", ".md", ".markdown"}
 _URL_RE = re.compile(r"(https?://[^\s<>\"]+)", flags=re.IGNORECASE)
 _GROUP_NOTICE_MAX_CANDIDATES = 3
@@ -78,6 +85,8 @@ _SIGNIN_FINALIZE_GRACE_SECONDS = 5.0
 _TEXT_COMPANION_EMOJI_SEG_TYPES = {"face", "mface", "market_face"}
 _MEDIA_OR_EMOJI_SEG_TYPES = {"image"} | _TEXT_COMPANION_EMOJI_SEG_TYPES
 _KEYWORD_ALLOWED_NON_TEXT_SEG_TYPES = {"at", "reply"} | _TEXT_COMPANION_EMOJI_SEG_TYPES
+_AUTO_REPLY_IMAGE_NAME_RE = re.compile(r"^[\w. +()（）-]+$", flags=re.UNICODE)
+_AUTO_REPLY_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _MEDIA_OR_EMOJI_PLACEHOLDER_RE = re.compile(
     r"^\[\s*(?:\u56fe\u7247|\u8868\u60c5|\u52a8\u753b\u8868\u60c5)\s*\]$",
     flags=re.IGNORECASE,
@@ -277,6 +286,109 @@ def _lookup_keyword_answers(text: str) -> List[str]:
     return list(best_replies or [])
 
 
+def _reload_consecutive_reply_cache_if_needed() -> None:
+    global _CONSECUTIVE_REPLY_CACHE_MTIME, _CONSECUTIVE_REPLY_CACHE
+    try:
+        mtime = float(CONSECUTIVE_REPLY_CONFIG_PATH.stat().st_mtime)
+    except Exception:
+        _CONSECUTIVE_REPLY_CACHE = {}
+        _CONSECUTIVE_REPLY_CACHE_MTIME = None
+        return
+    if _CONSECUTIVE_REPLY_CACHE_MTIME is not None and abs(_CONSECUTIVE_REPLY_CACHE_MTIME - mtime) < 1e-6:
+        return
+    try:
+        raw = json.loads(CONSECUTIVE_REPLY_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+
+    parsed: Dict[int, Dict[str, dict]] = {}
+    groups = raw.get("groups") if isinstance(raw, dict) else None
+    if isinstance(groups, dict):
+        for group_id_text, group_rules in groups.items():
+            try:
+                group_id = int(group_id_text)
+            except (TypeError, ValueError):
+                continue
+            if group_id <= 0 or not isinstance(group_rules, dict):
+                continue
+            rules: Dict[str, dict] = {}
+            for trigger_text, rule_raw in group_rules.items():
+                trigger = str(trigger_text or "").strip()
+                if not trigger or not isinstance(rule_raw, dict):
+                    continue
+                try:
+                    min_count = max(3, int(rule_raw.get("min_count", 3)))
+                except (TypeError, ValueError):
+                    min_count = 3
+                reply_text = str(rule_raw.get("reply_text") or "").strip()
+                image_name = str(rule_raw.get("reply_image") or "").strip()
+                if image_name:
+                    image_path = Path(image_name)
+                    if (
+                        image_path.name != image_name
+                        or not _AUTO_REPLY_IMAGE_NAME_RE.fullmatch(image_name)
+                        or image_path.suffix.lower() not in _AUTO_REPLY_IMAGE_SUFFIXES
+                    ):
+                        image_name = ""
+                if reply_text or image_name:
+                    rules[trigger] = {
+                        "min_count": min_count,
+                        "reply_text": reply_text,
+                        "reply_image": image_name,
+                    }
+            if rules:
+                parsed[group_id] = rules
+    _CONSECUTIVE_REPLY_CACHE = parsed
+    _CONSECUTIVE_REPLY_CACHE_MTIME = mtime
+
+
+def _consecutive_reply_messages(rule: dict) -> List[str]:
+    messages: List[str] = []
+    reply_text = str(rule.get("reply_text") or "").strip()
+    if reply_text:
+        messages.append(reply_text)
+    image_name = str(rule.get("reply_image") or "").strip()
+    image_path = AUTO_REPLY_IMAGES_DIR / image_name
+    if image_name and image_path.is_file():
+        uri = f"file://{AUTO_REPLY_IMAGES_CONTAINER_DIR}/{quote(image_name, safe='-._~')}"
+        messages.append(f"[CQ:image,file={uri}]")
+    return messages
+
+
+async def _handle_consecutive_reply(api, ctx, evt: dict, text: str, logsvc: LogService, state: "BotState") -> bool:
+    if getattr(ctx, "scene", "") != "group" or getattr(ctx, "group_id", None) is None:
+        return False
+    try:
+        group_id = int(ctx.group_id)
+    except (TypeError, ValueError):
+        return False
+    if not _is_keyword_text_message(evt, text):
+        state.consecutive_reply_runs.pop(group_id, None)
+        return False
+
+    _reload_consecutive_reply_cache_if_needed()
+    trigger = _strip_text_companion_cq_segments(text)
+    rule = _CONSECUTIVE_REPLY_CACHE.get(group_id, {}).get(trigger)
+    if rule is None:
+        state.consecutive_reply_runs.pop(group_id, None)
+        return False
+
+    previous = state.consecutive_reply_runs.get(group_id, {})
+    count = int(previous.get("count") or 0) + 1 if previous.get("trigger") == trigger else 1
+    replied = bool(previous.get("replied")) if previous.get("trigger") == trigger else False
+    state.consecutive_reply_runs[group_id] = {"trigger": trigger, "count": count, "replied": replied}
+    if replied or count < int(rule["min_count"]):
+        return False
+
+    messages = _consecutive_reply_messages(rule)
+    if not messages:
+        return False
+    state.consecutive_reply_runs[group_id]["replied"] = True
+    for message in messages:
+        await reply(api, ctx, message, logsvc)
+    return True
+
+
 def _is_media_or_emoji_only_message(evt: dict, text: str) -> bool:
     msg = evt.get("message")
     if isinstance(msg, list):
@@ -399,6 +511,8 @@ class BotState:
     pending_signin_name_input: Dict[int, dict] = field(default_factory=dict)
     # Group notice digest dedup cache: notice_key -> ts
     recent_group_notice_keys: Dict[str, float] = field(default_factory=dict)
+    # Consecutive reply state: group_id -> {trigger, count, replied}.
+    consecutive_reply_runs: Dict[int, dict] = field(default_factory=dict)
     # Opportunistic cleanup guard.
     last_state_sweep_ts: float = 0.0
 
@@ -4880,6 +4994,8 @@ async def dispatch(
         return
     # 记录 IN（只有最终 log_out 才会落盘）
     logsvc.log_in(ctx, raw_text or "[image]")
+    if await _handle_consecutive_reply(api, ctx, evt, raw_text, logsvc, state):
+        return
     non_ai_remembered = False
 
     def _remember_non_ai_once() -> None:

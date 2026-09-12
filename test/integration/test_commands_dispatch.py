@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -170,6 +171,71 @@ def _make_handin_management_stub(tasks: list[_FakeHandinTask]):
         is_task_gettable=Mock(return_value=True),
         cancel_task=Mock(return_value=(True, "task-cancelled")),
     )
+
+
+@pytest.mark.asyncio
+async def test_consecutive_reply_requires_whitelisted_group_and_text(tmp_path: Path, monkeypatch, dispatch_harness) -> None:
+    config_path = tmp_path / "consecutive_reply.json"
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    (image_dir / "reply.jpg").write_bytes(b"image")
+    config_path.write_text(
+        json.dumps(
+            {
+                "groups": {
+                    "20001": {
+                        "连续文本": {
+                            "min_count": 3,
+                            "reply_image": "reply.jpg",
+                        }
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(commands, "CONSECUTIVE_REPLY_CONFIG_PATH", config_path)
+    monkeypatch.setattr(commands, "AUTO_REPLY_IMAGES_DIR", image_dir)
+    monkeypatch.setattr(commands, "_CONSECUTIVE_REPLY_CACHE_MTIME", None)
+    monkeypatch.setattr(commands, "_CONSECUTIVE_REPLY_CACHE", {})
+
+    state = commands.BotState()
+    ctx = _make_ctx(group_id=20001)
+    evt = {"post_type": "message", "message_type": "group", "message": [{"type": "text", "data": {"text": "连续文本"}}]}
+    for _ in range(3):
+        await commands.dispatch(
+            api=SimpleNamespace(),
+            ctx=ctx,
+            evt=evt,
+            text="连续文本",
+            filesvc=_make_filesvc_stub(),
+            logsvc=_DummyLogService(),
+            state=state,
+            handin=Mock(),
+            perm=Mock(),
+            aisvc=None,
+        )
+
+    assert [item["text"] for item in dispatch_harness.messages] == [
+        "[CQ:image,file=file:///bot_auto_replies/reply.jpg]"
+    ]
+
+    other_group_state = commands.BotState()
+    for _ in range(3):
+        await commands.dispatch(
+            api=SimpleNamespace(),
+            ctx=_make_ctx(group_id=20002),
+            evt=evt,
+            text="连续文本",
+            filesvc=_make_filesvc_stub(),
+            logsvc=_DummyLogService(),
+            state=other_group_state,
+            handin=Mock(),
+            perm=Mock(),
+            aisvc=None,
+        )
+    assert len(dispatch_harness.messages) == 1
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,17 @@
+{
+  "_comment": "仅 groups 中列出的群和文本会触发；同一群内该精确文本连续出现 min_count 次后，每一轮连续消息只回复一次。reply_text 和 reply_image 可任选其一或同时配置；图片必须放在 storage/auto_replies/images/ 中。",
+  "groups": {
+    "1087250737": {
+      "甜甜甜": {
+        "min_count": 3,
+        "reply_image": "禁止+1.jpg"
+      }
+    },
+    "1076684416": {
+      "甜甜甜": {
+        "min_count": 3,
+        "reply_image": "禁止+1.jpg"
+      }
+    }
+  }
+}
