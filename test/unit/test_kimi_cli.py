@@ -256,3 +256,63 @@ async def test_stdout_overflow_terminates_child_fast_and_releases_its_slot(tmp_p
     assert pending == set()
 
 
+class _FakeVersionProcess:
+    def __init__(self, stdout: bytes, returncode: int = 0) -> None:
+        self._stdout = stdout
+        self.returncode = returncode
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, b""
+
+
+def _narrow_profile(tmp_path: Path) -> KimiProfile:
+    home = tmp_path / "narrow_home"
+    workdir = tmp_path / "narrow_workdir"
+    skills = home / "empty_skills"
+    for path in (home, workdir, skills):
+        path.mkdir(parents=True, exist_ok=True)
+    agent = tmp_path / "narrow_agent.md"
+    agent.write_text("---\nsubagents: []\n---\n", encoding="utf-8")
+    return KimiProfile("public", home, workdir, agent, skills, ("WebSearch",))
+
+
+@pytest.mark.asyncio
+async def test_runtime_version_probe_uses_the_injected_narrow_environment(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KIMI_TEST_PARENT_SECRET", "leaked-secret")
+    captured: dict[str, object] = {}
+
+    async def fake_spawn(*argv: object, **kwargs: object) -> _FakeVersionProcess:
+        captured["env"] = kwargs.get("env")
+        return _FakeVersionProcess(b"kimi 9.9.9\n")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_spawn)
+    profile = _narrow_profile(tmp_path)
+    env = build_kimi_env(profile, os.environ)
+
+    info = await detect_kimi_runtime_info("kimi", executable_resolver=lambda _path: sys.executable, env=env)
+
+    assert info.version == "kimi 9.9.9"
+    assert os.environ["KIMI_TEST_PARENT_SECRET"] == "leaked-secret"
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert "KIMI_TEST_PARENT_SECRET" not in child_env
+    assert child_env["PATH"] == env["PATH"]
+    assert child_env["KIMI_CODE_HOME"] == str(profile.home)
+
+
+@pytest.mark.asyncio
+async def test_runtime_version_probe_keeps_env_optional_and_degrades_to_unknown(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_spawn(*argv: object, **kwargs: object) -> _FakeVersionProcess:
+        captured["env"] = kwargs.get("env")
+        return _FakeVersionProcess(b"", returncode=1)
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_spawn)
+
+    info = await detect_kimi_runtime_info("kimi", executable_resolver=lambda _path: sys.executable)
+
+    assert captured["env"] is None
+    assert info.version == "unknown"
+
+

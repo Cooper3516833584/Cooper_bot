@@ -345,6 +345,7 @@ async def detect_kimi_runtime_info(
     *,
     executable_resolver: Callable[[str], Optional[str]] = shutil.which,
     timeout_seconds: float = 5.0,
+    env: Optional[Mapping[str, str]] = None,
 ) -> KimiRuntimeInfo:
     """Return diagnostic version data only; it never influences readiness."""
     executable = executable_resolver(str(cli_path or "")) if cli_path else None
@@ -357,6 +358,7 @@ async def detect_kimi_runtime_info(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=dict(env) if env is not None else None,
         )
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=max(0.1, float(timeout_seconds)))
         if process.returncode == 0:

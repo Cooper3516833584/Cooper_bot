@@ -42,6 +42,8 @@ CONV_LOCK_SWEEP_INTERVAL_SECONDS = 60.0
 # - Then set it back to False.
 REBUILD_MATERIAL_SCAN_MARKS_ON_STARTUP = False
 _INSTANCE_LOCK_HANDLE = None
+# 启动后后台同步任务；由 run_forever() 在退出时统一取消并 await。
+_POST_SYNC_TASK: "asyncio.Task | None" = None
 
 
 def _acquire_single_instance_lock() -> bool:
@@ -78,6 +80,7 @@ def _lock_path_text() -> str:
     return str(CLIENT_LOCK_PATH.resolve())
 
 async def run_forever():
+    """进程入口：创建共享服务、启动搜索桥，并在退出时统一清理资源。"""
     if not _acquire_single_instance_lock():
         log.warning(f"检测到已有其他 bot 实例在运行，当前进程退出。lock={_lock_path_text()}")
         return
@@ -92,8 +95,37 @@ async def run_forever():
     vision_skill = VisionSkill(log)
     calendar_service = DailyCalendarService(log, aisvc)
     email_notify_service = EmailNotifyService(log, aisvc)
-    # Kimi CLI 的 WebSearch 需要一个搜索服务端点；失败只记日志，不影响其他功能。
-    start_kimi_search_bridge(log)
+
+    search_bridge = None
+    try:
+        # Kimi CLI 的 WebSearch 需要一个搜索服务端点；失败只记日志，不影响其他功能。
+        search_bridge = start_kimi_search_bridge(log)
+        await _run_bot_loop(
+            aisvc=aisvc,
+            vision_skill=vision_skill,
+            filesvc=filesvc,
+            state=state,
+            perm=perm,
+            handin=handin,
+            calendar_service=calendar_service,
+            email_notify_service=email_notify_service,
+        )
+    finally:
+        await _cleanup_runtime(log, search_bridge, aisvc)
+
+
+async def _run_bot_loop(
+    *,
+    aisvc,
+    vision_skill,
+    filesvc,
+    state,
+    perm,
+    handin,
+    calendar_service,
+    email_notify_service,
+):
+    global _POST_SYNC_TASK
 
     try:
         kimi_report = await aisvc.load_kimi_capability_cache()
@@ -150,8 +182,8 @@ async def run_forever():
             log.warning(f"启动后后台同步任务异常: {e}")
 
     try:
-        post_sync_task = asyncio.create_task(_run_post_startup_sync_tasks())
-        post_sync_task.add_done_callback(_on_post_sync_done)
+        _POST_SYNC_TASK = asyncio.create_task(_run_post_startup_sync_tasks())
+        _POST_SYNC_TASK.add_done_callback(_on_post_sync_done)
     except Exception as e:
         log.warning(f"启动后后台同步任务调度失败: {e}")
 
@@ -319,6 +351,33 @@ async def run_forever():
         except Exception as e:
             log.error(f"连接断开/异常：{e}")
             await asyncio.sleep(2)
+
+async def _cleanup_runtime(logger, search_bridge, aisvc) -> None:
+    """退出清理：取消后台同步任务、停止搜索桥、关闭 AIService。
+
+    清理过程中的异常只记录，不中断后续清理，也不覆盖原始退出异常。
+    """
+    task = _POST_SYNC_TASK
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"启动后后台同步任务清理异常: {e}")
+
+    if search_bridge is not None:
+        try:
+            search_bridge.stop()
+        except Exception as e:
+            logger.warning(f"Kimi 搜索桥停止失败: {e}")
+
+    try:
+        await aisvc.aclose()
+    except Exception as e:
+        logger.warning(f"AI 服务关闭失败: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(run_forever())

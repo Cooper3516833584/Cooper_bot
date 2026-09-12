@@ -172,3 +172,43 @@ def test_load_api_config_warns_when_required_lines_missing(tmp_path) -> None:
     assert svc.deepseek_base_url == ""
 
 
+# ============ 联网搜索 compose prompt ============
+
+
+def test_web_search_compose_prompt_has_no_internal_marker(monkeypatch) -> None:
+    """compose prompt 是业务文本，不得残留内部/展示层引用标记。"""
+    svc = _new_service()
+    captured: dict = {}
+
+    def _fake_chat(messages, **_kwargs):
+        captured["messages"] = messages
+        return "最终回答"
+
+    monkeypatch.setattr(svc.gateway, "chat", _fake_chat)
+
+    out = svc._web_search_compose_final_sync("系统提示", "用户问题原文", "素材原文")
+
+    assert out == "最终回答"
+    system = captured["messages"][0]["content"]
+    user = captured["messages"][-1]["content"]
+    assert "cite" not in system.lower()
+    assert "cite" not in user.lower()
+    assert "联网搜索结果" in user
+    assert "用户问题原文" in user
+    assert "素材原文" in user
+
+
+def test_web_search_compose_keeps_material_and_strips_search_marker(monkeypatch) -> None:
+    svc = _new_service()
+    captured: dict = {}
+
+    def _fake_chat(messages, **_kwargs):
+        captured["messages"] = messages
+        return "[WEB_SEARCH] 泄漏的查询词\n真正的回答"
+
+    monkeypatch.setattr(svc.gateway, "chat", _fake_chat)
+
+    out = svc._web_search_compose_final_sync("系统提示", "用户问题", "素材")
+
+    assert out == "真正的回答"
+    assert "[WEB_SEARCH]" not in out
