@@ -127,3 +127,43 @@ async def test_cleanup_ignores_already_finished_post_sync_task() -> None:
     await client._cleanup_runtime(_CollectingLog(), bridge, _FakeAIService())
 
     assert bridge.stop_calls == 1
+
+
+async def _settle(task: asyncio.Task, rounds: int = 5) -> None:
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+async def test_post_sync_done_callback_ignores_cancellation(monkeypatch) -> None:
+    log = _CollectingLog()
+    monkeypatch.setattr(client, "log", log)
+
+    async def _long_running() -> None:
+        await asyncio.sleep(30)
+
+    task = asyncio.create_task(_long_running())
+    await _settle(task)
+    task.cancel()
+    await _settle(task)
+    assert task.cancelled()
+
+    client._log_post_sync_task_result(task)
+
+    # 退出时的正常取消不应产生任何日志噪声。
+    assert log.warnings == []
+
+
+async def test_post_sync_done_callback_logs_real_failures(monkeypatch) -> None:
+    log = _CollectingLog()
+    monkeypatch.setattr(client, "log", log)
+
+    async def _boom() -> None:
+        raise RuntimeError("sync failed")
+
+    task = asyncio.create_task(_boom())
+    await _settle(task)
+    assert task.done() and not task.cancelled()
+
+    client._log_post_sync_task_result(task)
+
+    assert any("sync failed" in msg for msg in log.warnings)

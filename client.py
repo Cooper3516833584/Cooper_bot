@@ -175,15 +175,9 @@ async def _run_bot_loop(
         if ai_ok:
             log.info("AI 启动后同步已完成")
 
-    def _on_post_sync_done(task: asyncio.Task) -> None:
-        try:
-            task.result()
-        except Exception as e:
-            log.warning(f"启动后后台同步任务异常: {e}")
-
     try:
         _POST_SYNC_TASK = asyncio.create_task(_run_post_startup_sync_tasks())
-        _POST_SYNC_TASK.add_done_callback(_on_post_sync_done)
+        _POST_SYNC_TASK.add_done_callback(_log_post_sync_task_result)
     except Exception as e:
         log.warning(f"启动后后台同步任务调度失败: {e}")
 
@@ -351,6 +345,16 @@ async def _run_bot_loop(
         except Exception as e:
             log.error(f"连接断开/异常：{e}")
             await asyncio.sleep(2)
+
+def _log_post_sync_task_result(task: asyncio.Task) -> None:
+    """启动后后台同步任务的 done callback：取消属正常退出，只有真实异常才记日志。"""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        log.warning(f"启动后后台同步任务异常: {e}")
+
 
 async def _cleanup_runtime(logger, search_bridge, aisvc) -> None:
     """退出清理：取消后台同步任务、停止搜索桥、关闭 AIService。
