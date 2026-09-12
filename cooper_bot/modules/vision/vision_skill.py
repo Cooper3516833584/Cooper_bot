@@ -290,7 +290,9 @@ class VisionSkill:
         self.max_images_per_message = max(1, int(VISION_MAX_IMAGES_PER_MESSAGE or 3))
         self.max_image_bytes = max(64 * 1024, int(VISION_MAX_IMAGE_BYTES or 8 * 1024 * 1024))
         self.max_edge = max(64, int(VISION_MAX_EDGE or 1024))
-        self.description_max_chars = 2400
+        # 输出长度上限由 VISION_DESCRIPTION_MAX_CHARS 控制；0/非法值兜底为配置默认值，
+        # 并保证不小于 1，避免截断函数收到 0 或负数。
+        self.description_max_chars = max(1, int(VISION_DESCRIPTION_MAX_CHARS or 2400))
         self.max_concurrency = max(1, int(VISION_MAX_CONCURRENCY or 4))
         self.cache_max_entries = max(0, int(VISION_CACHE_MAX_ENTRIES or 0))
         self.cache_ttl = max(0.0, float(VISION_CACHE_TTL_SECONDS or 21600.0))

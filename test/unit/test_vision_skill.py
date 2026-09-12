@@ -418,3 +418,70 @@ async def test_negative_ttl_zero_allows_immediate_retry() -> None:
     resolutions = await svc.resolve_slots(_FakeAPI(), [slot])
     assert resolutions[0].status == "retryable_error"
     assert resolutions[0].retry_after_ts <= 1000.0  # 立即重试
+
+
+# ============ 描述长度上限（VISION_DESCRIPTION_MAX_CHARS）============
+
+_VISION_MAX_CHARS_TARGET = "cooper_bot.modules.vision.vision_skill.VISION_DESCRIPTION_MAX_CHARS"
+
+
+def test_description_max_chars_follows_config(monkeypatch) -> None:
+    monkeypatch.setattr(_VISION_MAX_CHARS_TARGET, 123)
+
+    assert _make_skill().description_max_chars == 123
+
+
+def test_description_max_chars_falls_back_for_invalid_config(monkeypatch) -> None:
+    # 0 / 空值回落到配置默认值 2400，负数至少变成 1，避免截断函数拿到 0 或负数。
+    monkeypatch.setattr(_VISION_MAX_CHARS_TARGET, 0)
+    assert _make_skill().description_max_chars == 2400
+
+    monkeypatch.setattr(_VISION_MAX_CHARS_TARGET, -5)
+    assert _make_skill().description_max_chars == 1
+
+
+def test_formatted_description_is_truncated_to_configured_cap(monkeypatch) -> None:
+    monkeypatch.setattr(_VISION_MAX_CHARS_TARGET, 30)
+    svc = _make_skill()
+    raw = json.dumps(
+        {
+            "kind": "聊天截图",
+            "scene": "画面内容" * 40,
+            "visible_text": "可见文字" * 40,
+            "emotion": "轻松",
+            "intent": "打招呼",
+        },
+        ensure_ascii=False,
+    )
+
+    out = svc._format_vision_text(raw)
+
+    assert out
+    assert len(out) <= 30
+
+
+def test_larger_cap_yields_longer_description(monkeypatch) -> None:
+    raw = json.dumps(
+        {"kind": "照片", "scene": "内容" * 80, "visible_text": "", "emotion": "", "intent": ""},
+        ensure_ascii=False,
+    )
+
+    monkeypatch.setattr(_VISION_MAX_CHARS_TARGET, 20)
+    short = _make_skill()._format_vision_text(raw)
+
+    monkeypatch.setattr(_VISION_MAX_CHARS_TARGET, 200)
+    longer = _make_skill()._format_vision_text(raw)
+
+    assert len(short) <= 20
+    assert len(longer) > len(short)
+
+
+def test_truncate_at_punctuation_prefers_sentence_boundary() -> None:
+    from cooper_bot.modules.vision.vision_skill import _truncate_at_punctuation
+
+    text = "甲" * 30 + "。" + "乙" * 30
+
+    out = _truncate_at_punctuation(text, 35)
+
+    assert out == "甲" * 30 + "。"
+    assert len(out) <= 35
