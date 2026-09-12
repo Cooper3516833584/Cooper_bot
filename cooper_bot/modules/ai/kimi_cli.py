@@ -412,10 +412,12 @@ class KimiCliRunner:
         """Permit an explicit trusted re-probe after a public security fault."""
         self._public_security_healthy = True
 
-    def _profile_for(self, name: str) -> KimiProfile:
+    def _profile_for(self, name: str, request_id: str = "") -> KimiProfile:
         if name == "public":
             return self.settings.public
         if name == "admin":
+            if not self.settings.admin_enabled:
+                raise KimiSecurityViolation(request_id, "admin_disabled")
             return self.settings.admin
         raise KimiProtocolError("", "invalid_profile")
 
@@ -615,17 +617,42 @@ class KimiCliRunner:
                 return
             await process.wait()
 
+    @staticmethod
+    async def _drain_stream(stream: asyncio.StreamReader) -> None:
+        """Read a terminated child's pipe to EOF so its transport can close."""
+        try:
+            while await asyncio.wait_for(stream.read(65536), timeout=2.0):
+                continue
+        except (TimeoutError, OSError):
+            pass
+
+    async def _reap_readers(
+        self,
+        process: asyncio.subprocess.Process,
+        stdout_task: asyncio.Task[bytes],
+        stderr_task: asyncio.Task[bytes],
+    ) -> None:
+        """Cancel aborted readers and release the terminated child's pipes."""
+        for task in (stdout_task, stderr_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                await self._drain_stream(stream)
+
     async def run(self, request: KimiRunRequest) -> KimiRunResult:
         if self._closing:
             raise KimiBusyError(request.request_id)
         if request.profile == "public" and not self._public_security_healthy:
             raise KimiSecurityViolation(request.request_id, "public_profile_unhealthy")
-        profile = self._profile_for(request.profile)
+        profile = self._profile_for(request.profile, request.request_id)
         argv = self._build_argv(request, profile)
         admin_acquired, global_acquired = await self._acquire_slot(request)
         process: Optional[asyncio.subprocess.Process] = None
         stdout_task: Optional[asyncio.Task[bytes]] = None
         stderr_task: Optional[asyncio.Task[bytes]] = None
+        wait_task: Optional[asyncio.Task[int]] = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,

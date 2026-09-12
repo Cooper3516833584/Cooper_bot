@@ -15,7 +15,11 @@ class _Log:
 
 class _Runner:
     def __init__(self) -> None:
-        self.settings = SimpleNamespace(timeout_seconds=120.0, admin_timeout_seconds=480.0)
+        self.settings = SimpleNamespace(
+            timeout_seconds=120.0,
+            admin_timeout_seconds=480.0,
+            admin_enabled=False,
+        )
         self.requests = []
 
     async def run(self, request):
@@ -23,13 +27,65 @@ class _Runner:
         return SimpleNamespace(text="kimi-reply", tool_call_observed=False, tool_names=())
 
 
+def _patch_settings_validation(monkeypatch, *, public: bool = True, admin: bool = True) -> None:
+    monkeypatch.setattr(
+        "cooper_bot.modules.ai.aisvc.validate_kimi_settings",
+        lambda _settings: SimpleNamespace(public_profile_valid=public, admin_profile_valid=admin),
+    )
+
+
 @pytest.mark.asyncio
-async def test_kimi_admin_history_does_not_read_public_group_history() -> None:
+async def test_kimi_chat_rejects_when_requested_profile_is_not_ready(monkeypatch) -> None:
+    """service 层必须自己校验 readiness，不能依赖调用方先检查。"""
     svc = AIService(_Log())
     svc.system_prompt = "system"
     runner = _Runner()
     svc._kimi_runner = runner
+    _patch_settings_validation(monkeypatch)
+
+    # public 未就绪：chat_ready 为 False
+    with pytest.raises(RuntimeError) as public_error:
+        await svc.kimi_chat_with_context("private:stateless", "hi")
+    assert "public profile is not ready" in str(public_error.value)
+
+    # admin 未就绪：computer_ready 为 False，即使调用方误传 allow_computer=True 也必须拒绝
+    with pytest.raises(RuntimeError) as admin_error:
+        await svc.kimi_chat_with_context(
+            "private:stateless", "hi", allow_computer=True, actor_user_id=900001
+        )
+    assert "admin profile is not ready" in str(admin_error.value)
+    assert runner.requests == []
+
+
+@pytest.mark.asyncio
+async def test_kimi_admin_chat_proceeds_when_computer_ready(monkeypatch) -> None:
+    svc = AIService(_Log())
+    svc.system_prompt = "system"
+    runner = _Runner()
+    runner.settings.admin_enabled = True
+    svc._kimi_runner = runner
+    svc._computer_verified = True
+    _patch_settings_validation(monkeypatch)
+
+    out = await svc.kimi_chat_with_context(
+        "private:stateless", "hi", allow_computer=True, actor_user_id=900001
+    )
+
+    assert out == "kimi-reply"
+    assert runner.requests[0].profile == "admin"
+
+
+@pytest.mark.asyncio
+async def test_kimi_admin_history_does_not_read_public_group_history(monkeypatch) -> None:
+    svc = AIService(_Log())
+    svc.system_prompt = "system"
+    runner = _Runner()
+    runner.settings.admin_enabled = True
+    svc._kimi_runner = runner
     svc._public_runtime_safe = True
+    # admin 路径现在要求 computer_ready，补齐 readiness 才能走到历史隔离逻辑。
+    svc._computer_verified = True
+    _patch_settings_validation(monkeypatch)
     svc._save_chat_turn("group:20001", "public-message", "public-reply")
 
     out = await svc.kimi_chat_with_context("group:20001", "admin-message", allow_computer=True, actor_user_id=900001)

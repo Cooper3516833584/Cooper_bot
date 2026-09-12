@@ -544,7 +544,10 @@ class AIService:
         allow_computer: bool = False,
         actor_user_id: Optional[int] = None,
     ) -> str:
-        if not allow_computer and not self.chat_ready:
+        if allow_computer:
+            if not self.computer_ready:
+                raise RuntimeError("kimi admin profile is not ready")
+        elif not self.chat_ready:
             raise RuntimeError("kimi public profile is not ready")
         base_key = str(session_key or "").strip()
         storage_key = self._kimi_storage_key(base_key, allow_computer=allow_computer, actor_user_id=actor_user_id)

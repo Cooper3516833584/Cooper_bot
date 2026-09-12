@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -15,10 +18,18 @@ from cooper_bot.modules.ai.kimi_cli import (
     KimiSecurityViolation,
     KimiSettings,
     KimiTimeoutError,
+    build_kimi_env,
+    detect_kimi_runtime_info,
 )
 
 
-def _runner(tmp_path: Path, script_body: str, *, argv_budget: int = 24000) -> KimiCliRunner:
+def _runner(
+    tmp_path: Path,
+    script_body: str,
+    *,
+    argv_budget: int = 24000,
+    admin_enabled: bool = False,
+) -> KimiCliRunner:
     tmp_path.mkdir(parents=True, exist_ok=True)
     script = tmp_path / "fake_kimi.py"
     script.write_text(script_body, encoding="utf-8")
@@ -30,7 +41,7 @@ def _runner(tmp_path: Path, script_body: str, *, argv_budget: int = 24000) -> Ki
     agent = tmp_path / "agent.md"
     agent.write_text("---\nsubagents: []\n---\n", encoding="utf-8")
     profile = KimiProfile("public", home, workdir, agent, skills, ("WebSearch",))
-    settings = KimiSettings(True, sys.executable, "", profile, profile, 2.0, 2.0, 1, False, False)
+    settings = KimiSettings(True, sys.executable, "", profile, profile, 2.0, 2.0, 1, admin_enabled, False)
     return KimiCliRunner(
         settings,
         executable_resolver=lambda _path: sys.executable,
@@ -130,6 +141,7 @@ async def test_public_websearch_is_allowed_and_admin_bash_is_not_restricted(tmp_
         "import json\n"
         "print(json.dumps({'type': 'tool_call', 'name': 'Bash'}))\n"
         "print(json.dumps({'type': 'assistant', 'content': 'ok'}))\n",
+        admin_enabled=True,
     )
     assert (await admin_runner.run(KimiRunRequest("hello", "admin", 2.0, "admin-1", "computer_probe"))).text == "ok"
 
@@ -174,3 +186,35 @@ def test_stream_json_parser_fails_closed_on_unknown_legacy_urp_target() -> None:
     assert tools == ("UnknownURP",)
     assert observed is True
     assert protocol is True
+
+
+@pytest.mark.asyncio
+async def test_admin_profile_is_refused_while_admin_is_globally_disabled(tmp_path) -> None:
+    sentinel = tmp_path / "admin_child_started.txt"
+    runner = _runner(
+        tmp_path,
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('started', encoding='utf-8')\n",
+    )
+
+    with pytest.raises(KimiSecurityViolation) as exc_info:
+        await runner.run(KimiRunRequest("hello", "admin", 2.0, "admin-1", "computer_probe"))
+
+    assert exc_info.value.code == "kimi_security_violation"
+    assert exc_info.value.detail == "admin_disabled"
+    assert exc_info.value.request_id == "admin-1"
+    assert sentinel.exists() is False
+    assert runner._processes == set()
+
+
+@pytest.mark.asyncio
+async def test_public_profile_still_runs_while_admin_is_globally_disabled(tmp_path) -> None:
+    runner = _runner(
+        tmp_path,
+        "import json\nprint(json.dumps({'type': 'assistant', 'content': 'ok'}))\n",
+    )
+
+    assert runner.settings.admin_enabled is False
+    assert (await runner.run(_request())).text == "ok"
+
+
