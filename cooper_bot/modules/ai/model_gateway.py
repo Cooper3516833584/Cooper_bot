@@ -190,8 +190,49 @@ def anthropic_messages_url(base_url: str) -> str:
     return f"{root}/anthropic/v1/messages"
 
 
+class ModelGatewayError(RuntimeError):
+    """模型网关调用失败的基类。"""
+
+
+class ModelGatewayTimeoutError(ModelGatewayError, TimeoutError):
+    """上游超时；同时是 TimeoutError，便于调用方按超时语义分支。"""
+
+
+class ModelGatewayHTTPError(ModelGatewayError):
+    """上游返回非 2xx 状态码。"""
+
+
+def _is_timeout_reason(reason: object) -> bool:
+    # socket.timeout 自 Python 3.10 起就是 TimeoutError 的别名，无需再单独判断。
+    if isinstance(reason, TimeoutError):
+        return True
+    return "timed out" in str(reason or "").lower()
+
+
+def _redact_headers(text: str, headers: dict) -> str:
+    """抹掉文本里出现的请求头凭据，避免上游回显把 key 带进日志。"""
+    out = str(text or "")
+    for value in (headers or {}).values():
+        token = str(value or "")
+        candidates = [token]
+        # Authorization 这类头把凭据放在 scheme 之后，裸凭据也要单独抹一次。
+        parts = token.split()
+        if len(parts) > 1:
+            candidates.append(parts[-1])
+        for candidate in candidates:
+            if len(candidate) >= 8 and candidate in out:
+                out = out.replace(candidate, "<redacted>")
+    return out
+
+
 def post_json_with_headers(url: str, payload: dict, headers: dict, timeout: float = 60.0) -> dict:
-    """唯一的 HTTP 出口；失败一律抛 RuntimeError。"""
+    """唯一的 HTTP 出口。
+
+    失败语义分三类，便于上层按需分支：
+        ModelGatewayTimeoutError  上游超时（可被 except TimeoutError 捕获）
+        ModelGatewayHTTPError     上游返回非 2xx
+        ModelGatewayError         其他传输层错误
+    """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url=url, data=body, method="POST")
     for name, value in headers.items():
@@ -206,9 +247,15 @@ def post_json_with_headers(url: str, payload: dict, headers: dict, timeout: floa
             detail = e.read().decode("utf-8", errors="replace")
         except Exception:
             detail = str(e)
-        raise RuntimeError(f"http {e.code}: {detail[:300]}")
+        raise ModelGatewayHTTPError(f"http {e.code}: {_redact_headers(detail, headers)[:300]}") from e
+    except TimeoutError as e:
+        raise ModelGatewayTimeoutError(f"timeout: {e}") from e
+    except urllib.error.URLError as e:
+        if _is_timeout_reason(getattr(e, "reason", None)):
+            raise ModelGatewayTimeoutError(f"timeout: {e.reason}") from e
+        raise ModelGatewayError(str(e)) from e
     except Exception as e:
-        raise RuntimeError(str(e))
+        raise ModelGatewayError(str(e)) from e
 
     txt = raw.decode("utf-8", errors="replace").strip()
     if not txt:
@@ -399,7 +446,9 @@ class ModelGateway:
         """OpenAI 兼容的 chat/completions。返回助手文本（可能为空串）。"""
         cfg = self.provider(provider)
         if cfg.kind != KIND_OPENAI_COMPAT:
-            raise RuntimeError(f"provider {provider} is not text-capable")
+            raise ModelGatewayError(f"provider {provider} is not text-capable")
+        if not cfg.ready:
+            raise ModelGatewayError(f"provider {provider} not ready")
         payload: dict = {
             "model": str(cfg.model),
             "messages": list(messages),

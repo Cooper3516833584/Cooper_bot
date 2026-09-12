@@ -480,3 +480,128 @@ def test_post_json_with_headers_serializes_utf8_payload(monkeypatch) -> None:
 def test_anthropic_messages_url_normalizes_v1_suffix() -> None:
     assert model_gateway.anthropic_messages_url("https://api.deepseek.com/v1") == "https://api.deepseek.com/anthropic/v1/messages"
     assert model_gateway.anthropic_messages_url("https://api.deepseek.com") == "https://api.deepseek.com/anthropic/v1/messages"
+
+
+# ============ 传输层异常语义 ============
+
+
+def _urlopen_raising(exc: BaseException):
+    def _boom(*_args, **_kwargs):
+        raise exc
+
+    return _boom
+
+
+def test_http_post_json_maps_timeout_to_typed_timeout_error(monkeypatch) -> None:
+    monkeypatch.setattr(
+        model_gateway.urllib.request,
+        "urlopen",
+        _urlopen_raising(TimeoutError("timed out")),
+    )
+
+    with pytest.raises(model_gateway.ModelGatewayTimeoutError) as excinfo:
+        model_gateway.http_post_json("https://x", {"a": 1}, "k")
+
+    # 上层可以继续用 except TimeoutError 分支处理。
+    assert isinstance(excinfo.value, TimeoutError)
+    assert isinstance(excinfo.value, model_gateway.ModelGatewayError)
+
+
+def test_http_post_json_maps_url_error_timeout_reason(monkeypatch) -> None:
+    import urllib.error
+
+    monkeypatch.setattr(
+        model_gateway.urllib.request,
+        "urlopen",
+        _urlopen_raising(urllib.error.URLError(TimeoutError("timed out"))),
+    )
+
+    with pytest.raises(model_gateway.ModelGatewayTimeoutError):
+        model_gateway.http_post_json("https://x", {"a": 1}, "k")
+
+    monkeypatch.setattr(
+        model_gateway.urllib.request,
+        "urlopen",
+        _urlopen_raising(urllib.error.URLError("timed out")),
+    )
+
+    with pytest.raises(model_gateway.ModelGatewayTimeoutError):
+        model_gateway.http_post_json("https://x", {"a": 1}, "k")
+
+
+def test_http_post_json_maps_non_timeout_network_error(monkeypatch) -> None:
+    import urllib.error
+
+    monkeypatch.setattr(
+        model_gateway.urllib.request,
+        "urlopen",
+        _urlopen_raising(urllib.error.URLError("connection refused")),
+    )
+
+    with pytest.raises(model_gateway.ModelGatewayError) as excinfo:
+        model_gateway.http_post_json("https://x", {"a": 1}, "k")
+
+    assert not isinstance(excinfo.value, TimeoutError)
+    assert not isinstance(excinfo.value, model_gateway.ModelGatewayHTTPError)
+
+
+def test_http_post_json_maps_http_error_to_typed_error(monkeypatch) -> None:
+    import urllib.error
+
+    monkeypatch.setattr(
+        model_gateway.urllib.request,
+        "urlopen",
+        _urlopen_raising(urllib.error.HTTPError("https://x", 503, "unavailable", {}, None)),
+    )
+
+    with pytest.raises(model_gateway.ModelGatewayHTTPError) as excinfo:
+        model_gateway.http_post_json("https://x", {"a": 1}, "k")
+
+    assert "http 503" in str(excinfo.value)
+    assert not isinstance(excinfo.value, TimeoutError)
+
+
+def test_http_error_message_redacts_credentials(monkeypatch) -> None:
+    import io
+    import urllib.error
+
+    secret = "sk-super-secret-value"
+    body = json.dumps({"error": {"message": f"invalid key {secret}"}}).encode("utf-8")
+
+    def _boom(*_args, **_kwargs):
+        raise urllib.error.HTTPError("https://x", 401, "unauthorized", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(model_gateway.urllib.request, "urlopen", _boom)
+
+    with pytest.raises(model_gateway.ModelGatewayHTTPError) as excinfo:
+        model_gateway.http_post_json("https://x", {"a": 1}, secret)
+
+    message = str(excinfo.value)
+    assert secret not in message
+    assert "<redacted>" in message
+
+
+# ============ chat provider readiness ============
+
+
+def test_chat_requires_ready_provider(monkeypatch) -> None:
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("request must not be attempted")
+
+    monkeypatch.setattr(model_gateway, "http_post_json", _unexpected)
+
+    cases = [
+        model_gateway.build_providers(),  # 全部为空
+        model_gateway.build_providers(deepseek_base_url="https://ds.example/v1"),
+        model_gateway.build_providers(deepseek_api_key="k"),
+    ]
+
+    for providers in cases:
+        gateway = ModelGateway(
+            provider_source=lambda providers=providers: providers
+        )
+        with pytest.raises(model_gateway.ModelGatewayError) as excinfo:
+            gateway.chat([{"role": "user", "content": "hi"}])
+        assert "not ready" in str(excinfo.value)
+
+
