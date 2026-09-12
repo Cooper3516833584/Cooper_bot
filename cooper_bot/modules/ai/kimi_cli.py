@@ -666,11 +666,32 @@ class KimiCliRunner:
             assert process.stdout is not None and process.stderr is not None
             stdout_task = asyncio.create_task(self._read_stream(process.stdout, _MAX_STDOUT_BYTES))
             stderr_task = asyncio.create_task(self._read_stream(process.stderr, _MAX_STDERR_BYTES, keep_tail=True))
-            try:
-                await asyncio.wait_for(process.wait(), timeout=max(0.1, float(request.timeout_seconds)))
-            except TimeoutError as exc:
+            wait_task = asyncio.create_task(process.wait())
+            # Watch the process exit and both readers together: an early stdout
+            # overflow must terminate the child instead of letting it block on a
+            # full pipe until the whole request timeout expires.
+            done, _pending = await asyncio.wait(
+                (wait_task, stdout_task, stderr_task),
+                timeout=max(0.1, float(request.timeout_seconds)),
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            failure: Optional[BaseException] = None
+            for task in (stdout_task, stderr_task):
+                if task in done and not task.cancelled():
+                    error = task.exception()
+                    if error is not None:
+                        failure = error
+                        break
+            if failure is not None:
                 await self._stop_process(process)
-                raise KimiTimeoutError(request.request_id) from exc
+                await self._reap_readers(process, stdout_task, stderr_task)
+                if isinstance(failure, KimiProtocolError) and failure.detail == "stdout_limit":
+                    raise KimiProtocolError(request.request_id, "stdout_limit") from failure
+                raise failure
+            if stdout_task not in done or stderr_task not in done:
+                await self._stop_process(process)
+                await self._reap_readers(process, stdout_task, stderr_task)
+                raise KimiTimeoutError(request.request_id)
             stdout = await stdout_task
             await stderr_task
             if process.returncode != 0:
@@ -688,12 +709,12 @@ class KimiCliRunner:
                 await self._stop_process(process)
             raise
         finally:
-            if stdout_task is not None and not stdout_task.done():
-                stdout_task.cancel()
-            if stderr_task is not None and not stderr_task.done():
-                stderr_task.cancel()
-            if stdout_task is not None or stderr_task is not None:
-                await asyncio.gather(*(task for task in (stdout_task, stderr_task) if task is not None), return_exceptions=True)
+            for task in (stdout_task, stderr_task, wait_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            pending_tasks = tuple(task for task in (stdout_task, stderr_task, wait_task) if task is not None)
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
             if process is not None:
                 self._processes.discard(process)
             if global_acquired:

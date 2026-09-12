@@ -218,3 +218,41 @@ async def test_public_profile_still_runs_while_admin_is_globally_disabled(tmp_pa
     assert (await runner.run(_request())).text == "ok"
 
 
+@pytest.mark.asyncio
+async def test_stdout_overflow_terminates_child_fast_and_releases_its_slot(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli._MAX_STDOUT_BYTES", 64)
+    runner = _runner(
+        tmp_path,
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "if (Path(__file__).parent / 'mode.txt').exists():\n"
+        "    print(json.dumps({'type': 'assistant', 'content': 'ok'}))\n"
+        "else:\n"
+        "    chunk = b'x' * 65536\n"
+        "    while True:\n"
+        "        sys.stdout.buffer.write(chunk)\n"
+        "        sys.stdout.buffer.flush()\n",
+    )
+    tasks_before = asyncio.all_tasks()
+
+    started = time.monotonic()
+    with pytest.raises(KimiProtocolError) as exc_info:
+        await runner.run(_request(timeout_seconds=10.0))
+    elapsed = time.monotonic() - started
+
+    assert exc_info.value.detail == "stdout_limit"
+    assert exc_info.value.request_id == "req-1"
+    assert elapsed < 5.0, f"stdout overflow took {elapsed:.2f}s, the child was not terminated promptly"
+    assert runner._processes == set()
+
+    (tmp_path / "mode.txt").write_text("ok", encoding="utf-8")
+    follow_up = KimiRunRequest("hello", "public", 2.0, "req-2", "qq_chat")
+    assert (await runner.run(follow_up)).text == "ok"
+
+    await runner.aclose()
+    await asyncio.sleep(0)
+    current = asyncio.current_task()
+    pending = {task for task in asyncio.all_tasks() if task is not current and task not in tasks_before}
+    assert pending == set()
+
+
