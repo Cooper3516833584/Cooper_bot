@@ -605,3 +605,41 @@ def test_chat_requires_ready_provider(monkeypatch) -> None:
         assert "not ready" in str(excinfo.value)
 
 
+# ============ api_key.txt 固定行位 ============
+
+
+def test_load_providers_keeps_fixed_positions_with_blank_lines(tmp_path: Path, monkeypatch) -> None:
+    # 部署环境可能已提供 VISION_*，这里清空以验证 api_key.txt 的固定行位不被空行左移。
+    monkeypatch.setattr("cooper_bot.core.config.VISION_BASE_URL", "")
+    monkeypatch.setattr("cooper_bot.core.config.VISION_API_KEY", "")
+    path = _write_api_key(
+        tmp_path,
+        ["https://ds.example/v1", "ds-key", "", "", "https://vision.example/v1", "vision-key"],
+    )
+
+    providers = model_gateway.load_providers(path)
+
+    assert providers["deepseek"].base_url == "https://ds.example/v1"
+    assert providers["deepseek"].api_key == "ds-key"
+    assert providers["embedding"].base_url == ""
+    assert providers["embedding"].api_key == ""
+    assert providers["embedding"].ready is False
+    assert providers["vision"].base_url == "https://vision.example/v1"
+    assert providers["vision"].api_key == "vision-key"
+    assert providers["vision"].ready is True
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 5, 6, 7])
+def test_load_providers_tolerates_any_line_count(tmp_path: Path, monkeypatch, count: int) -> None:
+    monkeypatch.setattr("cooper_bot.core.config.VISION_BASE_URL", "")
+    monkeypatch.setattr("cooper_bot.core.config.VISION_API_KEY", "")
+    path = _write_api_key(tmp_path, [f"line-{i}.example" for i in range(count)])
+
+    providers = model_gateway.load_providers(path)
+
+    assert set(providers) == {"deepseek", "search", "embedding", "vision"}
+    if count >= 2:
+        assert providers["deepseek"].base_url == "line-0.example"
+        assert providers["deepseek"].api_key == "line-1.example"
+    else:
+        assert providers["deepseek"].ready is False

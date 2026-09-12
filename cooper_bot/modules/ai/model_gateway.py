@@ -88,14 +88,16 @@ class ProviderConfig:
 
 
 def read_api_key_lines(api_key_path: Optional[Path] = None, log=None) -> List[str]:
-    """读取 api_key.txt 的非空行；读取失败时记日志（若给了 log）并返回空列表。"""
+    """按行位置读取 api_key.txt；保留空行，避免后面的 provider 配置整体左移。
+
+    行序（与既有 6 行格式一致，不引入注释语法，每行都当作取值）：
+        1 = deepseek base url，2 = deepseek api key，
+        3 = embedding base url，4 = embedding api key，
+        5 = vision base url，6 = vision api key。
+    """
     path = Path(api_key_path) if api_key_path is not None else Path(core_config.AI_API_KEY_PATH)
     try:
-        return [
-            x.strip()
-            for x in path.read_text(encoding="utf-8").splitlines()
-            if x.strip()
-        ]
+        return [x.strip() for x in path.read_text(encoding="utf-8").splitlines()]
     except Exception as e:
         if log is not None and hasattr(log, "warning"):
             log.warning(f"AI 配置：读取 api_key.txt 失败: {e}")
@@ -155,21 +157,20 @@ def build_providers(
 def load_providers(api_key_path: Optional[Path] = None) -> Dict[str, ProviderConfig]:
     """按 api_key.txt 的行序解析全部 provider。
 
-    行序（只跳空行，注释行会被当作值，与既有实现一致）：
+    行序（保留空行，缺行按空字符串补齐；不引入注释语法，每行都当作取值）：
         1 = deepseek base url，2 = deepseek api key，
         3 = embedding base url，4 = embedding api key，
         5 = vision base url，6 = vision api key。
     """
-    lines = read_api_key_lines(api_key_path)
-    vision_file_base = lines[4] if len(lines) >= 5 else ""
-    vision_file_key = lines[5] if len(lines) >= 6 else ""
+    # 补足到 6 行，避免位置型配置因缺行或空行而越界/左移。
+    lines = read_api_key_lines(api_key_path) + [""] * 6
     return build_providers(
-        deepseek_base_url=lines[0] if len(lines) >= 1 else "",
-        deepseek_api_key=lines[1] if len(lines) >= 2 else "",
-        embedding_base_url=lines[2] if len(lines) >= 3 else "",
-        embedding_api_key=lines[3] if len(lines) >= 4 else "",
-        vision_base_url=str(core_config.VISION_BASE_URL or vision_file_base),
-        vision_api_key=str(core_config.VISION_API_KEY or vision_file_key),
+        deepseek_base_url=lines[0],
+        deepseek_api_key=lines[1],
+        embedding_base_url=lines[2],
+        embedding_api_key=lines[3],
+        vision_base_url=str(core_config.VISION_BASE_URL or lines[4]),
+        vision_api_key=str(core_config.VISION_API_KEY or lines[5]),
         vision_enabled=bool(core_config.VISION_ENABLED),
         chat_model=str(core_config.AI_CHAT_MODEL or ""),
         search_model=str(core_config.AI_WEB_SEARCH_MODEL or ""),

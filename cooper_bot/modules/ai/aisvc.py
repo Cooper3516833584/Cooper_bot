@@ -2728,9 +2728,12 @@ class AIService:
         )
 
     def _load_api_config(self) -> None:
-        lines = read_api_key_lines(self.api_key_path, self.log)
-        if len(lines) < 4:
-            self.log.warning("AI 配置：api_key.txt 至少需要 4 行（deepseek base/key + embedding base/key）")
+        """按行位置加载凭据（解析实现统一在 model_gateway，空行不再导致后面的配置左移）。"""
+        lines = read_api_key_lines(self.api_key_path, self.log) + [""] * 4
+        if not (lines[0] and lines[1] and lines[2] and lines[3]):
+            self.log.warning(
+                "AI 配置：api_key.txt 第 1-4 行需要依次为 deepseek base/key 与 embedding base/key"
+            )
             return
 
         self.deepseek_base_url = lines[0].rstrip("/")
