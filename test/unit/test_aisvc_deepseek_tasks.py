@@ -115,22 +115,20 @@ def test_load_api_config_uses_fixed_line_positions(tmp_path) -> None:
     assert svc.embedding_api_key == "embed-key"
 
 
-def test_load_api_config_keeps_embedding_empty_when_its_lines_blank(tmp_path) -> None:
-    """第 3、4 行为空时 embedding 保持为空，不会把第 5、6 行的 vision 当成 embedding。
+class _CollectingLog:
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+        self.infos: list[str] = []
 
-    与改动前一致：必填行未全部就绪时只告警、不写入任何凭据。
-    """
+    def info(self, msg: str) -> None:
+        self.infos.append(str(msg))
 
-    class _CollectingLog:
-        def __init__(self) -> None:
-            self.warnings: list[str] = []
+    def warning(self, msg: str) -> None:
+        self.warnings.append(str(msg))
 
-        def info(self, _msg: str) -> None:
-            return
 
-        def warning(self, msg: str) -> None:
-            self.warnings.append(str(msg))
-
+def test_load_api_config_keeps_embedding_independent_of_deepseek(tmp_path) -> None:
+    """embedding 第 3、4 行留空：DeepSeek 必须仍然可用，embedding 单独判为未就绪。"""
     path = tmp_path / "api_key.txt"
     path.write_text(
         "\n".join(["https://ds.example/v1", "ds-key", "", "", "https://vision.example/v1", "vision-key"]) + "\n",
@@ -142,24 +140,42 @@ def test_load_api_config_keeps_embedding_empty_when_its_lines_blank(tmp_path) ->
     svc.api_key_path = path
     svc._load_api_config()
 
-    assert svc.deepseek_base_url == ""
-    assert svc.deepseek_api_key == ""
+    assert svc.deepseek_base_url == "https://ds.example/v1"
+    assert svc.deepseek_api_key == "ds-key"
+    assert svc.deepseek_task_ready is True
+    assert svc.notice_ready is True
     assert svc.embedding_base_url == ""
     assert svc.embedding_api_key == ""
-    assert any("api_key.txt" in msg for msg in log.warnings)
+    assert svc.semantic_ready is False
+    assert svc.gateway.provider("embedding").ready is False
+    assert any("Embedding" in msg for msg in log.warnings)
 
 
-def test_load_api_config_warns_when_required_lines_missing(tmp_path) -> None:
-    class _CollectingLog:
-        def __init__(self) -> None:
-            self.warnings: list[str] = []
+def test_load_api_config_loads_embedding_without_deepseek(tmp_path) -> None:
+    """DeepSeek 第 1、2 行留空：Embedding 仍必须被正确解析。"""
+    path = tmp_path / "api_key.txt"
+    path.write_text(
+        "\n".join(["", "", "https://embed.example/v1", "embed-key", "", ""]) + "\n",
+        encoding="utf-8",
+    )
 
-        def info(self, _msg: str) -> None:
-            return
+    log = _CollectingLog()
+    svc = AIService(log=log)
+    svc.api_key_path = path
+    svc._load_api_config()
 
-        def warning(self, msg: str) -> None:
-            self.warnings.append(str(msg))
+    assert svc.deepseek_base_url == ""
+    assert svc.deepseek_api_key == ""
+    assert svc.deepseek_task_ready is False
+    assert svc.notice_ready is False
+    assert svc.embedding_base_url == "https://embed.example/v1"
+    assert svc.embedding_api_key == "embed-key"
+    assert svc.gateway.provider("embedding").ready is True
+    assert any("DeepSeek" in msg for msg in log.warnings)
 
+
+def test_load_api_config_tolerates_missing_required_lines(tmp_path) -> None:
+    """不足 4 行不抛异常，只报告哪一方未就绪。"""
     path = tmp_path / "api_key.txt"
     path.write_text("https://ds.example/v1\nds-key\n", encoding="utf-8")
 
@@ -168,8 +184,26 @@ def test_load_api_config_warns_when_required_lines_missing(tmp_path) -> None:
     svc.api_key_path = path
     svc._load_api_config()
 
-    assert any("api_key.txt" in msg for msg in log.warnings)
+    assert svc.deepseek_base_url == "https://ds.example/v1"
+    assert svc.deepseek_api_key == "ds-key"
+    assert svc.embedding_base_url == ""
+    assert any("Embedding" in msg for msg in log.warnings)
+
+
+def test_load_api_config_reports_both_providers_when_empty(tmp_path) -> None:
+    path = tmp_path / "api_key.txt"
+    path.write_text("", encoding="utf-8")
+
+    log = _CollectingLog()
+    svc = AIService(log=log)
+    svc.api_key_path = path
+    svc._load_api_config()
+
     assert svc.deepseek_base_url == ""
+    assert svc.embedding_base_url == ""
+    assert svc.deepseek_task_ready is False
+    assert svc.notice_ready is False
+    assert len([msg for msg in log.warnings if "api_key.txt" in msg]) == 2
 
 
 # ============ 联网搜索 compose prompt ============

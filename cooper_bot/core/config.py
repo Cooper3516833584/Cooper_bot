@@ -351,14 +351,16 @@ AI_SYSTEM_PROMPT = """# 核心角色与身份设定
 # 视觉 API 配置优先从环境变量 / secrets.env 读取；
 # 未配置时兜底读取 api_key.txt 第 5、6 行（视觉 base url + key）。
 def _read_vision_config_from_api_key_txt() -> "tuple[str, str]":
+    # api_key.txt 是位置型配置：空行表示该行留空，必须保留行位，
+    # 否则未配置 Embedding 时第 5、6 行的 Vision 配置会左移到第 3、4 行。
     try:
         lines = [
             x.strip()
             for x in AI_API_KEY_PATH.read_text(encoding="utf-8").splitlines()
-            if x.strip()
         ]
-        if len(lines) >= 6:
-            return lines[4].rstrip("/"), lines[5]
+        if len(lines) < 6:
+            lines += [""] * (6 - len(lines))
+        return lines[4].rstrip("/"), lines[5]
     except Exception:
         pass
     return "", ""

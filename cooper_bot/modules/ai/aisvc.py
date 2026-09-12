@@ -2728,19 +2728,25 @@ class AIService:
         )
 
     def _load_api_config(self) -> None:
-        """按行位置加载凭据（解析实现统一在 model_gateway，空行不再导致后面的配置左移）。"""
+        """按行位置加载凭据（解析实现统一在 model_gateway，空行不再导致后面的配置左移）。
+
+        DeepSeek 与 Embedding 各自独立判断就绪：一方缺失不影响另一方可用。
+        """
         lines = read_api_key_lines(self.api_key_path, self.log) + [""] * 4
-        if not (lines[0] and lines[1] and lines[2] and lines[3]):
-            self.log.warning(
-                "AI 配置：api_key.txt 第 1-4 行需要依次为 deepseek base/key 与 embedding base/key"
-            )
-            return
 
         self.deepseek_base_url = lines[0].rstrip("/")
         self.deepseek_api_key = lines[1]
         self.embedding_base_url = lines[2].rstrip("/")
         self.embedding_api_key = lines[3]
-        self.log.info("AI 配置：已加载 DeepSeek 与 Embedding API")
+
+        deepseek_ready = bool(self.deepseek_base_url and self.deepseek_api_key)
+        embedding_ready = bool(self.embedding_base_url and self.embedding_api_key)
+        if not deepseek_ready:
+            self.log.warning("AI 配置：api_key.txt 第 1、2 行缺少 DeepSeek base/key，DeepSeek 相关功能不可用")
+        if not embedding_ready:
+            self.log.warning("AI 配置：api_key.txt 第 3、4 行缺少 Embedding base/key，语义检索与资料索引不可用")
+        if deepseek_ready and embedding_ready:
+            self.log.info("AI 配置：已加载 DeepSeek 与 Embedding API")
 
     def _provider_configs(self) -> Dict[str, ProviderConfig]:
         """把当前模型名与凭据组装成 provider 表，供 gateway 在每次调用时读取。
