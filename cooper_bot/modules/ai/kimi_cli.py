@@ -340,6 +340,24 @@ def validate_kimi_settings(
     )
 
 
+async def _stop_process(process: asyncio.subprocess.Process) -> None:
+    """Best-effort child teardown: terminate, then kill after a short grace period."""
+    if process.returncode is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2.0)
+    except TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        await process.wait()
+
+
 async def detect_kimi_runtime_info(
     cli_path: str,
     *,
@@ -351,6 +369,7 @@ async def detect_kimi_runtime_info(
     executable = executable_resolver(str(cli_path or "")) if cli_path else None
     if not executable:
         return KimiRuntimeInfo("", "unknown")
+    process: Optional[asyncio.subprocess.Process] = None
     try:
         process = await asyncio.create_subprocess_exec(
             str(executable),
@@ -365,6 +384,10 @@ async def detect_kimi_runtime_info(
             return KimiRuntimeInfo(str(executable), stdout[:1024].decode("utf-8", errors="replace").strip() or "unknown")
     except Exception:
         pass
+    finally:
+        # 超时后 wait_for 会取消 communicate()，子进程可能仍然存活，必须显式回收。
+        if process is not None:
+            await _stop_process(process)
     return KimiRuntimeInfo(str(executable), "unknown")
 
 
@@ -604,20 +627,8 @@ class KimiCliRunner:
         return final_text, tuple(dict.fromkeys(tools)), tool_seen, protocol_seen
 
     async def _stop_process(self, process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
-            return
-        try:
-            process.terminate()
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=2.0)
-        except TimeoutError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                return
-            await process.wait()
+        # 实现统一在模块级函数，version probe 与正式运行共用同一套回收逻辑。
+        await _stop_process(process)
 
     @staticmethod
     async def _drain_stream(stream: asyncio.StreamReader) -> None:

@@ -316,3 +316,62 @@ async def test_runtime_version_probe_keeps_env_optional_and_degrades_to_unknown(
     assert info.version == "unknown"
 
 
+
+
+class _HangingVersionProcess:
+    """communicate() 不会自行结束，用于验证探测超时后子进程被回收。"""
+
+    def __init__(self) -> None:
+        self.returncode = None
+        self.terminated = False
+        self.killed = False
+        self.wait_calls = 0
+        self._released = asyncio.Event()
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await self._released.wait()
+        return b"", b""
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+        self._released.set()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self._released.set()
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        await self._released.wait()
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_runtime_version_probe_reaps_the_child_after_timeout(monkeypatch) -> None:
+    process = _HangingVersionProcess()
+
+    async def fake_spawn(*_argv: object, **_kwargs: object) -> _HangingVersionProcess:
+        return process
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_spawn)
+    tasks_before = set(asyncio.all_tasks()) - {asyncio.current_task()}
+
+    info = await detect_kimi_runtime_info(
+        "kimi",
+        executable_resolver=lambda _path: sys.executable,
+        timeout_seconds=0.05,
+    )
+
+    # 版本探测失败只降级为 unknown，但子进程必须被结束并回收。
+    assert info.version == "unknown"
+    assert process.terminated is True
+    assert process.returncode is not None
+    assert process.wait_calls >= 1
+
+    await asyncio.sleep(0)
+    pending = {
+        task for task in asyncio.all_tasks() if task is not asyncio.current_task() and task not in tasks_before
+    }
+    assert pending == set()

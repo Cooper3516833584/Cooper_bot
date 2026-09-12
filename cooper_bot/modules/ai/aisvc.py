@@ -26,6 +26,7 @@ from cooper_bot.modules.ai.kimi_cli import (
     KimiCliRunner,
     KimiRunRequest,
     KimiSecurityViolation,
+    build_kimi_env,
     detect_kimi_runtime_info,
     load_kimi_settings,
     validate_kimi_settings,
@@ -306,7 +307,11 @@ class AIService:
 
     async def _kimi_capability_fingerprint(self) -> tuple[dict, bool]:
         settings = self._kimi_runner.settings
-        runtime = await detect_kimi_runtime_info(settings.cli_path)
+        # 与正式运行保持一致：版本探测同样使用最小环境，不继承 bot 的敏感变量。
+        runtime = await detect_kimi_runtime_info(
+            settings.cli_path,
+            env=build_kimi_env(settings.public, os.environ),
+        )
         self._kimi_runtime_version = runtime.version
         return (
             {
