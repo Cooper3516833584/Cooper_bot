@@ -19,6 +19,7 @@ from __future__ import annotations
 import hmac
 import json
 import threading
+import time
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +39,8 @@ _anthropic_messages_url = model_gateway.anthropic_messages_url
 _MAX_CONCURRENCY = 4
 _MAX_BODY_BYTES = 64 * 1024
 _ALLOWED_PATHS = ("/search", "/search/")
+# 排队最多占用总预算中的这一部分，其余留给上游检索，避免"排队 timeout + 上游 timeout"叠加。
+_QUEUE_WAIT_SECONDS = 5.0
 
 
 class KimiSearchBridge:
@@ -64,6 +67,8 @@ class KimiSearchBridge:
         self.api_key_path = Path(api_key_path if api_key_path is not None else config.AI_API_KEY_PATH)
         # 联网抓取统一走 gateway：它按 api_key_path 解析 deepseek 凭据与检索模型。
         self.gateway = ModelGateway(log, api_key_path=self.api_key_path)
+        # 注入的测试 caller 保持单参数签名；默认 caller 走 gateway 以接收剩余预算。
+        self._injected_deepseek_caller = deepseek_caller
         self._deepseek_caller = deepseek_caller or self._call_deepseek_search
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -137,9 +142,18 @@ class KimiSearchBridge:
 
     # ---------- DeepSeek 联网搜索 ----------
 
-    def _call_deepseek_search(self, query: str) -> list:
+    def _call_deepseek_search(self, query: str, *, timeout: Optional[float] = None) -> list:
         """把查询交给 gateway；检索模型、端点与请求体由 gateway 的 search provider 决定。"""
-        return self.gateway.search_web(query, timeout=self.timeout_seconds)
+        return self.gateway.search_web(
+            query,
+            timeout=self.timeout_seconds if timeout is None else float(timeout),
+        )
+
+    def _call_caller(self, query: str, timeout: float) -> list:
+        """默认 caller 获得剩余预算；注入的单参数 caller 继续按原签名调用。"""
+        if self._injected_deepseek_caller is not None:
+            return self._injected_deepseek_caller(query)
+        return self._call_deepseek_search(query, timeout=timeout)
 
     @staticmethod
     def map_search_payload(payload: dict, query: str) -> list:
@@ -173,12 +187,19 @@ class KimiSearchBridge:
         if not query:
             _send_json(handler, 400, {"error": "empty_query"})
             return
-        if not self._slots.acquire(timeout=self.timeout_seconds):
+        # 排队与上游检索共享同一个总预算，最坏耗时不超过 timeout_seconds。
+        deadline = time.monotonic() + self.timeout_seconds
+        if not self._slots.acquire(timeout=min(_QUEUE_WAIT_SECONDS, self.timeout_seconds)):
             self.log.warning("Kimi 搜索桥：并发检索已满，本次请求被拒绝")
             _send_json(handler, 503, {"error": "busy"})
             return
         try:
-            results = self._deepseek_caller(query)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.log.warning("Kimi 搜索桥：排队已耗尽本次请求的时间预算")
+                _send_json(handler, 504, {"error": "upstream_timeout"})
+                return
+            results = self._call_caller(query, remaining)
         except TimeoutError:
             self.log.warning("Kimi 搜索桥：上游检索超时")
             _send_json(handler, 504, {"error": "upstream_timeout"})
