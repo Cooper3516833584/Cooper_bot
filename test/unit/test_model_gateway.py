@@ -22,6 +22,8 @@ def test_load_providers_reads_six_lines_in_order(tmp_path: Path, monkeypatch) ->
     # 部署环境的 secrets.env 可能已提供 VISION_*，这里清空以验证文件行序回退。
     monkeypatch.setattr("cooper_bot.core.config.VISION_BASE_URL", "")
     monkeypatch.setattr("cooper_bot.core.config.VISION_API_KEY", "")
+    # 与部署环境解耦：没有凭据的环境里 VISION_ENABLED 默认 False，会掩盖行位断言。
+    monkeypatch.setattr("cooper_bot.core.config.VISION_ENABLED", True)
     path = _write_api_key(
         tmp_path,
         [
@@ -53,6 +55,8 @@ def test_load_providers_reads_six_lines_in_order(tmp_path: Path, monkeypatch) ->
 def test_load_providers_with_four_lines_leaves_vision_unconfigured(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("cooper_bot.core.config.VISION_BASE_URL", "")
     monkeypatch.setattr("cooper_bot.core.config.VISION_API_KEY", "")
+    # 与部署环境解耦：没有凭据的环境里 VISION_ENABLED 默认 False，会掩盖行位断言。
+    monkeypatch.setattr("cooper_bot.core.config.VISION_ENABLED", True)
     path = _write_api_key(tmp_path, ["https://ds.example", "k", "https://embed.example", "e"])
 
     providers = model_gateway.load_providers(path)
@@ -612,6 +616,8 @@ def test_load_providers_keeps_fixed_positions_with_blank_lines(tmp_path: Path, m
     # 部署环境可能已提供 VISION_*，这里清空以验证 api_key.txt 的固定行位不被空行左移。
     monkeypatch.setattr("cooper_bot.core.config.VISION_BASE_URL", "")
     monkeypatch.setattr("cooper_bot.core.config.VISION_API_KEY", "")
+    # 与部署环境解耦：没有凭据的环境里 VISION_ENABLED 默认 False，会掩盖行位断言。
+    monkeypatch.setattr("cooper_bot.core.config.VISION_ENABLED", True)
     path = _write_api_key(
         tmp_path,
         ["https://ds.example/v1", "ds-key", "", "", "https://vision.example/v1", "vision-key"],
@@ -633,6 +639,8 @@ def test_load_providers_keeps_fixed_positions_with_blank_lines(tmp_path: Path, m
 def test_load_providers_tolerates_any_line_count(tmp_path: Path, monkeypatch, count: int) -> None:
     monkeypatch.setattr("cooper_bot.core.config.VISION_BASE_URL", "")
     monkeypatch.setattr("cooper_bot.core.config.VISION_API_KEY", "")
+    # 与部署环境解耦：没有凭据的环境里 VISION_ENABLED 默认 False，会掩盖行位断言。
+    monkeypatch.setattr("cooper_bot.core.config.VISION_ENABLED", True)
     path = _write_api_key(tmp_path, [f"line-{i}.example" for i in range(count)])
 
     providers = model_gateway.load_providers(path)
