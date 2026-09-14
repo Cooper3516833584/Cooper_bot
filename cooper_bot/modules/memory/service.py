@@ -406,8 +406,6 @@ class MemoryService:
         rows=await self.store.facts_missing_embeddings(scope_id, fingerprint, batch, after)
         if not rows:return
         for row in rows:
-            if not await self.store.reserve_daily_usage("memory_embed",config.AI_MEMORY_EMBEDDING_DAILY_BUDGET):
-                return
             vector=await self._embed(str(row["text"] or ""))
             if vector is None:continue
             await self.store.put_embedding(scope_id,str(row["fact_id"]),fingerprint,int(row["revision"]),vectors.encode(vector),len(vector))

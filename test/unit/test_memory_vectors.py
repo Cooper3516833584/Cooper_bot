@@ -178,15 +178,20 @@ async def test_disabled_switch_never_calls_provider_and_keeps_lexical_order(tmp_
 
 
 @pytest.mark.asyncio
-async def test_daily_budget_exhaustion_skips_provider(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_EMBEDDING_DAILY_BUDGET", 0)
+async def test_embedding_has_no_daily_cap_and_drains_the_backlog(tmp_path) -> None:
+    """向量化不再有日预算上限：超过一个批次的回填也会全部跑完。"""
     gateway = _EmbedGateway()
-    service, identity, scope_id = await _seed(tmp_path, gateway, ["数学作业需要周三交"])
-    await _wait_for_idle(service)
+    texts = [f"作业{index}需要提交" for index in range(40)]
+    service, _identity_value, scope_id = await _seed(tmp_path, gateway, texts)
+    await _wait_for_embeddings(service, scope_id, 40)
 
-    assert gateway.calls == []
-    assert await _embeddings_count(service, scope_id) == 0
-    assert [row["text"] for row in await service.search_facts(identity, "作业")] == ["数学作业需要周三交"]
+    assert len(gateway.calls) == 40
+    assert await _embeddings_count(service, scope_id) == 40
+
+    def _usage() -> int:
+        return int(service.store._c().execute("SELECT COUNT(*) FROM memory_usage_daily WHERE kind='memory_embed'").fetchone()[0])
+
+    assert await service.store._call(_usage) == 0
     await service.aclose()
 
 

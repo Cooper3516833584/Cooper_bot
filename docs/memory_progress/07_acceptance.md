@@ -10,13 +10,13 @@
   - `AI_MEMORY_ENABLED=true`、`AI_MEMORY_EMBEDDING_ENABLED=true` —— **2026-09-14 按产品决定改为默认开启，覆盖修复包 D15「master switch 应默认关闭」的口径**；关闭时不创建也不打开数据库。
   - `AI_MEMORY_SUMMARY_ENABLED=false`、`AI_MEMORY_AUTO_EXTRACT_ENABLED=false` —— 这两条链路会把群聊原文送给模型网关，且从未接过真实 provider，保持关闭。
   - `AI_MEMORY_GROUP_ALLOWLIST` 默认空（群记忆必须显式配置）；`AI_MEMORY_MAX_EVENTS_PER_SCOPE=3000`、`AI_MEMORY_RECENT_EVENTS=40`、`AI_MEMORY_TOP_K=6`、`AI_MEMORY_CONTEXT_CHAR_BUDGET=10000`。
-  - 向量：`AI_MEMORY_EMBEDDING_MIN_SIMILARITY=0.35`、`AI_MEMORY_EMBEDDING_BATCH_SIZE=16`、`AI_MEMORY_EMBEDDING_DAILY_BUDGET=500`、`AI_MEMORY_EMBEDDING_TIMEOUT_SECONDS=30`。
+  - 向量：`AI_MEMORY_EMBEDDING_MIN_SIMILARITY=0.35`、`AI_MEMORY_EMBEDDING_BATCH_SIZE=16`、`AI_MEMORY_EMBEDDING_TIMEOUT_SECONDS=30`。**embedding 没有日预算上限**（2026-09-14 按产品决定移除 `AI_MEMORY_EMBEDDING_DAILY_BUDGET`）。
 - 执行前仓库已有未跟踪 `runtime/`，未覆盖或清理。测试临时目录 `.pytest_tmp` 曾 ACL 异常（`Get-Acl`/`ls` 均被拒绝），已重命名为 `.pytest_tmp_broken_20260914` 让 pytest 重建；未删除任何用户数据。
 
 ## 本阶段新增
 
 - `test/unit/test_memory_deletion.py`（4 例）：forget 清理派生行并写 forget marker 水位；forget 后显式重述仍可见；`clear_subject` 清空并让在途 turn 变为 stale；`/memory group clear` 轮换 conversation 并清空该 scope 的 events/facts/summaries/embeddings/jobs/markers。
-- `test/unit/test_memory_vectors.py`（16 例，全 fake provider、零网络）：写入即向量化、无词法重叠也能靠向量召回、开关关闭/未配置/调用失败/日预算用尽时逐条等价于纯词法、模型换代后重新回填并丢弃旧 fingerprint、superseded 事实的向量被清理、维度不一致被忽略、查询向量 60s 缓存、融合排序改变 prompt 中 facts 顺序、慢 provider 不阻塞记忆 DB。
+- `test/unit/test_memory_vectors.py`（16 例，全 fake provider、零网络）：写入即向量化、无词法重叠也能靠向量召回、开关关闭/未配置/调用失败时逐条等价于纯词法、超过一个批次的回填会全部跑完（无日预算上限）、模型换代后重新回填并丢弃旧 fingerprint、superseded 事实的向量被清理、维度不一致被忽略、查询向量 60s 缓存、融合排序改变 prompt 中 facts 顺序、慢 provider 不阻塞记忆 DB。
 - `tools/diagnostics/memory_perf_probe.py`：08 第 7 节的本地性能探针（虚构数据、临时库、结束即清理），并新增向量打分与融合排序的纯本地 CPU 开销测量。
 - `tools/diagnostics/probe_memory_embedding.py`：真实 embedding provider 探针（只发两段固定测试文本，不含任何聊天/记忆内容）。**未运行**（需联网授权）。
 
@@ -77,7 +77,7 @@ NOT-RUN。全部验证在本地 fake 组件上完成，未连接真实 QQ、Kimi
 
 - **默认开启但真实环境未验证**：`AI_MEMORY_ENABLED` / `AI_MEMORY_EMBEDDING_ENABLED` 已默认开启（产品决定），而真实 QQ/Kimi/DeepSeek、真实 embedding provider、真实灰度都没有跑过。也就是说"默认开"与"未经真实环境验证"同时成立，扩大范围前需要先跑 `probe_memory_embedding.py` 与一次单私聊灰度。
 - embedding provider 是否支持 `/embeddings`、维度多少、限流如何，均未实测；未配置时整条向量路径静默退化为词法。
-- 换 `AI_EMBED_MODEL` 会让所有旧向量按 fingerprint 失效并重新回填，回填按 `AI_MEMORY_EMBEDDING_BATCH_SIZE` 分批、受日预算限制；预算用尽当天剩余事实等下一次写入或重启继续。
+- 换 `AI_EMBED_MODEL` 会让所有旧向量按 fingerprint 失效并重新回填；回填按 `AI_MEMORY_EMBEDDING_BATCH_SIZE` 分批但**不设日预算上限**，会一直调用 provider 直到没有缺失事实——大批量换模型时对 provider 的请求量没有闸门，只受批间顺序执行（单 worker，一次一条）限制。
 - 单线程 DB executor 下 500 并发过载排队 p95 ≈ 20 s；正常顺序聊天路径 p95 ≈ 51 ms。向量打分额外约 7 ms/次（500 条候选）。
 - `snapshot_rows` 在单 conversation 达到 retention 上限时 p95 ≈ 46 ms（本报告样本即最坏情况）。
 - summary / auto_extract 默认关闭：代码路径已被测试覆盖，但默认配置下不会真正产生模型请求，也未在真实 provider 下端到端验证。
