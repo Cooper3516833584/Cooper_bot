@@ -40,6 +40,7 @@ from cooper_bot.modules.ai.model_gateway import (
     read_api_key_lines,
     search_results_to_text,
 )
+from cooper_bot.modules.memory.service import MemoryService
 
 from cooper_bot.core import config as core_config
 
@@ -197,6 +198,9 @@ class AIService:
             api_key_path=self.api_key_path,
             provider_source=self._provider_configs,
         )
+        # Constructing the service is inert while the master switch is off;
+        # opening SQLite is delayed until a permitted memory operation.
+        self.memory = MemoryService(log)
 
         self._lock = threading.RLock()
         self._chat_sessions_lock = threading.RLock()
@@ -296,6 +300,7 @@ class AIService:
         await asyncio.to_thread(self._bootstrap_quick_sync_sync)
 
     async def aclose(self) -> None:
+        await self.memory.aclose()
         await self._kimi_runner.aclose()
 
     @staticmethod
@@ -528,16 +533,16 @@ class AIService:
             raise RuntimeError("invalid admin chat context")
         return f"admin:{actor}:{key}"
 
-    def _build_kimi_prompt(self, base_key: str, history: List[Dict[str, str]], current: str, *, purpose: str) -> str:
-        return json.dumps(
-            {
+    def _build_kimi_prompt(self, base_key: str, history: List[Dict[str, str]], current: str, *, purpose: str, memory_context: Optional[dict] = None) -> str:
+        payload = {
                 "purpose": purpose,
                 "system_instructions": self._select_chat_system_prompt(base_key) or self.system_prompt,
                 "conversation_history": self._materialize_history_for_model(history),
                 "latest_user_request": current,
-            },
-            ensure_ascii=False,
-        )
+            }
+        if memory_context:
+            payload["memory_context"] = memory_context
+        return json.dumps(payload, ensure_ascii=False)
 
     async def kimi_chat_with_context(
         self,
@@ -548,6 +553,7 @@ class AIService:
         vision_slots: Optional[list] = None,
         allow_computer: bool = False,
         actor_user_id: Optional[int] = None,
+        memory_turn=None,
     ) -> str:
         if allow_computer:
             if not self.computer_ready:
@@ -559,9 +565,18 @@ class AIService:
         slots = self._normalize_vision_slots(vision_slots)
         content = str(user_input or "").strip()
         current = self._render_chat_message_content({"role": "user", "content": content, "_vision": slots} if slots else {"role": "user", "content": content})
-        history = self._select_history_for_backend(self._load_active_chat_history(storage_key), "kimi") if storage_key else []
+        if memory_turn is not None:
+            history = [
+                {"role": row["role"], "content": row["own_text"]}
+                for row in memory_turn.snapshot.recent_events
+                if row.get("own_text") and row.get("role") in {"user", "assistant"}
+            ]
+            memory_context = await self.memory.prompt_context(memory_turn.identity, content)
+        else:
+            history = self._select_history_for_backend(self._load_active_chat_history(storage_key), "kimi") if storage_key else []
+            memory_context = None
         request = KimiRunRequest(
-            prompt=self._build_kimi_prompt(base_key, history, current, purpose="qq_chat"),
+            prompt=self._build_kimi_prompt(base_key, history, current, purpose="qq_chat", memory_context=memory_context),
             profile="admin" if allow_computer else "public",
             timeout_seconds=self._kimi_runner.settings.admin_timeout_seconds if allow_computer else self._kimi_runner.settings.timeout_seconds,
             request_id=str(msg_id or f"kimi-{time.time_ns()}"),
@@ -578,7 +593,7 @@ class AIService:
         text = str(result.text or "").strip()
         if not text:
             raise RuntimeError("empty kimi response")
-        if storage_key:
+        if storage_key and memory_turn is None:
             self._save_chat_turn(storage_key, content, text, msg_id=msg_id, vision_slots=slots)
         return text
 
@@ -645,6 +660,7 @@ class AIService:
         vision_slots: Optional[list] = None,
         allow_computer: bool = False,
         actor_user_id: Optional[int] = None,
+        memory_turn=None,
     ) -> str:
         return await self.kimi_chat_with_context(
             session_key,
@@ -653,6 +669,7 @@ class AIService:
             vision_slots=vision_slots,
             allow_computer=allow_computer,
             actor_user_id=actor_user_id,
+            memory_turn=memory_turn,
         )
 
     def remember_user_message(

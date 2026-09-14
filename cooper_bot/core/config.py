@@ -250,6 +250,26 @@ HANDIN_INBOX_KEEP_DAYS = 30
 AI_API_KEY_PATH = PRIVATE_CONFIG_DIR / "api_key.txt"
 AI_MATERIAL_DIR = DATA_DIR / "public" / "textbook_and_material"
 AI_SEMANTIC_STORE_PATH = DATABASES_DIR / "ai" / "semantic_store.sqlite3"
+# Chat memory is deliberately separate from the searchable material index.
+# Keep these values close to the other AI storage settings so deployments have
+# one conventional environment-variable parser and no second secrets file.
+AI_MEMORY_ENABLED = _get_env_bool("AI_MEMORY_ENABLED", False)
+AI_MEMORY_DB_PATH = _get_env_path("AI_MEMORY_DB_PATH", DATABASES_DIR / "ai" / "chat_memory.sqlite3")
+AI_MEMORY_BOT_ID = _get_env_int("AI_MEMORY_BOT_ID", 0, 0, 9_999_999_999)
+AI_MEMORY_GROUP_ALLOWLIST = _parse_int_set(_get_env("AI_MEMORY_GROUP_ALLOWLIST", ""))
+AI_MEMORY_RAW_RETENTION_DAYS = _get_env_int("AI_MEMORY_RAW_RETENTION_DAYS", 30, 1, 3650)
+AI_MEMORY_MAX_EVENTS_PER_SCOPE = _get_env_int("AI_MEMORY_MAX_EVENTS_PER_SCOPE", 3000, 100, 100000)
+AI_MEMORY_MAX_FACT_CHARS = _get_env_int("AI_MEMORY_MAX_FACT_CHARS", 500, 1, 4000)
+AI_MEMORY_MAX_STORED_EVENT_CHARS = _get_env_int("AI_MEMORY_MAX_STORED_EVENT_CHARS", 6000, 100, 20000)
+AI_MEMORY_RECENT_EVENTS = _get_env_int("AI_MEMORY_RECENT_EVENTS", 40, 1, 300)
+AI_MEMORY_CONTEXT_CHAR_BUDGET = _get_env_int("AI_MEMORY_CONTEXT_CHAR_BUDGET", 10000, 500, 30000)
+AI_MEMORY_TOP_K = _get_env_int("AI_MEMORY_TOP_K", 6, 1, 20)
+AI_MEMORY_SCOPE_MAX_WAITERS = _get_env_int("AI_MEMORY_SCOPE_MAX_WAITERS", 4, 0, 32)
+AI_MEMORY_GLOBAL_MAX_WAITERS = _get_env_int("AI_MEMORY_GLOBAL_MAX_WAITERS", 32, 1, 256)
+AI_MEMORY_DB_BUSY_TIMEOUT_MS = _get_env_int("AI_MEMORY_DB_BUSY_TIMEOUT_MS", 2000, 1, 30000)
+AI_MEMORY_SUMMARY_ENABLED = _get_env_bool("AI_MEMORY_SUMMARY_ENABLED", False)
+AI_MEMORY_AUTO_EXTRACT_ENABLED = _get_env_bool("AI_MEMORY_AUTO_EXTRACT_ENABLED", False)
+AI_MEMORY_EMBEDDING_ENABLED = _get_env_bool("AI_MEMORY_EMBEDDING_ENABLED", False)
 AI_LEGACY_DIR = DATABASES_DIR / "ai" / "legacy"
 AI_INDEX_PATH = AI_LEGACY_DIR / "all_files_index.json"
 AI_METADATA_PATH = AI_LEGACY_DIR / "file_metadata.json"

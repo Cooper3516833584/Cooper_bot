@@ -31,6 +31,8 @@ from cooper_bot.core.router import get_files
 from cooper_bot.core.ziputil import open_fast_zip, write_path as zip_write_path
 from cooper_bot.modules.calendar.daily_calendar import parse_calendar_date
 from cooper_bot.modules.vision.vision_skill import VisionSlot
+from cooper_bot.modules.memory.models import CapturedInput, MemoryIdentity
+from cooper_bot.commands.memory_commands import handle_memory_command
 from cooper_bot.core.config import (
     ADMIN_USERS,
     DATA_DIR,
@@ -55,6 +57,7 @@ from cooper_bot.core.config import (
     AUTO_REPLY_IMAGES_DIR,
     AUTO_REPLY_IMAGES_CONTAINER_DIR,
     TEMP_DIR,
+    AI_MEMORY_BOT_ID,
 )
 if TYPE_CHECKING:
     from cooper_bot.modules.ai.aisvc import AIService
@@ -118,6 +121,7 @@ _EXPLICIT_COMMAND_NAMES = {
     "help",
     "level",
     "ls",
+    "memory",
     "ping",
     "signin",
     "whoami",
@@ -2158,6 +2162,27 @@ def _ai_chat_allows_kimi_computer(ctx, perm=None) -> bool:
     return scene != "group" or bool(AI_KIMI_ALLOW_GROUP_COMPUTER)
 
 
+def _memory_identity(ctx, evt: dict, *, allow_computer: bool, perm=None) -> Optional[MemoryIdentity]:
+    """Build memory ownership only from trusted routing and OneBot fields."""
+    try:
+        actor = int(getattr(ctx, "user_id", 0) or 0)
+        group_id = getattr(ctx, "group_id", None)
+        group_id = int(group_id) if group_id is not None else None
+        bot_id = int((evt or {}).get("self_id") or AI_MEMORY_BOT_ID or 0)
+    except (TypeError, ValueError):
+        return None
+    scene = "group" if str(getattr(ctx, "scene", "")) == "group" else "private"
+    if actor <= 0 or bot_id <= 0 or (scene == "group" and not group_id):
+        return None
+    personal_admin = actor in ADMIN_USERS
+    if not personal_admin and perm is not None:
+        try:
+            personal_admin = int(perm.get_level(actor)) >= 3
+        except Exception:
+            pass
+    return MemoryIdentity(bot_id, actor, scene, group_id, "admin" if allow_computer else "public", personal_admin)
+
+
 def _ai_chat_session_key(ctx) -> Optional[str]:
     scene = str(getattr(ctx, "scene", "") or "")
     if scene == "group":
@@ -4044,7 +4069,45 @@ async def _handle_ai_chat_trigger(
         if not callable(chat_fn):
             await reply(api, ctx, "AI 聊天暂时不可用（Kimi 配置未就绪）。", logsvc)
             return True
+        memory_turn = None
+        memory_service = getattr(aisvc, "memory", None)
+        identity = _memory_identity(ctx, evt, allow_computer=allow_computer, perm=perm)
+        if memory_service is not None and identity is not None:
+            try:
+                memory_turn = await memory_service.turn(
+                    identity,
+                    CapturedInput(
+                        source_event_id=str(message_id or f"event:{time.time_ns()}"),
+                        own_text=clean_trigger_text,
+                        created_at_utc=time.time(),
+                        source_kind="request_metadata" if allow_computer else "direct_chat",
+                    ),
+                )
+            except Exception as e:
+                logsvc.log.warning(f"memory turn setup failed: {type(e).__name__}")
+                memory_turn = None
         try:
+            if memory_turn is not None:
+                async with memory_turn:
+                    if memory_turn.is_duplicate:
+                        return True
+                    context_kwargs = {"msg_id": message_id, "vision_slots": current_slots, "memory_turn": memory_turn}
+                    if allow_computer:
+                        context_kwargs.update(allow_computer=True, actor_user_id=ctx.user_id)
+                    out = (await chat_with_context_fn(session_key, ai_input, **context_kwargs)).strip()
+                    if not out:
+                        out = "我这边没收到有效回复，稍后再试一次。"
+                    await memory_turn.record_generated(out)
+                    if not await memory_turn.ensure_current():
+                        await memory_turn.abort("scope_changed")
+                        return True
+                    try:
+                        setattr(ctx, "_skip_reply_context_once", True)
+                    except Exception:
+                        pass
+                    sent = await reply(api, ctx, out, logsvc, force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None)
+                    await memory_turn.finish_delivery(bool(sent))
+                    return True
             if session_key and callable(chat_with_context_fn):
                 context_kwargs = {
                     "msg_id": message_id,
@@ -5019,6 +5082,16 @@ async def dispatch(
 
     t = raw_text
     if t.startswith(("/", "／")):
+        command_name = t[1:].strip().split(maxsplit=1)[0].lower() if t[1:].strip() else ""
+        if command_name == "memory":
+            identity = _memory_identity(ctx, evt, allow_computer=_ai_chat_allows_kimi_computer(ctx, perm), perm=perm)
+            service = getattr(aisvc, "memory", None) if aisvc is not None else None
+            if identity is None or service is None:
+                await reply(api, ctx, "记忆服务暂时不可用：无法确认当前机器人身份。", logsvc)
+            else:
+                result, force_private = await handle_memory_command(service, identity, t)
+                await reply(api, ctx, result, logsvc, force_private_user_id=ctx.user_id if force_private else None)
+            return
         if _is_known_explicit_command(t) or int(getattr(ctx, "level", 0) or 0) < 1:
             _remember_non_ai_once()
             await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc, calendar_service)
