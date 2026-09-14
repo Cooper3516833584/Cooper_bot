@@ -18,7 +18,7 @@
 - `test/unit/test_memory_deletion.py`（4 例）：forget 清理派生行并写 forget marker 水位；forget 后显式重述仍可见；`clear_subject` 清空并让在途 turn 变为 stale；`/memory group clear` 轮换 conversation 并清空该 scope 的 events/facts/summaries/embeddings/jobs/markers。
 - `test/unit/test_memory_vectors.py`（16 例，全 fake provider、零网络）：写入即向量化、无词法重叠也能靠向量召回、开关关闭/未配置/调用失败时逐条等价于纯词法、超过一个批次的回填会全部跑完（无日预算上限）、模型换代后重新回填并丢弃旧 fingerprint、superseded 事实的向量被清理、维度不一致被忽略、查询向量 60s 缓存、融合排序改变 prompt 中 facts 顺序、慢 provider 不阻塞记忆 DB。
 - `tools/diagnostics/memory_perf_probe.py`：08 第 7 节的本地性能探针（虚构数据、临时库、结束即清理），并新增向量打分与融合排序的纯本地 CPU 开销测量。
-- `tools/diagnostics/probe_memory_embedding.py`：真实 embedding provider 探针（只发两段固定测试文本，不含任何聊天/记忆内容）。**未运行**（需联网授权）。
+- `tools/diagnostics/probe_memory_embedding.py`：真实 embedding provider 探针（只发两段固定测试文本，不含任何聊天/记忆内容）。**已于 2026-09-14 运行**（用户授权联网）：`api.siliconflow.cn` 的 `BAAI/bge-m3`，`/embeddings` 可用，1024 维，同文本余弦 0.99996、跨文本 0.5949。
 
 ## 实际测试命令 + 退出码
 
@@ -40,7 +40,7 @@
 - M036-M051（命令、群权限、opt-out、forget/clear、passive capture）：PASS（`test_memory_commands.py`、`test_memory_deletion.py`、`test_memory_chat_flow.py`）。
 - M052-M063（summary schema/worker/cutoff/CAS/lease/budget）：PASS，但 summary 默认关闭；测试在 monkeypatch 打开开关后验证 schema v2→v3、cutoff、parent assistant、CAS、lease、日预算与晚到结果拒绝。
 - M064-M078（auto extraction/evidence/cursor/conflict/forget marker）：PASS，同样默认关闭；测试覆盖程序固定 subject/scope、evidence 子串校验、legacy cursor、explicit 优先、forget marker 防复活。
-- M079-M084（embedding/向量增强）：自动测试 PASS（`test_memory_vectors.py`，fake provider 覆盖写入、召回、降级、回填、失效、维度、缓存、融合排序）；**真实 provider NOT-RUN**，`probe_memory_embedding.py` 未执行。
+- M079-M084（embedding/向量增强）：自动测试 PASS（`test_memory_vectors.py`，fake provider 覆盖写入、召回、降级、回填、失效、维度、缓存、融合排序）；**真实 provider 已执行**（2026-09-14）：`api.siliconflow.cn` 的 `BAAI/bge-m3` 返回 1024 维，同文本余弦 0.99996、跨文本 0.5949。M079-M084 可判 PASS（本机 + 真实 provider 各一次），但生产消息链路仍未验证。
 - M085（在线 backup/恢复）：PASS（`test_memory_store.py::test_online_backup_restores_consistent_memory_database`）。
 - M086（迁移/future schema）：PASS（`test_future_schema_fails_closed`、`test_schema_v2_migrates_summary_and_job_columns_without_rebuild`）。
 - M087（本地性能前置）：顺序单查询 p95 < 100 ms 达标（含向量打分）；500 并发过载见性能节，单列为已知限制。
@@ -58,7 +58,9 @@
 
 ## 真实 QQ / Kimi / DeepSeek / embedding provider
 
-NOT-RUN。全部验证在本地 fake 组件上完成，未连接真实 QQ、Kimi CLI、DeepSeek 或电脑执行域；embedding 也只用了 fake provider。
+QQ / Kimi / DeepSeek：NOT-RUN，未连接真实 QQ、Kimi CLI、DeepSeek 或电脑执行域。
+
+embedding provider：**已实测**（2026-09-14，用户授权联网）。`tools/diagnostics/probe_memory_embedding.py` 只发两段固定测试文本、不含任何聊天或记忆内容，结果：`api.siliconflow.cn` 的 `BAAI/bge-m3`，`/embeddings` 可用，维度 1024，同文本两次调用余弦 0.99996，跨文本余弦 0.5949。限流、超时、错误码等其余 provider 行为仍未实测。
 
 ## 性能（本机实测，命令：`python tools/diagnostics/memory_perf_probe.py`）
 
@@ -75,8 +77,8 @@ NOT-RUN。全部验证在本地 fake 组件上完成，未连接真实 QQ、Kimi
 
 ## 已知限制
 
-- **默认开启但真实环境未验证**：`AI_MEMORY_ENABLED` / `AI_MEMORY_EMBEDDING_ENABLED` 已默认开启（产品决定），而真实 QQ/Kimi/DeepSeek、真实 embedding provider、真实灰度都没有跑过。也就是说"默认开"与"未经真实环境验证"同时成立，扩大范围前需要先跑 `probe_memory_embedding.py` 与一次单私聊灰度。
-- embedding provider 是否支持 `/embeddings`、维度多少、限流如何，均未实测；未配置时整条向量路径静默退化为词法。
+- **默认开启、真实消息链路未验证**：`AI_MEMORY_ENABLED` / `AI_MEMORY_EMBEDDING_ENABLED` 已默认开启（产品决定）；embedding provider 已实测可用，但真实 QQ/Kimi/DeepSeek 消息链路与真实灰度仍未跑过。扩大范围前至少要做一次单私聊灰度。
+- embedding provider 的限流、超时与错误码行为未实测；未配置或调用失败时整条向量路径静默退化为词法（已由自动测试覆盖）。
 - 换 `AI_EMBED_MODEL` 会让所有旧向量按 fingerprint 失效并重新回填；回填按 `AI_MEMORY_EMBEDDING_BATCH_SIZE` 分批但**不设日预算上限**，会一直调用 provider 直到没有缺失事实——大批量换模型时对 provider 的请求量没有闸门，只受批间顺序执行（单 worker，一次一条）限制。
 - 单线程 DB executor 下 500 并发过载排队 p95 ≈ 20 s；正常顺序聊天路径 p95 ≈ 51 ms。向量打分额外约 7 ms/次（500 条候选）。
 - `snapshot_rows` 在单 conversation 达到 retention 上限时 p95 ≈ 46 ms（本报告样本即最坏情况）。
@@ -92,4 +94,4 @@ NOT-RUN。全部验证在本地 fake 组件上完成，未连接真实 QQ、Kimi
 
 ## 是否可上线
 
-**不能判定为"已验证可上线"**。memory 的阻断安全项与向量检索都有自动测试证据，默认开关也按产品要求打开了；但真实 QQ/Kimi/DeepSeek、真实 embedding provider、真实灰度与生产回滚均未执行，高并发 DB 排队容量未验证，summary/auto_extract 仍默认关闭且未在真实 provider 下端到端跑过，全量测试也仍有一个基线 vision 断言失败。按 08 第 10 节，这不满足"可上线"的举证要求——默认开启属于产品决定，风险需以真实灰度结果来确认或回退。
+**不能判定为"已验证可上线"**。memory 的阻断安全项与向量检索都有自动测试证据，embedding provider 也已实测可用，默认开关按产品要求打开；但真实 QQ/Kimi/DeepSeek 消息链路、真实灰度与生产回滚均未执行，高并发 DB 排队容量未验证，summary/auto_extract 仍默认关闭且未在真实 provider 下端到端跑过，全量测试也仍有一个基线 vision 断言失败。按 08 第 10 节，这不满足"可上线"的举证要求——默认开启属于产品决定，风险需以真实灰度结果来确认或回退。

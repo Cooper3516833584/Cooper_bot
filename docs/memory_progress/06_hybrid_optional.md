@@ -8,4 +8,4 @@
 - 隐私：发给 embedding provider 的只有该 scope 的事实文本与查询文本，不含聊天原文。
 - 展示：`/memory status` 输出向量是否就绪、已向量化条数 / 可见事实条数。
 
-验证：`test/unit/test_memory_vectors.py`（16 passed）。真实 provider 是否可用需运行 `tools/diagnostics/probe_memory_embedding.py`（会联网，只发两段固定测试文本）。
+验证：`test/unit/test_memory_vectors.py`（16 passed）。真实 embedding provider 已实测（2026-09-14）：`api.siliconflow.cn` 的 `BAAI/bge-m3`，`/embeddings` 可用，1024 维，同文本余弦 0.99996、跨文本 0.5949（探针 `tools/diagnostics/probe_memory_embedding.py`，只发两段固定测试文本）。
