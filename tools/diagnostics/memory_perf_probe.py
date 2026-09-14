@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import shutil
 import sys
 import time
@@ -26,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cooper_bot.core import config  # noqa: E402
+from cooper_bot.modules.memory import vectors  # noqa: E402
 from cooper_bot.modules.memory.retrieval import search  # noqa: E402
 from cooper_bot.modules.memory.store import MemoryStore  # noqa: E402
 
@@ -176,7 +178,30 @@ async def main() -> int:
     print(f"facts_search_ms: p50={percentile(facts_ms, 0.5):.3f} p95={percentile(facts_ms, 0.95):.3f} p99={percentile(facts_ms, 0.99):.3f}")
     print(f"sequential_ms: p50={percentile(sequential, 0.5):.3f} p95={percentile(sequential, 0.95):.3f} p99={percentile(sequential, 0.99):.3f}")
     print(f"burst_{QUERY_COUNT}_ms: p50={percentile(concurrent, 0.5):.3f} p95={percentile(concurrent, 0.95):.3f} p99={percentile(concurrent, 0.99):.3f} max={max(concurrent):.3f} wall={burst_wall * 1000:.3f}")
+    _vectors_section()
     return 0
+
+
+def _vectors_section() -> None:
+    """向量打分与融合排序的纯本地 CPU 开销（不发任何网络请求）。"""
+    candidates, dimension = 500, 1024
+    rng = random.Random(20260914)
+    facts = [{"fact_id": f"fact-{index}", "text": f"第{index}条记忆", "updated_at": float(index)} for index in range(candidates)]
+    blobs = [vectors.encode([rng.uniform(-1.0, 1.0) for _ in range(dimension)]) for _ in range(candidates)]
+    query_vector = vectors.decode(blobs[0])
+    lexical = {f"fact-{index}": 1.0 for index in range(0, candidates, 5)}
+    samples: list[float] = []
+    recalled = 0
+    for _ in range(30):
+        began = time.perf_counter()
+        raw_vectors = [vectors.from_blob(blob) for blob in blobs]
+        scores = dict(zip([row["fact_id"] for row in facts], vectors.similarity_scores(query_vector, raw_vectors)))
+        recalled = len(vectors.fusion_order(facts, lexical, scores, limit=6, min_similarity=0.35))
+        samples.append((time.perf_counter() - began) * 1000)
+    print(
+        f"vector_rank_ms: facts={candidates} dim={dimension} -> "
+        f"p50={percentile(samples, 0.5):.3f} p95={percentile(samples, 0.95):.3f} max={max(samples):.3f} (recalled_top={recalled})"
+    )
 
 
 if __name__ == "__main__":

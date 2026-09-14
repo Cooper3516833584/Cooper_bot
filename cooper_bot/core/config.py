@@ -253,7 +253,8 @@ AI_SEMANTIC_STORE_PATH = DATABASES_DIR / "ai" / "semantic_store.sqlite3"
 # Chat memory is deliberately separate from the searchable material index.
 # Keep these values close to the other AI storage settings so deployments have
 # one conventional environment-variable parser and no second secrets file.
-AI_MEMORY_ENABLED = _get_env_bool("AI_MEMORY_ENABLED", False)
+# 部署默认开启（产品决定，覆盖修复包 D15 的"默认关闭"口径）；关闭时不创建/不打开数据库。
+AI_MEMORY_ENABLED = _get_env_bool("AI_MEMORY_ENABLED", True)
 AI_MEMORY_DB_PATH = _get_env_path("AI_MEMORY_DB_PATH", DATABASES_DIR / "ai" / "chat_memory.sqlite3")
 AI_MEMORY_BOT_ID = _get_env_int("AI_MEMORY_BOT_ID", 0, 0, 9_999_999_999)
 AI_MEMORY_GROUP_ALLOWLIST = _parse_int_set(_get_env("AI_MEMORY_GROUP_ALLOWLIST", ""))
@@ -274,7 +275,12 @@ AI_MEMORY_SUMMARY_DAILY_BUDGET = _get_env_int("AI_MEMORY_SUMMARY_DAILY_BUDGET", 
 AI_MEMORY_AUTO_EXTRACT_ENABLED = _get_env_bool("AI_MEMORY_AUTO_EXTRACT_ENABLED", False)
 AI_MEMORY_AUTO_EXTRACT_MIN_EVENTS = _get_env_int("AI_MEMORY_AUTO_EXTRACT_MIN_EVENTS", 1, 1, 100)
 AI_MEMORY_AUTO_EXTRACT_DAILY_BUDGET = _get_env_int("AI_MEMORY_AUTO_EXTRACT_DAILY_BUDGET", 100, 0, 10000)
-AI_MEMORY_EMBEDDING_ENABLED = _get_env_bool("AI_MEMORY_EMBEDDING_ENABLED", False)
+# 记忆向量检索（默认开启；embedding provider 未配置时自动退化为纯词法）。
+AI_MEMORY_EMBEDDING_ENABLED = _get_env_bool("AI_MEMORY_EMBEDDING_ENABLED", True)
+AI_MEMORY_EMBEDDING_MIN_SIMILARITY = _get_env_float("AI_MEMORY_EMBEDDING_MIN_SIMILARITY", 0.35, 0.0, 1.0)
+AI_MEMORY_EMBEDDING_BATCH_SIZE = _get_env_int("AI_MEMORY_EMBEDDING_BATCH_SIZE", 16, 1, 100)
+AI_MEMORY_EMBEDDING_DAILY_BUDGET = _get_env_int("AI_MEMORY_EMBEDDING_DAILY_BUDGET", 500, 0, 10000)
+AI_MEMORY_EMBEDDING_TIMEOUT_SECONDS = _get_env_float("AI_MEMORY_EMBEDDING_TIMEOUT_SECONDS", 30.0, 1.0, 120.0)
 AI_LEGACY_DIR = DATABASES_DIR / "ai" / "legacy"
 AI_INDEX_PATH = AI_LEGACY_DIR / "all_files_index.json"
 AI_METADATA_PATH = AI_LEGACY_DIR / "file_metadata.json"

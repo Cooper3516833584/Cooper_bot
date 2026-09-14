@@ -287,6 +287,53 @@ class MemoryStore:
         if not subjects:return []
         marks=','.join('?'*len(subjects)); q=f"SELECT * FROM memory_facts WHERE scope_id=? AND subject_id IN ({marks}) AND status='active' AND (expires_at IS NULL OR expires_at>?) ORDER BY updated_at DESC,fact_id"; return [dict(x) for x in self._c().execute(q,(scope_id,*subjects,time.time())).fetchall()]
 
+    async def put_embedding(self, scope_id: str, fact_id: str, fingerprint: str, revision: int, vector: bytes, dimension: int) -> None:
+        await self._call(self._put_embedding, scope_id, fact_id, fingerprint, revision, vector, dimension)
+    def _put_embedding(self,scope_id,fact_id,fingerprint,revision,vector,dimension):
+        c=self._c();now=time.time()
+        with c:
+            c.execute("INSERT OR REPLACE INTO memory_embeddings(fact_id,fingerprint,scope_id,fact_revision,dimension,vector,updated_at) VALUES(?,?,?,?,?,?,?)",(fact_id,fingerprint,scope_id,int(revision),int(dimension),sqlite3.Binary(vector),now))
+            c.execute("DELETE FROM memory_embeddings WHERE scope_id=? AND fact_id=? AND fingerprint!=?",(scope_id,fact_id,fingerprint))
+
+    async def load_embeddings(self, scope_id: str, subjects: tuple[str, ...], fingerprint: str) -> list[dict]:
+        return await self._call(self._load_embeddings, scope_id, subjects, fingerprint)
+    def _load_embeddings(self,scope_id,subjects,fingerprint):
+        if not subjects:return []
+        marks=','.join('?'*len(subjects))
+        q=f"""SELECT embedding.fact_id,embedding.fact_revision,embedding.dimension,embedding.vector
+              FROM memory_embeddings AS embedding JOIN memory_facts AS fact ON fact.fact_id=embedding.fact_id
+              WHERE embedding.scope_id=? AND embedding.fingerprint=? AND fact.status='active'
+                AND fact.subject_id IN ({marks}) AND fact.revision=embedding.fact_revision
+                AND (fact.expires_at IS NULL OR fact.expires_at>?)"""
+        return [dict(x) for x in self._c().execute(q,(scope_id,fingerprint,*subjects,time.time())).fetchall()]
+
+    async def facts_missing_embeddings(self, scope_id: str, fingerprint: str, limit: int, after_fact_id: str = "") -> list[dict]:
+        return await self._call(self._facts_missing_embeddings, scope_id, fingerprint, limit, after_fact_id)
+    def _facts_missing_embeddings(self,scope_id,fingerprint,limit,after_fact_id):
+        q="""SELECT fact.fact_id,fact.subject_id,fact.revision,fact.text FROM memory_facts AS fact
+             WHERE fact.scope_id=? AND fact.status='active' AND fact.fact_id>?
+               AND NOT EXISTS (SELECT 1 FROM memory_embeddings AS embedding WHERE embedding.fact_id=fact.fact_id AND embedding.fingerprint=? AND embedding.fact_revision=fact.revision)
+             ORDER BY fact.fact_id LIMIT ?"""
+        return [dict(x) for x in self._c().execute(q,(scope_id,str(after_fact_id or ""),fingerprint,max(1,int(limit)))).fetchall()]
+
+    async def prune_stale_embeddings(self, scope_id: str) -> int:
+        return await self._call(self._prune_stale_embeddings, scope_id)
+    def _prune_stale_embeddings(self,scope_id):
+        with self._c():
+            cur=self._c().execute("""DELETE FROM memory_embeddings WHERE scope_id=? AND NOT EXISTS (
+                SELECT 1 FROM memory_facts AS fact WHERE fact.fact_id=memory_embeddings.fact_id AND fact.status='active' AND fact.revision=memory_embeddings.fact_revision)""",(scope_id,))
+        return int(cur.rowcount)
+
+    async def count_embeddings(self, scope_id: str, fingerprint: str) -> int:
+        return await self._call(self._count_embeddings, scope_id, fingerprint)
+    def _count_embeddings(self,scope_id,fingerprint):
+        return int(self._c().execute("SELECT COUNT(*) FROM memory_embeddings WHERE scope_id=? AND fingerprint=?",(scope_id,fingerprint)).fetchone()[0])
+
+    async def scope_ids(self) -> list[str]:
+        return await self._call(self._scope_ids)
+    def _scope_ids(self):
+        return [str(row[0]) for row in self._c().execute("SELECT scope_id FROM memory_scopes").fetchall()]
+
     async def resolve_fact_prefix(self, scope_id: str, subject: str, prefix: str) -> list[str]:
         return await self._call(self._resolve_fact_prefix, scope_id, subject, prefix)
     def _resolve_fact_prefix(self, scope_id: str, subject: str, prefix: str) -> list[str]:
@@ -479,6 +526,14 @@ class MemoryStore:
         await self._call(self._enqueue_job, scope_id, conversation_id, epoch, kind, target, payload, dedupe_key, base_version)
     def _enqueue_job(self, scope_id, cid, epoch, kind, target, payload, key, base_version):
         with self._c(): self._c().execute("INSERT OR IGNORE INTO memory_jobs(job_id,scope_id,conversation_id,epoch,kind,target_input_seq,payload_json,state,base_version,not_before,dedupe_key) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)", (uuid.uuid4().hex,scope_id,cid,epoch,kind,target,json.dumps(payload,ensure_ascii=False),base_version,time.time(),key))
+    async def requeue_job(self, scope_id: str, conversation_id: str, epoch: int, kind: str, target: int, payload: dict, dedupe_key: str, *, base_version: int=0) -> None:
+        """INSERT OR UPDATE：同一 dedupe_key 的终结作业重新排队（回填触发必须可重复）。"""
+        await self._call(self._requeue_job, scope_id, conversation_id, epoch, kind, target, payload, dedupe_key, base_version)
+    def _requeue_job(self, scope_id, cid, epoch, kind, target, payload, key, base_version):
+        c=self._c();now=time.time()
+        with c:
+            c.execute("UPDATE memory_jobs SET state='queued',attempts=0,not_before=?,lease_until=NULL,last_error_code=NULL WHERE dedupe_key=? AND state IN ('succeeded','failed','cancelled')",(now,key))
+            c.execute("INSERT OR IGNORE INTO memory_jobs(job_id,scope_id,conversation_id,epoch,kind,target_input_seq,payload_json,state,base_version,not_before,dedupe_key) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)", (uuid.uuid4().hex,scope_id,cid,epoch,kind,target,json.dumps(payload,ensure_ascii=False),base_version,now,key))
     async def claim_job(self, *, max_attempts: int=3, lease_seconds: int=120) -> dict | None: return await self._call(self._claim_job,max_attempts,lease_seconds)
     def _claim_job(self,max_attempts,lease_seconds):
         c=self._c();now=time.time()

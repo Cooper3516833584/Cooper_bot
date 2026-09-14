@@ -17,6 +17,9 @@ class MemoryJobWorker:
         await self.store.enqueue_job(*args, **kwargs)
         self._wake.set()
 
+    def wake(self):
+        self._wake.set()
+
     async def _run(self):
         while not self._closing:
             job = await self.store.claim_job()

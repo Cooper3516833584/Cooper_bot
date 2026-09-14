@@ -8,4 +8,4 @@
 
 验证：`python -m pytest -q test/unit/test_memory_turn_safety.py`（6 passed）；memory、AI、dispatch、client lifecycle 相关组合测试（61 passed）。
 
-9563319 修复阶段 04：启动时按完整 input block 执行 raw TTL/每 scope 数量上限，只清 terminal block，不随机切断问答或删除 pending/generated 在途记录。默认 master switch 改回关闭；配置来源的 DB 路径必须位于私有 `runtime/databases` 根内，否则 fail closed 且不创建文件。显式传入 `db_path` 仅用于可信测试注入。
+9563319 修复阶段 04：启动时按完整 input block 执行 raw TTL/每 scope 数量上限，只清 terminal block，不随机切断问答或删除 pending/generated 在途记录。修复阶段 04 曾把默认 master switch 改回关闭（缺陷矩阵 D15）；2026-09-14 按产品决定改为**默认开启**，口径见 `docs/memory.md` 与 `07_acceptance.md`。配置来源的 DB 路径必须位于私有 `runtime/databases` 根内，否则 fail closed 且不创建文件。显式传入 `db_path` 仅用于可信测试注入。

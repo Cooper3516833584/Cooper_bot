@@ -13,6 +13,22 @@ def tokens(text: str) -> set[str]:
     return {x for x in out if x}
 
 
+def scored(rows: list[dict], query: str) -> dict[str, float]:
+    """逐条词法分（不截断），供向量融合排序使用；key 与事实行取 id 的方式一致。"""
+    q = tokens(query)
+    if not q:
+        return {}
+    phrase = str(query or "").strip().casefold()
+    scores: dict[str, float] = {}
+    for row in rows:
+        text = str(row.get("text") or row.get("own_text") or "")
+        overlap = len(q & tokens(text))
+        if not overlap:
+            continue
+        scores[str(row.get("fact_id") or "")] = overlap / len(q) + (2.0 if phrase and phrase in text.casefold() else 0.0)
+    return scores
+
+
 def search(rows: list[dict], query: str, limit: int = 6) -> list[dict]:
     q = tokens(query)
     if not q:

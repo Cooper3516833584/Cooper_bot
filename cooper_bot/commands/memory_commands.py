@@ -49,7 +49,7 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
             if not status["scope_available"]:
                 return ("聊天记忆总开关：开启；当前作用域不在部署允许范围内。", private)
             profile_text = "admin explicit-only" if status["profile"] == "admin" else "public"
-            return (f"总开关：开启；scope：{'开启' if status['scope_enabled'] else '关闭'}；模式：{status['capture_mode']}；本人：{'启用' if status['member_enabled'] else '已退出'}；profile：{profile_text}；可见事实：{status['visible_facts']}；summary/auto/embedding：{int(status['summary_enabled'])}/{int(status['auto_extract_enabled'])}/{int(status['embedding_enabled'])}。", private)
+            return (f"总开关：开启；scope：{'开启' if status['scope_enabled'] else '关闭'}；模式：{status['capture_mode']}；本人：{'启用' if status['member_enabled'] else '已退出'}；profile：{profile_text}；可见事实：{status['visible_facts']}；向量：{'就绪' if status['embedding_ready'] else '未就绪'}（{status['embedded_facts']}/{status['total_facts']}）；summary/auto/embedding：{int(status['summary_enabled'])}/{int(status['auto_extract_enabled'])}/{int(status['embedding_enabled'])}。", private)
         if not service.enabled:
             return ("聊天记忆总开关当前关闭；请由部署者设置 AI_MEMORY_ENABLED=true 后重启。", private)
         if action == "on":
