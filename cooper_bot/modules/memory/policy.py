@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from .models import CapturedInput, MemoryIdentity
 
 _SECRET_RE = re.compile(r"(?:api[_ -]?key|password|passwd|secret|token)\s*[:=]|-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|sk-[A-Za-z0-9_-]{12,}", re.I)
+_RESOURCE_RE = re.compile(r"(?:https?://|file://|data:[^\s;,]+;base64,|[A-Za-z]:[\\/]|(?:^|\s)/(?:home|Users|tmp|var)/)", re.I)
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,13 @@ def safe_text(value: object, limit: int) -> tuple[str, bool, bool]:
     if len(text) > limit:
         return text[:limit], True, False
     return text, False, False
+
+
+def safe_context_text(value: object, limit: int) -> tuple[str, bool, bool]:
+    text, truncated, secret = safe_text(value, limit)
+    if secret or _RESOURCE_RE.search(text):
+        return "", False, True
+    return text, truncated, False
 
 
 def valid_identity(identity: MemoryIdentity) -> bool:

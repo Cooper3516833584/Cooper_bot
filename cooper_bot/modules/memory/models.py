@@ -32,6 +32,7 @@ class MemorySnapshot:
     current_input_seq: int
     recent_events: tuple[dict, ...]
     recalled_facts: tuple[dict, ...] = ()
+    summary: dict | None = None
 
 
 class MemoryError(RuntimeError):

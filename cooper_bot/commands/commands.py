@@ -2183,6 +2183,59 @@ def _memory_identity(ctx, evt: dict, *, allow_computer: bool, perm=None) -> Opti
     return MemoryIdentity(bot_id, actor, scene, group_id, "admin" if allow_computer else "public", personal_admin)
 
 
+def _memory_quoted_text(aisvc, session_key: Optional[str], evt: dict) -> str:
+    reply_id = _extract_reply_msg_id(evt)
+    find_message = getattr(aisvc, "find_chat_message_by_msg_id", None)
+    if not reply_id or not session_key or not callable(find_message):
+        return ""
+    try:
+        message = find_message(session_key, reply_id)
+    except Exception:
+        return ""
+    return str((message or {}).get("content") or "").strip() if isinstance(message, dict) else ""
+
+
+def _memory_visual_text(slots: list) -> str:
+    descriptions = []
+    for slot in slots or []:
+        if isinstance(slot, dict):
+            status = str(slot.get("status") or "")
+            description = str(slot.get("description") or "").strip()
+        else:
+            status = str(getattr(slot, "status", "") or "")
+            description = str(getattr(slot, "description", "") or "").strip()
+        if status == "ready" and description:
+            descriptions.append(description)
+    return "\n".join(descriptions)
+
+
+async def _capture_passive_memory(ctx, evt: dict, text: str, aisvc, logsvc, current_slots: list) -> None:
+    if str(getattr(ctx, "scene", "")) != "group" or not isinstance(evt, dict):
+        return
+    if evt.get("post_type") not in (None, "message") or evt.get("message_type") not in (None, "group"):
+        return
+    message_id = str(evt.get("message_id") or "").strip()
+    self_id = str(evt.get("self_id") or "").strip()
+    if not message_id or (self_id and self_id == str(getattr(ctx, "user_id", 0) or 0)):
+        return
+    service = getattr(aisvc, "memory", None) if aisvc is not None else None
+    identity = _memory_identity(ctx, evt, allow_computer=False)
+    capture = getattr(service, "capture_passive", None)
+    if identity is None or not callable(capture):
+        return
+    try:
+        await capture(identity, CapturedInput(
+            source_event_id=message_id,
+            own_text=text,
+            quoted_text=_memory_quoted_text(aisvc, _ai_chat_session_key(ctx), evt),
+            visual_text=_memory_visual_text(current_slots),
+            created_at_utc=time.time(),
+            source_kind="passive_chat",
+        ))
+    except Exception as exc:
+        logsvc.log.warning(f"passive memory capture failed: {type(exc).__name__}")
+
+
 def _ai_chat_session_key(ctx) -> Optional[str]:
     scene = str(getattr(ctx, "scene", "") or "")
     if scene == "group":
@@ -4079,6 +4132,8 @@ async def _handle_ai_chat_trigger(
                     CapturedInput(
                         source_event_id=str(message_id or f"event:{time.time_ns()}"),
                         own_text=clean_trigger_text,
+                        quoted_text=_memory_quoted_text(aisvc, session_key, evt),
+                        visual_text=_memory_visual_text(current_slots),
                         created_at_utc=time.time(),
                         source_kind="request_metadata" if allow_computer else "direct_chat",
                     ),
@@ -4089,7 +4144,7 @@ async def _handle_ai_chat_trigger(
         try:
             if memory_turn is not None:
                 async with memory_turn:
-                    if memory_turn.is_duplicate:
+                    if memory_turn.is_duplicate or memory_turn.is_stale_or_disabled:
                         return True
                     context_kwargs = {"msg_id": message_id, "vision_slots": current_slots, "memory_turn": memory_turn}
                     if allow_computer:
@@ -4098,7 +4153,7 @@ async def _handle_ai_chat_trigger(
                     if not out:
                         out = "我这边没收到有效回复，稍后再试一次。"
                     await memory_turn.record_generated(out)
-                    if not await memory_turn.ensure_current():
+                    if not await memory_turn.acquire_send_permit():
                         await memory_turn.abort("scope_changed")
                         return True
                     try:
@@ -5089,7 +5144,14 @@ async def dispatch(
             if identity is None or service is None:
                 await reply(api, ctx, "记忆服务暂时不可用：无法确认当前机器人身份。", logsvc)
             else:
-                result, force_private = await handle_memory_command(service, identity, t)
+                clear_admin_history = getattr(aisvc, "clear_admin_chat_history", None)
+                session_key = _ai_chat_session_key(ctx)
+                clear_callback = (
+                    (lambda: clear_admin_history(session_key, identity.actor_user_id))
+                    if identity.profile == "admin" and session_key and callable(clear_admin_history)
+                    else None
+                )
+                result, force_private = await handle_memory_command(service, identity, t, clear_admin_history=clear_callback)
                 await reply(api, ctx, result, logsvc, force_private_user_id=ctx.user_id if force_private else None)
             return
         if _is_known_explicit_command(t) or int(getattr(ctx, "level", 0) or 0) < 1:
@@ -5129,6 +5191,7 @@ async def dispatch(
     ):
         return
     _remember_non_ai_once()
+    await _capture_passive_memory(ctx, evt, enriched_text, aisvc, logsvc, current_slots)
     if await _handle_plain_text_input(api, ctx, evt, t, logsvc, state):
         return
 

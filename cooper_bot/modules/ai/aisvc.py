@@ -41,6 +41,7 @@ from cooper_bot.modules.ai.model_gateway import (
     search_results_to_text,
 )
 from cooper_bot.modules.memory.service import MemoryService
+from cooper_bot.modules.memory.prompting import fit_prompt_budget, materialize_memory_events
 
 from cooper_bot.core import config as core_config
 
@@ -200,7 +201,7 @@ class AIService:
         )
         # Constructing the service is inert while the master switch is off;
         # opening SQLite is delayed until a permitted memory operation.
-        self.memory = MemoryService(log)
+        self.memory = MemoryService(log, gateway=self.gateway)
 
         self._lock = threading.RLock()
         self._chat_sessions_lock = threading.RLock()
@@ -542,6 +543,7 @@ class AIService:
             }
         if memory_context:
             payload["memory_context"] = memory_context
+        payload = fit_prompt_budget(payload, core_config.AI_MEMORY_CONTEXT_CHAR_BUDGET)
         return json.dumps(payload, ensure_ascii=False)
 
     async def kimi_chat_with_context(
@@ -565,13 +567,12 @@ class AIService:
         slots = self._normalize_vision_slots(vision_slots)
         content = str(user_input or "").strip()
         current = self._render_chat_message_content({"role": "user", "content": content, "_vision": slots} if slots else {"role": "user", "content": content})
-        if memory_turn is not None:
-            history = [
-                {"role": row["role"], "content": row["own_text"]}
-                for row in memory_turn.snapshot.recent_events
-                if row.get("own_text") and row.get("role") in {"user", "assistant"}
-            ]
-            memory_context = await self.memory.prompt_context(memory_turn.identity, content)
+        if memory_turn is not None and allow_computer:
+            history = self._select_history_for_backend(self._load_active_chat_history(storage_key), "kimi") if storage_key else []
+            memory_context = await self.memory.prompt_context(memory_turn.identity, content, summary=None)
+        elif memory_turn is not None:
+            history = materialize_memory_events(memory_turn.snapshot.recent_events, memory_turn.identity.scene)
+            memory_context = await self.memory.prompt_context(memory_turn.identity, content, summary=getattr(memory_turn.snapshot, "summary", None))
         else:
             history = self._select_history_for_backend(self._load_active_chat_history(storage_key), "kimi") if storage_key else []
             memory_context = None
@@ -593,7 +594,7 @@ class AIService:
         text = str(result.text or "").strip()
         if not text:
             raise RuntimeError("empty kimi response")
-        if storage_key and memory_turn is None:
+        if storage_key and (memory_turn is None or allow_computer):
             self._save_chat_turn(storage_key, content, text, msg_id=msg_id, vision_slots=slots)
         return text
 
@@ -3235,6 +3236,11 @@ class AIService:
                 checked = [user_msg, assistant_msg]
                 self.log.warning(f"AI chat context invalid after append, reset to current turn: session={key[:80]}")
             self._chat_sessions[key] = {"messages": checked, "last_active_ts": now_ts}
+
+    def clear_admin_chat_history(self, session_key: str, actor_user_id: int) -> None:
+        key = self._kimi_storage_key(session_key, allow_computer=True, actor_user_id=actor_user_id)
+        with self._chat_sessions_lock:
+            self._chat_sessions.pop(key, None)
 
     # ---------- 视觉 slot 接口 ----------
 
