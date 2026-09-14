@@ -253,7 +253,7 @@ AI_SEMANTIC_STORE_PATH = DATABASES_DIR / "ai" / "semantic_store.sqlite3"
 # Chat memory is deliberately separate from the searchable material index.
 # Keep these values close to the other AI storage settings so deployments have
 # one conventional environment-variable parser and no second secrets file.
-AI_MEMORY_ENABLED = _get_env_bool("AI_MEMORY_ENABLED", False)
+AI_MEMORY_ENABLED = _get_env_bool("AI_MEMORY_ENABLED", True)
 AI_MEMORY_DB_PATH = _get_env_path("AI_MEMORY_DB_PATH", DATABASES_DIR / "ai" / "chat_memory.sqlite3")
 AI_MEMORY_BOT_ID = _get_env_int("AI_MEMORY_BOT_ID", 0, 0, 9_999_999_999)
 AI_MEMORY_GROUP_ALLOWLIST = _parse_int_set(_get_env("AI_MEMORY_GROUP_ALLOWLIST", ""))
