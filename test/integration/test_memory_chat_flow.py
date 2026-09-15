@@ -71,7 +71,7 @@ async def _dispatch(ai: _FakeAI, text: str, message_id: str) -> None:
         logsvc=_LogService(),
         state=commands.BotState(),
         handin=SimpleNamespace(),
-        perm=SimpleNamespace(get_level=lambda _actor: 1),
+        perm=SimpleNamespace(get_level=lambda _actor: 2),
         aisvc=ai,
     )
 

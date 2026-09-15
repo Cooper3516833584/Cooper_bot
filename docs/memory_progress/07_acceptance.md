@@ -195,6 +195,7 @@ embedding provider：**已实测**（2026-09-14，用户授权联网）。`tools
 
 - 新作用域仍默认关闭；`/memory on` 需要权限等级 >= 2（新增 `MemoryIdentity.memory_operator`，与电脑控制用的 `personal_admin` 分离，level >= 3 仍同时是 `personal_admin`）。群里 `/memory on` 等价 `/memory group on all`；群会话已开启时普通成员仍可自行 on/off；`/memory remember` 不再自动打开会话。
 - 事实抽取按成员累计 200 条一次、单批最多 200 条、每条 `own_text` 最多 200 字、每天最多 20 次；摘要与 embedding 保持默认关闭；回复上下文收到 `AI_MEMORY_RECENT_EVENTS=20`、`AI_MEMORY_TOP_K=3`、`AI_MEMORY_CONTEXT_CHAR_BUDGET=7000`；`AI_MEMORY_MAX_EVENTS_PER_SCOPE=20000`；`VISION_CAPTURE_CONTEXT_IMAGES=false`。
+- 命令权限：所有 `/memory` 子命令都要求权限等级 >= 2（`MemoryIdentity.memory_operator`），没有例外；`/memory on` / `/memory off` 是当前会话（私聊/群聊）的记忆开关（`off` 把作用域 `enabled=0`，不物理删除）。验证：`test/unit/test_memory_highflow.py` 的 `test_all_memory_commands_need_level_two` 与 `test_memory_on_off_toggles_the_current_chat`。
 - 重启恢复：`recover_interrupted_jobs()`（`running` → `queued`，`attempts` 减 1，不等旧 lease）+ `active_extraction_pairs()` 启动补排，覆盖"够 200 条但崩溃前没 enqueue"的窗口。抽取作业重试耗尽变成 `failed` 后不会永久堵住 cursor：`enqueue_job(..., revive_failed=True)` 在再次发现同一批（新消息或启动补排）时把这条 failed job 重新激活（`attempts=0`、清 lease 与 `last_error_code`），`queued`/`running`/`succeeded` 一律不动。验证：`test/unit/test_memory_highflow.py` 的 failed 复活 4 例。
 - 验证：`python -m pytest -q test/unit/test_memory_highflow.py`（8 passed：权限等级、remember 不绕过、200 条跨重启、重启补排、running 作业恢复、200 条一批、每条 200 字截断、图片默认不解析）；memory 相关测试全绿；全量 `python -m pytest test` 仍有 1 个与 memory 无关的既有失败（`test_vision_skill.py::test_resolve_image_ready`，1600 vs 800）。
 - 未执行：真实 QQ 群高流量、真实 DeepSeek / embedding 调用、生产灰度与回滚 —— NOT RUN。

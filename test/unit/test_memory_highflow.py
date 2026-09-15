@@ -367,3 +367,69 @@ async def test_service_revives_a_failed_batch_when_it_is_rediscovered(tmp_path) 
     await _wait_for_cursor(service, scope_id, 20202, 200)
     assert gateway.payloads
     await service.aclose()
+
+
+# ------------------------------------------------- 所有 /memory 指令限 2 级
+
+@pytest.mark.asyncio
+async def test_all_memory_commands_need_level_two(tmp_path) -> None:
+    service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    level1 = _private(20202)
+    gated = (
+        "/memory",
+        "/memory help",
+        "/memory status",
+        "/memory on",
+        "/memory off",
+        "/memory remember 内容",
+        "/memory list",
+        "/memory search 内容",
+        "/memory forget abcdef",
+        "/memory history",
+        "/memory new",
+        "/memory clear",
+        "/memory group on all",
+        "/memory group off",
+        "/memory group clear",
+        "/memory unknown",
+    )
+    for command in gated:
+        reply, _ = await handle_memory_command(service, level1, command)
+        assert "需要权限等级 2 或以上" in reply, command
+
+    # 等级 1 连 off 都用不了：既不会被创建也不会被开启
+    scope_id = scope_for(level1)
+    scope = await service.store.scope(scope_id)
+    assert scope is None or not bool(scope["enabled"])
+
+    # 等级 2 可以正常用
+    operator = _private(20203, operator=True)
+    reply, _ = await handle_memory_command(service, operator, "/memory status")
+    assert "总开关：开启" in reply
+    reply, _ = await handle_memory_command(service, operator, "/memory on")
+    assert "已开启当前作用域的记忆" in reply
+    await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_memory_on_off_toggles_the_current_chat(tmp_path) -> None:
+    """on / off 就是当前会话（私聊或群聊）的记忆开关。"""
+    service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    private = _private(20202, operator=True)
+    group = _group(20203, operator=True)
+
+    reply, _ = await handle_memory_command(service, private, "/memory on")
+    assert "已开启当前作用域的记忆" in reply
+    assert bool((await service.store.scope(scope_for(private)))["enabled"])
+    reply, _ = await handle_memory_command(service, private, "/memory off")
+    assert "已关闭当前作用域的记忆" in reply
+    assert not bool((await service.store.scope(scope_for(private)))["enabled"])
+
+    reply, _ = await handle_memory_command(service, group, "/memory on")
+    assert "已开启当前作用域的记忆" in reply
+    scope = await service.store.scope(scope_for(group))
+    assert scope is not None and bool(scope["enabled"]) and scope["capture_mode"] == "all"
+    reply, _ = await handle_memory_command(service, group, "/memory off")
+    assert "已关闭当前作用域的记忆" in reply
+    assert not bool((await service.store.scope(scope_for(group)))["enabled"])
+    await service.aclose()

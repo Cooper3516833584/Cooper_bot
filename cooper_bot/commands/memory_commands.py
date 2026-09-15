@@ -39,8 +39,11 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
     action = parts[1].lower() if len(parts) > 1 else "help"
     argument = parts[2] if len(parts) > 2 else ""
     private = identity.profile == "admin" and identity.scene == "group"
+    # 所有记忆指令都要求权限等级 2 或以上；/memory on / off 是当前会话（私聊或群聊）的记忆开关。
+    if not identity.memory_operator:
+        return ("记忆指令需要权限等级 2 或以上。", private)
     if action in {"help", ""}:
-        return ("记忆默认关闭，用 /memory on 开启当前会话（需要权限等级 2 或以上）。群里 /memory on 会开启当前群会话并默认 capture_mode=all；在已开启的群里，普通成员 /memory on 只是把自己加回来。另有 status、remember/list/search/forget、history/new/clear；group on [directed|all]/off/remember/clear 仅可信个人管理员；off 不物理删除，clear 不能撤回已在途请求。", private)
+        return ("记忆默认关闭，所有记忆指令都需要权限等级 2 或以上。/memory on 开启当前会话（私聊或群聊）的记忆，群里按 capture_mode=all 记录普通群聊；/memory off 关闭当前会话的记忆（不物理删除）。另有 status、remember/list/search/forget、history/new/clear；group on directed|all/off/remember/clear 仅可信个人管理员；clear 不能撤回已在途请求。", private)
     try:
         if action == "status":
             status = await service.status(identity)
@@ -55,8 +58,6 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
         if action == "on":
             if identity.scene == "group":
                 if not await service.group_scope_enabled(identity):
-                    if not identity.memory_operator:
-                        return ("当前群记忆未开启，需要权限等级 2 或以上才能开启。", private)
                     # 群聊 /memory on = 开启当前 public group scope，默认 all（记录普通群聊）。
                     await service.set_group_enabled(replace(identity, profile="public"), True, "all")
                 if identity.profile == "public":
@@ -65,15 +66,20 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
                     await service.set_enabled(identity, True)
                     await service.set_member_enabled(identity, True)
                 return ("已开启当前作用域的记忆。", private)
-            if not identity.memory_operator:
-                return ("开启记忆需要权限等级 2 或以上。", private)
             await service.set_enabled(identity, True)
             await service.set_member_enabled(identity, True)
             return ("已开启当前作用域的记忆。", private)
         if action == "off":
+            # 关闭当前会话（私聊或群聊）的记忆开关，与 /memory on 对称；不物理删除已有数据。
+            if identity.scene == "group":
+                await service.set_group_enabled(replace(identity, profile="public"), False)
+                if identity.profile != "public":
+                    await service.set_enabled(identity, False)
+            else:
+                await service.set_enabled(identity, False)
             await service.set_member_enabled(identity, False)
             _clear_admin_volatile()
-            return ("已停止采集和使用你在当前作用域的记忆；已有数据未立即物理删除。", private)
+            return ("已关闭当前作用域的记忆；已有数据未立即物理删除。", private)
         if action == "remember":
             if not argument:
                 return ("用法：/memory remember <要记住的内容>", private)

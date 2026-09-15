@@ -34,21 +34,30 @@ async def test_group_scope_is_off_by_default_until_operator_enables(tmp_path) ->
 
 
 @pytest.mark.asyncio
-async def test_group_member_on_off_only_affects_own_membership(tmp_path) -> None:
-    """群会话开启后，普通成员 on/off 只改本人，不动群级策略。"""
+async def test_group_memory_switch_needs_level_two(tmp_path) -> None:
+    """等级 0/1 连 /memory off 都用不了；等级 2 用 on/off 切换当前群会话。"""
     admin = _group_identity(90909, personal_admin=True)
     member = _group_identity(20202)
+    operator = _group_identity(20203, memory_operator=True)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
     scope_id = scope_for(member)
 
     await service.set_group_enabled(admin, True, "all")
-    reply, _ = await handle_memory_command(service, member, "/memory off")
-    assert "已停止采集和使用" in reply
-    assert await service.store.member_enabled(scope_id, 20202) is False
-
-    reply, _ = await handle_memory_command(service, member, "/memory on")
-    assert "已开启当前作用域的记忆" in reply
+    for command in ("/memory off", "/memory on", "/memory status"):
+        reply, _ = await handle_memory_command(service, member, command)
+        assert "需要权限等级 2 或以上" in reply, command
+    # 等级 1 的拒绝不影响别人：群会话与本人 membership 都没被改动
+    scope = await service.store.scope(scope_id)
+    assert scope is not None and bool(scope["enabled"])
     assert await service.store.member_enabled(scope_id, 20202) is True
+
+    reply, _ = await handle_memory_command(service, operator, "/memory off")
+    assert "已关闭当前作用域的记忆" in reply
+    scope = await service.store.scope(scope_id)
+    assert scope is not None and not bool(scope["enabled"])
+
+    reply, _ = await handle_memory_command(service, operator, "/memory on")
+    assert "已开启当前作用域的记忆" in reply
     scope = await service.store.scope(scope_id)
     assert scope is not None and bool(scope["enabled"]) and scope["capture_mode"] == "all"
     await service.aclose()
@@ -70,20 +79,23 @@ async def test_level2_memory_on_enables_current_group_session_with_all(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_group_off_by_admin_blocks_member_remember_and_on(tmp_path) -> None:
-    """群级策略仍只由可信管理员控制：管理员关掉后，普通成员不能靠 remember/on 重新打开。"""
+async def test_group_off_blocks_remember_until_it_is_opened_again(tmp_path) -> None:
+    """管理员关掉群会话后 remember 被拒；等级 2 成员可以自己重新打开当前群会话。"""
     admin = _group_identity(90909, personal_admin=True)
-    member = _group_identity(20202)
+    member = _group_identity(20202, memory_operator=True)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
     await service.set_group_enabled(admin, False)
 
     reply, _ = await handle_memory_command(service, member, "/memory remember 不应写入")
     assert "未由管理员开启" in reply
-    reply, _ = await handle_memory_command(service, member, "/memory on")
-    assert "需要权限等级 2 或以上" in reply
     scope = await service.store.scope(scope_for(member))
     assert scope is not None and not bool(scope["enabled"])
     assert await service.list_facts(member) == []
+
+    reply, _ = await handle_memory_command(service, member, "/memory on")
+    assert "已开启当前作用域的记忆" in reply
+    scope = await service.store.scope(scope_for(member))
+    assert scope is not None and bool(scope["enabled"]) and scope["capture_mode"] == "all"
     await service.aclose()
 
 
@@ -151,10 +163,11 @@ async def test_member_off_invalidates_mixed_data_and_filters_old_events(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_regular_group_member_cannot_rotate_public_group_conversation(tmp_path, monkeypatch) -> None:
+async def test_level2_group_member_cannot_rotate_public_group_conversation(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {GROUP_ID})
     admin = _group_identity(90909, personal_admin=True)
-    member = _group_identity(20202)
+    # 等级 2（有记忆操作权限但不是可信个人管理员）：/memory new 仍被拒绝
+    member = _group_identity(20202, memory_operator=True)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
     await service.set_group_enabled(admin, True)
     before = await service.store.scope(scope_for(member))
@@ -199,7 +212,7 @@ async def test_admin_off_clear_new_request_volatile_history_reset(tmp_path) -> N
     reply, _ = await handle_memory_command(service, identity, "/memory new", clear_admin_history=lambda: resets.append("new"))
     assert "已开始新对话" in reply
     reply, _ = await handle_memory_command(service, identity, "/memory off", clear_admin_history=lambda: resets.append("off"))
-    assert "已停止采集" in reply
+    assert "已关闭当前作用域的记忆" in reply
     prompt, _ = await handle_memory_command(service, identity, "/memory clear", clear_admin_history=lambda: resets.append("early"))
     token = re.search(r"--confirm (\S+)", prompt).group(1)
     reply, _ = await handle_memory_command(
@@ -214,7 +227,7 @@ async def test_admin_off_clear_new_request_volatile_history_reset(tmp_path) -> N
 async def test_status_reports_master_scope_member_mode_and_features(tmp_path, monkeypatch) -> None:
     disabled_path = tmp_path / "disabled.sqlite3"
     disabled = MemoryService(enabled=False, db_path=disabled_path)
-    reply, _ = await handle_memory_command(disabled, MemoryIdentity(1, 2, "private", None, "public"), "/memory status")
+    reply, _ = await handle_memory_command(disabled, MemoryIdentity(1, 2, "private", None, "public", False, True), "/memory status")
     assert "总开关：关闭" in reply
     assert not disabled_path.exists()
 
@@ -280,7 +293,8 @@ async def test_group_clear_requires_admin_and_only_clears_target_group(tmp_path,
     other_group = GROUP_ID + 1
     monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {GROUP_ID, other_group})
     admin = _group_identity(90909, personal_admin=True)
-    regular = _group_identity(20202)
+    # 等级 2 可以操作记忆，但 group clear 仍仅限可信个人管理员
+    regular = _group_identity(20202, memory_operator=True)
     other = _group_identity(90909, group_id=other_group, personal_admin=True)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
     await service.set_group_enabled(admin, True)
@@ -303,7 +317,7 @@ async def test_group_clear_requires_admin_and_only_clears_target_group(tmp_path,
 
 @pytest.mark.asyncio
 async def test_history_pagination_has_author_time_and_no_duplicates(tmp_path) -> None:
-    identity = MemoryIdentity(10101, 20202, "private", None, "public")
+    identity = MemoryIdentity(10101, 20202, "private", None, "public", False, True)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
     await service.set_enabled(identity, True)
     for index in range(3):
