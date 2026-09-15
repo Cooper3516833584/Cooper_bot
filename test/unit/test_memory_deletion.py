@@ -15,8 +15,8 @@ def _private_identity(actor: int = 20202) -> MemoryIdentity:
     return MemoryIdentity(10101, actor, "private", None, "public")
 
 
-def _group_identity(actor: int, *, personal_admin: bool = False) -> MemoryIdentity:
-    return MemoryIdentity(10101, actor, "group", GROUP_ID, "public", personal_admin)
+def _group_identity(actor: int, *, personal_admin: bool = False, memory_operator: bool | None = None) -> MemoryIdentity:
+    return MemoryIdentity(10101, actor, "group", GROUP_ID, "public", personal_admin, personal_admin if memory_operator is None else memory_operator)
 
 
 async def _seed_derived_rows(service: MemoryService, scope_id: str, conversation_id: str, *, fact_id: str | None, job_key: str) -> None:

@@ -98,7 +98,7 @@ async def test_group_all_captures_passive_without_running_kimi_and_directed_does
     monkeypatch.setattr(commands, "_lookup_keyword_answers", lambda _text: [])
     monkeypatch.setattr(commands, "reply", _reply)
 
-    admin = MemoryIdentity(10101, 90909, "group", GROUP_ID, "public", True)
+    admin = MemoryIdentity(10101, 90909, "group", GROUP_ID, "public", True, True)
     member = MemoryIdentity(10101, 20202, "group", GROUP_ID, "public")
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
     ai = _FakeAI(service)
@@ -139,7 +139,7 @@ async def test_group_chat_is_not_captured_until_group_memory_is_on(tmp_path, mon
     monkeypatch.setattr(commands, "_lookup_keyword_answers", lambda _text: [])
     monkeypatch.setattr(commands, "reply", _reply)
 
-    admin = MemoryIdentity(10101, 90909, "group", GROUP_ID, "public", True)
+    admin = MemoryIdentity(10101, 90909, "group", GROUP_ID, "public", True, True)
     member = MemoryIdentity(10101, 20202, "group", GROUP_ID, "public")
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
     ai = _FakeAI(service)
@@ -159,9 +159,9 @@ async def test_group_chat_is_not_captured_until_group_memory_is_on(tmp_path, mon
 
 @pytest.mark.asyncio
 async def test_private_chat_is_not_captured_until_memory_on(tmp_path) -> None:
-    """默认全关：私聊要先发 /memory on 才会采集。"""
+    """默认全关：私聊要先由权限等级 2+ 发 /memory on 才会采集。"""
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
-    identity = MemoryIdentity(10101, 20202, "private", None, "public")
+    identity = MemoryIdentity(10101, 20202, "private", None, "public", False, True)
 
     assert await service.turn(identity, CapturedInput("private-off-1", "默认不该采集")) is None
     scope = await service.store.scope(scope_for(identity))

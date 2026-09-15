@@ -208,6 +208,26 @@ class MemoryStore:
 
     async def recover_incomplete_turns(self) -> None:
         await self._call(self._recover_incomplete_turns)
+    async def recover_interrupted_jobs(self) -> int:
+        """进程重启：把上次崩溃遗留下的 running 作业立即放回队列，不必等旧 lease 过期。"""
+        return await self._call(self._recover_interrupted_jobs)
+    def _recover_interrupted_jobs(self) -> int:
+        with self._c():
+            cur=self._c().execute("UPDATE memory_jobs SET state='queued',attempts=MAX(attempts-1,0),not_before=?,lease_until=NULL,last_error_code='restart_recovery' WHERE state='running'",(time.time(),))
+        return int(cur.rowcount)
+    async def active_extraction_pairs(self) -> list[tuple[str, int]]:
+        """已开启的 public scope + 其中出现过且未退出的成员，用于启动时补排事实抽取作业。"""
+        return await self._call(self._active_extraction_pairs)
+    def _active_extraction_pairs(self) -> list[tuple[str, int]]:
+        rows=self._c().execute("""SELECT DISTINCT event.scope_id,event.actor_user_id
+              FROM memory_events AS event JOIN memory_scopes AS scope ON scope.scope_id=event.scope_id
+              WHERE scope.enabled=1 AND scope.profile='public' AND event.role='user'
+                AND event.conversation_id=scope.active_conversation_id
+                AND event.source_kind IN ('direct_chat','passive_chat')
+                AND event.state IN ('completed','observed','unconfirmed')
+                AND NOT EXISTS (SELECT 1 FROM memory_members AS member WHERE member.scope_id=event.scope_id AND member.actor_user_id=event.actor_user_id AND member.enabled=0)
+              ORDER BY event.scope_id,event.actor_user_id""").fetchall()
+        return [(str(row[0]), int(row[1])) for row in rows]
     def _recover_incomplete_turns(self) -> None:
         c=self._c(); now=time.time()
         with c:
@@ -440,8 +460,10 @@ class MemoryStore:
         where="scope_id=? AND conversation_id=? AND actor_user_id=? AND role='user' AND seq>? AND source_kind IN ('direct_chat','passive_chat') AND state IN ('completed','observed','unconfirmed')"
         args=[scope_id,scope["active_conversation_id"],actor,cursor]
         if pending is not None:where+=" AND seq<?";args.append(int(pending))
-        rows=c.execute(f"SELECT seq FROM memory_events WHERE {where} ORDER BY seq",args).fetchall()
-        if len(rows)<max(1,int(min_events)):return None
+        # 固定小批次：只看 cursor 后最早的 min_events 条，够一批才建 job，避免停机很久后一次塞进模型。
+        limit=max(1,int(min_events))
+        rows=c.execute(f"SELECT seq FROM memory_events WHERE {where} ORDER BY seq LIMIT ?",(*args,limit)).fetchall()
+        if len(rows)<limit:return None
         return {"scope_id":scope_id,"conversation_id":scope["active_conversation_id"],"epoch":int(scope["epoch"]),"actor_user_id":actor,"cursor":cursor,"target_input_seq":int(rows[-1][0])}
 
     async def extraction_job_context(self, job: dict) -> dict | None:

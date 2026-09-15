@@ -14,27 +14,28 @@ from cooper_bot.modules.memory.service import MemoryService
 GROUP_ID = 30303
 
 
-def _group_identity(actor: int, *, group_id: int = GROUP_ID, admin_profile: bool = False, personal_admin: bool = False) -> MemoryIdentity:
-    return MemoryIdentity(10101, actor, "group", group_id, "admin" if admin_profile else "public", personal_admin)
+def _group_identity(actor: int, *, group_id: int = GROUP_ID, admin_profile: bool = False, personal_admin: bool = False, memory_operator: bool | None = None) -> MemoryIdentity:
+    # 现实中 level>=3 必然满足 level>=2，测试默认沿用这个关系，需要单独区分时显式传 memory_operator。
+    return MemoryIdentity(10101, actor, "group", group_id, "admin" if admin_profile else "public", personal_admin, personal_admin if memory_operator is None else memory_operator)
 
 
 @pytest.mark.asyncio
-async def test_group_scope_is_off_by_default_until_admin_enables(tmp_path) -> None:
-    """默认全关：群作用域未开启时，普通成员 /memory on 只能被告知需要管理员先开。"""
+async def test_group_scope_is_off_by_default_until_operator_enables(tmp_path) -> None:
+    """默认全关：群里 /memory on 需要权限等级 2 或以上才能开启当前群会话。"""
     member = _group_identity(20202)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
     scope_id = scope_for(member)
 
     reply, _ = await handle_memory_command(service, member, "/memory on")
-    assert "未由管理员开启" in reply
+    assert "需要权限等级 2 或以上" in reply
     scope = await service.store.scope(scope_id)
-    assert scope is not None and not bool(scope["enabled"])
+    assert scope is None or not bool(scope["enabled"])
     await service.aclose()
 
 
 @pytest.mark.asyncio
 async def test_group_member_on_off_only_affects_own_membership(tmp_path) -> None:
-    """管理员开启群会话后，普通成员 on/off 只改本人，不动群级策略。"""
+    """群会话开启后，普通成员 on/off 只改本人，不动群级策略。"""
     admin = _group_identity(90909, personal_admin=True)
     member = _group_identity(20202)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
@@ -54,17 +55,17 @@ async def test_group_member_on_off_only_affects_own_membership(tmp_path) -> None
 
 
 @pytest.mark.asyncio
-async def test_personal_admin_memory_on_enables_current_group_session(tmp_path) -> None:
-    """可信个人管理员在群里 /memory on 等价于开启当前群会话，不必再发 group on。"""
-    admin = _group_identity(90909, personal_admin=True)
+async def test_level2_memory_on_enables_current_group_session_with_all(tmp_path) -> None:
+    """等级 2 用户在群里 /memory on 会开启当前群会话，默认 capture_mode=all。"""
+    operator = _group_identity(20202, memory_operator=True)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
-    scope_id = scope_for(admin)
+    scope_id = scope_for(operator)
 
-    reply, _ = await handle_memory_command(service, admin, "/memory on")
+    reply, _ = await handle_memory_command(service, operator, "/memory on")
     assert "已开启当前作用域的记忆" in reply
     scope = await service.store.scope(scope_id)
-    assert scope is not None and bool(scope["enabled"]) and scope["capture_mode"] == "directed"
-    assert await service.store.member_enabled(scope_id, 90909) is True
+    assert scope is not None and bool(scope["enabled"]) and scope["capture_mode"] == "all"
+    assert await service.store.member_enabled(scope_id, 20202) is True
     await service.aclose()
 
 
@@ -79,7 +80,7 @@ async def test_group_off_by_admin_blocks_member_remember_and_on(tmp_path) -> Non
     reply, _ = await handle_memory_command(service, member, "/memory remember 不应写入")
     assert "未由管理员开启" in reply
     reply, _ = await handle_memory_command(service, member, "/memory on")
-    assert "未由管理员开启" in reply
+    assert "需要权限等级 2 或以上" in reply
     scope = await service.store.scope(scope_for(member))
     assert scope is not None and not bool(scope["enabled"])
     assert await service.list_facts(member) == []
@@ -189,8 +190,9 @@ async def test_group_policy_and_group_remember_require_admin_path(tmp_path) -> N
 
 @pytest.mark.asyncio
 async def test_admin_off_clear_new_request_volatile_history_reset(tmp_path) -> None:
-    identity = MemoryIdentity(10101, 90909, "private", None, "admin", True)
+    identity = MemoryIdentity(10101, 90909, "private", None, "admin", True, True)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    await service.set_enabled(identity, True)
     await service.remember_explicit(identity, "管理员显式事实")
     resets: list[str] = []
 

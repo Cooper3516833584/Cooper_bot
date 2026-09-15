@@ -10,7 +10,9 @@
 
 9563319 修复阶段 04：启动时按完整 input block 执行 raw TTL/每 scope 数量上限，只清 terminal block，不随机切断问答或删除 pending/generated 在途记录。修复阶段 04 曾把默认 master switch 改回关闭（缺陷矩阵 D15）；2026-09-14 按产品决定改为**默认开启**，口径见 `docs/memory.md` 与 `07_acceptance.md`。配置来源的 DB 路径必须位于私有 `runtime/databases` 根内，否则 fail closed 且不创建文件。显式传入 `db_path` 仅用于可信测试注入。
 
-2026-09-15 默认全关：新建作用域默认 `enabled=0`、`capture_mode='directed'`，私聊/群聊都必须显式开启（私聊 `/memory on`；群里由可信个人管理员 `/memory on` 或 `/memory group on directed|all`）。`INSERT OR IGNORE` 保证已被用户改过的作用域不受影响，`/memory off`、`/memory group off` 仍然随时生效。
+2026-09-15 默认全关 + 高流量模式：新建作用域默认 `enabled=0`、`capture_mode='directed'`，私聊/群聊都必须显式开启（`/memory on`，需要权限等级 >= 2；群里等价 `/memory group on all`）。`INSERT OR IGNORE` 保证已被用户改过的作用域不受影响，`/memory off`、`/memory group off` 仍然随时生效。重启恢复都在启动时做：`recover_interrupted_jobs()` 把上次崩溃遗留的 `running` 作业立即放回队列（`attempts` 减 1，不消耗普通重试次数），`active_extraction_pairs()` 列出已开启 scope 中的活跃成员并补排抽取作业，所以"够 200 条但没来得及 enqueue"的批次不会丢。作用域容量上限提到 20000 个输入块（配合 `AI_MEMORY_RAW_RETENTION_DAYS=30`），避免成员还没攒够 200 条就被清理。
+
+验证：`python -m pytest -q test/unit/test_memory_highflow.py`（8 passed：权限等级、remember 不绕过 on、200 条跨重启、重启补排、running 作业恢复、200 条一批、每条 200 字截断、图片默认不解析）。
 
 第二轮 R2-D01/R2-D02/R2-D05：`_Turn.abort()` 现在区分"尚未 generated"与"已经 generated"——生成前异常会把 pending 输入收尾为 `failed`，不再留下永久 pending 与永久重复事件；`__aenter__()` 用 `try/except BaseException` 包住准备阶段（锁的获取与释放用 `_lock_acquired` 记账，避免 double release），任何异常（含任务取消）都会释放 scope lock 并收尾输入。`_set_member_policy_and_invalidate` 不再执行 `DELETE FROM memory_facts WHERE scope_id=? AND source_kind!='explicit_memory'`：退出成员只停止"使用"其记忆，不再误删同 scope 其他成员的 auto facts，也不再让 extraction cursor 与已删事实脱节。该成员事实的可见性改由 `memory_members.enabled` 在查询层过滤（`list_facts`/`history`）。
 

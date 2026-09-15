@@ -2180,7 +2180,13 @@ def _memory_identity(ctx, evt: dict, *, allow_computer: bool, perm=None) -> Opti
             personal_admin = int(perm.get_level(actor)) >= 3
         except Exception:
             pass
-    return MemoryIdentity(bot_id, actor, scene, group_id, "admin" if allow_computer else "public", personal_admin)
+    memory_operator = personal_admin
+    if not memory_operator and perm is not None:
+        try:
+            memory_operator = int(perm.get_level(actor)) >= 2
+        except Exception:
+            pass
+    return MemoryIdentity(bot_id, actor, scene, group_id, "admin" if allow_computer else "public", personal_admin, memory_operator)
 
 
 def _memory_quoted_text(aisvc, session_key: Optional[str], evt: dict) -> str:

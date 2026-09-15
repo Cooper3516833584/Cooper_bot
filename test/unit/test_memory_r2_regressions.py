@@ -39,8 +39,8 @@ def _private_identity(actor: int = 20202) -> MemoryIdentity:
     return MemoryIdentity(10101, actor, "private", None, "public")
 
 
-def _group_identity(actor: int, *, personal_admin: bool = False) -> MemoryIdentity:
-    return MemoryIdentity(10101, actor, "group", GROUP_ID, "public", personal_admin)
+def _group_identity(actor: int, *, personal_admin: bool = False, memory_operator: bool | None = None) -> MemoryIdentity:
+    return MemoryIdentity(10101, actor, "group", GROUP_ID, "public", personal_admin, personal_admin if memory_operator is None else memory_operator)
 
 
 def _allow_group(monkeypatch) -> None:
@@ -497,18 +497,25 @@ async def test_r2_t10_budget_exhausted_does_not_advance_cursor(tmp_path, monkeyp
     identity = _private_identity()
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3", gateway=gateway)
     await service.set_enabled(identity, True)
-    await _complete(service, identity, "budget", "今天讨论一个临时问题")
+    target = await _complete(service, identity, "budget", "今天讨论一个临时问题")
     await _wait_for_job_attempt(service, "extract")
 
     assert await _cursor(service, identity) == 0
     assert gateway.payloads == []
     assert await service.list_facts(identity) == []
 
-    # 恢复预算后同一批事件仍能抽取，说明 cursor 没有被跳过。
+    # 预算恢复后，被推迟的作业到点即可继续（cursor 不会被跳过，也不必等新消息）。
     monkeypatch.setattr(config, "AI_MEMORY_AUTO_EXTRACT_DAILY_BUDGET", 20)
-    target = await _complete(service, identity, "budget-retry", "这是后续的正式问题")
+
+    def _make_due() -> None:
+        with service.store._c():
+            service.store._c().execute("UPDATE memory_jobs SET not_before=0 WHERE kind='extract'")
+
+    await service.store._call(_make_due)
+    service.worker.wake()
     await _wait_for_cursor(service, identity, target)
     assert gateway.payloads
+    await service.aclose()
     await service.aclose()
 
 
@@ -715,16 +722,23 @@ def _isolated_switches(overrides: dict[str, str]) -> list[bool]:
 
 @pytest.mark.skipif(not sys.executable, reason="needs an interpreter for the isolated env check")
 def test_r2_t20_defaults_match_docs_and_env_can_enable() -> None:
-    """默认全关：只有总开关开启（/memory on 需要它），三条链路默认关闭；文档口径一致。"""
-    assert _isolated_switches({}) == [True, False, False, False]
+    """高流量群默认值：总开关开、自动事实抽取开（每成员 200 条）；summary/embedding 关。"""
+    enabled, embedding, summary, auto_extract = _isolated_switches({})
+    assert (enabled, summary, embedding) == (True, False, False)
+    assert auto_extract is True
+    assert _isolated_switches({"AI_MEMORY_AUTO_EXTRACT_ENABLED": "false"})[3] is False
 
-    enabled = {name: "true" for name in (
-        "AI_MEMORY_ENABLED", "AI_MEMORY_EMBEDDING_ENABLED", "AI_MEMORY_SUMMARY_ENABLED", "AI_MEMORY_AUTO_EXTRACT_ENABLED")}
-    assert _isolated_switches(enabled) == [True, True, True, True]
+    assert config.AI_MEMORY_AUTO_EXTRACT_MIN_EVENTS == 200
+    assert config.AI_MEMORY_MAX_EVENTS_PER_SCOPE == 20000
+    assert config.AI_MEMORY_RECENT_EVENTS == 20
+    assert config.AI_MEMORY_TOP_K == 3
+    assert config.AI_MEMORY_CONTEXT_CHAR_BUDGET == 7000
+    assert config.VISION_CAPTURE_CONTEXT_IMAGES is False
 
     document = (PROJECT_ROOT / "docs" / "memory.md").read_text(encoding="utf-8")
     assert "AI_MEMORY_ENABLED=true" in document
-    for name in ("AI_MEMORY_SUMMARY_ENABLED", "AI_MEMORY_AUTO_EXTRACT_ENABLED", "AI_MEMORY_EMBEDDING_ENABLED"):
+    assert "AI_MEMORY_AUTO_EXTRACT_ENABLED=true" in document
+    for name in ("AI_MEMORY_SUMMARY_ENABLED", "AI_MEMORY_EMBEDDING_ENABLED"):
         assert f"{name}=false" in document
 
 

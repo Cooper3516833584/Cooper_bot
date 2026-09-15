@@ -8,10 +8,11 @@
 - Python / SQLite：3.13.5 / 3.49.1。
 - 默认配置（`cooper_bot/core/config.py`）：
   - `AI_MEMORY_ENABLED=true` —— 总开关保持开启，因为 `/memory on` 需要它才能工作（它本身不采集、不外发）；设为 `false` 后重启则完全不创建/不打开数据库。
-  - `AI_MEMORY_SUMMARY_ENABLED=false`、`AI_MEMORY_AUTO_EXTRACT_ENABLED=false`、`AI_MEMORY_EMBEDDING_ENABLED=false` —— **2026-09-15 按维护者要求改为默认关闭**（此前一轮的"默认开启"口径作废）。三条链路分别会把摘要 events / 待抽取 `own_text` / 事实文本发往模型网关或 embedding provider，需要时设为 `true` 后重启。
-  - `AI_MEMORY_GROUP_ALLOWLIST` 默认空 = 不限制可开启的群（哪个群真正启用仍由 `/memory group on` 决定）；显式列出群号则只有这些群能开启。
-  - 作用域默认：新建作用域即 `enabled=0`、`capture_mode='directed'`；私聊要 `/memory on`，群里要可信个人管理员 `/memory on`（或 `/memory group on directed|all`）+ 成员 `/memory on`。
-  - `AI_MEMORY_MAX_EVENTS_PER_SCOPE=3000`、`AI_MEMORY_RECENT_EVENTS=40`、`AI_MEMORY_TOP_K=6`、`AI_MEMORY_CONTEXT_CHAR_BUDGET=10000`。
+  - `AI_MEMORY_SUMMARY_ENABLED=false`、`AI_MEMORY_EMBEDDING_ENABLED=false` —— 高流量群里不做高频摘要、长期事实少所以先用词法检索；需要时设为 `true` 后重启。
+  - `AI_MEMORY_AUTO_EXTRACT_ENABLED=true`、`AI_MEMORY_AUTO_EXTRACT_MIN_EVENTS=200`（允许 1~1000）、`AI_MEMORY_AUTO_EXTRACT_DAILY_BUDGET=20` —— 2026-09-15 按高流量群要求：**按成员累计 200 条才判断一次**，每天最多 20 次；超预算用 `ExtractionDeferred` 推迟、cursor 不推进。单批只看 cursor 后最早的 200 条，每条 `own_text` 最多 200 字送模型（代码常量 `_AUTO_EXTRACT_EVENT_TEXT_CHARS`）。
+  - `AI_MEMORY_GROUP_ALLOWLIST` 默认空 = 不限制可开启的群（哪个群真正启用仍由 `/memory on` / `/memory group on` 决定）；显式列出群号则只有这些群能开启。
+  - 作用域默认：新建作用域即 `enabled=0`、`capture_mode='directed'`；`/memory on` 需要权限等级 >= 2（`MemoryIdentity.memory_operator`，与电脑控制用的 `personal_admin` 分离），群里 `/memory on` 等价 `/memory group on all`，普通成员在已开启的群里可自行 on/off。
+  - 高流量取值：`AI_MEMORY_MAX_EVENTS_PER_SCOPE=20000`、`AI_MEMORY_RECENT_EVENTS=20`、`AI_MEMORY_TOP_K=3`、`AI_MEMORY_CONTEXT_CHAR_BUDGET=7000`、`VISION_CAPTURE_CONTEXT_IMAGES=false`（普通消息图片不为记忆解析）。
   - 向量：`AI_MEMORY_EMBEDDING_MIN_SIMILARITY=0.35`、`AI_MEMORY_EMBEDDING_BATCH_SIZE=16`、`AI_MEMORY_EMBEDDING_TIMEOUT_SECONDS=30`。**embedding 没有日预算上限**（2026-09-14 按产品决定移除 `AI_MEMORY_EMBEDDING_DAILY_BUDGET`）。
 - 执行前仓库已有未跟踪 `runtime/`，未覆盖或清理。测试临时目录 `.pytest_tmp` 曾 ACL 异常（`Get-Acl`/`ls` 均被拒绝），已重命名为 `.pytest_tmp_broken_20260914` 让 pytest 重建；未删除任何用户数据。
 
@@ -189,3 +190,11 @@ embedding provider：**已实测**（2026-09-14，用户授权联网）。`tools
 建议按 05 号文档进入**第一阶段**小流量灰度：`AI_MEMORY_ENABLED=true`、`AI_MEMORY_SUMMARY_ENABLED=false`、`AI_MEMORY_AUTO_EXTRACT_ENABLED=false`、`AI_MEMORY_EMBEDDING_ENABLED=false`，先验证近期持久历史、explicit remember、off / clear / new 与 admin 电脑操作；随后依次放开 summary、auto facts，最后才考虑 embedding。
 
 但必须明确：本轮结论全部来自 fake provider 与单进程自动测试，真实 QQ / Kimi / DeepSeek / embedding provider 与生产回滚均为 NOT RUN，因此上述建议是"可以开始小流量验证"，**不是"已验证可上线"**。
+
+### 2026-09-15 高流量群聊配置（第五轮）
+
+- 新作用域仍默认关闭；`/memory on` 需要权限等级 >= 2（新增 `MemoryIdentity.memory_operator`，与电脑控制用的 `personal_admin` 分离，level >= 3 仍同时是 `personal_admin`）。群里 `/memory on` 等价 `/memory group on all`；群会话已开启时普通成员仍可自行 on/off；`/memory remember` 不再自动打开会话。
+- 事实抽取按成员累计 200 条一次、单批最多 200 条、每条 `own_text` 最多 200 字、每天最多 20 次；摘要与 embedding 保持默认关闭；回复上下文收到 `AI_MEMORY_RECENT_EVENTS=20`、`AI_MEMORY_TOP_K=3`、`AI_MEMORY_CONTEXT_CHAR_BUDGET=7000`；`AI_MEMORY_MAX_EVENTS_PER_SCOPE=20000`；`VISION_CAPTURE_CONTEXT_IMAGES=false`。
+- 重启恢复：`recover_interrupted_jobs()`（`running` → `queued`，`attempts` 减 1，不等旧 lease）+ `active_extraction_pairs()` 启动补排，覆盖"够 200 条但崩溃前没 enqueue"的窗口。
+- 验证：`python -m pytest -q test/unit/test_memory_highflow.py`（8 passed：权限等级、remember 不绕过、200 条跨重启、重启补排、running 作业恢复、200 条一批、每条 200 字截断、图片默认不解析）；memory 相关测试全绿；全量 `python -m pytest test` 仍有 1 个与 memory 无关的既有失败（`test_vision_skill.py::test_resolve_image_ready`，1600 vs 800）。
+- 未执行：真实 QQ 群高流量、真实 DeepSeek / embedding 调用、生产灰度与回滚 —— NOT RUN。

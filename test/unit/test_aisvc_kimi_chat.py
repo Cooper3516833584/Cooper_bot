@@ -113,6 +113,7 @@ async def test_admin_memory_uses_and_saves_volatile_history_with_explicit_facts(
     svc.memory = MemoryService(enabled=True, db_path=db_path)
     _patch_settings_validation(monkeypatch)
     identity = MemoryIdentity(10101, 900001, "private", None, "admin", True)
+    await svc.memory.set_enabled(identity, True)
     await svc.memory.remember_explicit(identity, "偏好简短回答")
 
     first = await svc.memory.turn(identity, CapturedInput("admin-1", "first", source_kind="request_metadata"))
@@ -194,8 +195,8 @@ async def test_public_memory_prompt_excludes_cross_scope_and_opted_out_content(t
     group_a, group_b = 30303, 30304
     monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {group_a, group_b})
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
-    admin_a = MemoryIdentity(10101, 90909, "group", group_a, "public", True)
-    admin_b = MemoryIdentity(10101, 90909, "group", group_b, "public", True)
+    admin_a = MemoryIdentity(10101, 90909, "group", group_a, "public", True, True)
+    admin_b = MemoryIdentity(10101, 90909, "group", group_b, "public", True, True)
     opted_out = MemoryIdentity(10101, 20201, "group", group_a, "public")
     cross_scope = MemoryIdentity(10101, 20202, "group", group_b, "public")
     current_actor = MemoryIdentity(10101, 20203, "group", group_a, "public")

@@ -12,6 +12,8 @@ class MemoryIdentity:
     group_id: int | None
     profile: Literal["public", "admin"]
     personal_admin: bool = False
+    # 权限等级 >= 2：可以 /memory on 打开当前会话（与 personal_admin 的电脑控制权限分离）。
+    memory_operator: bool = False
 
 
 @dataclass(frozen=True)
