@@ -435,7 +435,8 @@ class MemoryService:
         if not candidate:return
         key=f"extract:{scope_id}:{actor}:{candidate['epoch']}:{candidate['cursor']}:{candidate['target_input_seq']}"
         payload={"actor_user_id":actor,"cursor":candidate["cursor"]}
-        await self.worker.enqueue(scope_id,candidate["conversation_id"],candidate["epoch"],"extract",candidate["target_input_seq"],payload,key)
+        # 这批之前重试耗尽变成 failed 的话，这里把它重新激活（新消息与启动补排都走这条路径）。
+        await self.worker.enqueue(scope_id,candidate["conversation_id"],candidate["epoch"],"extract",candidate["target_input_seq"],payload,key,revive_failed=True)
     async def _maybe_schedule_embedding(self, scope_id: str, *, after_fact_id: str = "") -> None:
         if not self._embedding_ready() or self.worker is None:return
         fingerprint=self._embedding_fingerprint()

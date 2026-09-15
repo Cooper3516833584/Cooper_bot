@@ -234,3 +234,136 @@ def test_passive_images_are_not_resolved_for_memory() -> None:
     # 只有已经解析好的 ready 描述才会进 memory；未解析的 slot 不产生 visual_text
     assert commands._memory_visual_text([{"status": "unresolved", "description": "不应保存"}]) == ""
     assert commands._memory_visual_text([{"status": "ready", "description": "图片里是一只猫"}]) == "图片里是一只猫"
+
+
+# ------------------------------------------------- failed extraction job 可恢复
+
+
+class _FlakyGateway:
+    """先抛异常、之后恢复：模拟 provider 连续普通异常后重试耗尽。"""
+
+    def __init__(self) -> None:
+        self.fail = True
+        self.payloads: list[dict] = []
+
+    def chat(self, messages, **_kwargs) -> str:
+        payload = json.loads(messages[1]["content"])
+        if self.fail:
+            raise TimeoutError("provider down")
+        self.payloads.append(payload)
+        return json.dumps({"schema_version": 1, "facts": []}, ensure_ascii=False)
+
+
+async def _job(store: MemoryStore, dedupe_key: str) -> dict | None:
+    def _row():
+        row = store._c().execute("SELECT * FROM memory_jobs WHERE dedupe_key=?", (dedupe_key,)).fetchone()
+        return dict(row) if row else None
+
+    return await store._call(_row)
+
+
+async def _job_count(store: MemoryStore, dedupe_key: str) -> int:
+    def _count() -> int:
+        return int(store._c().execute("SELECT COUNT(*) FROM memory_jobs WHERE dedupe_key=?", (dedupe_key,)).fetchone()[0])
+
+    return int(await store._call(_count))
+
+
+@pytest.mark.asyncio
+async def test_failed_extraction_job_can_be_enqueued_again(tmp_path) -> None:
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    await store.start()
+    key = "extract:scope:20202:0:1000:1200"
+    await store.enqueue_job("scope", "conv", 0, "extract", 1200, {"actor_user_id": 20202, "cursor": 1000}, key, revive_failed=True)
+
+    claimed = await store.claim_job()
+    assert claimed is not None
+    await store.finish_job(claimed["job_id"], False, "TimeoutError", max_attempts=1)
+    assert (await _job(store, key))["state"] == "failed"
+
+    # 同一批再次被发现：failed 的旧作业被重新激活，不必等 cursor 变化
+    await store.enqueue_job("scope", "conv", 0, "extract", 1200, {"actor_user_id": 20202, "cursor": 1000}, key, revive_failed=True)
+    row = await _job(store, key)
+    assert row["state"] == "queued"
+    assert int(row["attempts"]) == 0
+    assert row["lease_until"] is None
+    assert row["last_error_code"] is None
+    assert float(row["not_before"]) <= time.time()
+    assert await _job_count(store, key) == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_does_not_duplicate_queued_or_running_jobs(tmp_path) -> None:
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    await store.start()
+    key = "extract:scope:20202:0:1000:1200"
+    await store.enqueue_job("scope", "conv", 0, "extract", 1200, {}, key, revive_failed=True)
+    await store.enqueue_job("scope", "conv", 0, "extract", 1200, {}, key, revive_failed=True)
+    row = await _job(store, key)
+    assert row["state"] == "queued" and int(row["attempts"]) == 0
+    assert await _job_count(store, key) == 1
+
+    claimed = await store.claim_job(lease_seconds=120)
+    assert claimed is not None and claimed["dedupe_key"] == key and claimed["state"] == "running"
+    await store.enqueue_job("scope", "conv", 0, "extract", 1200, {}, key, revive_failed=True)
+    row = await _job(store, key)
+    assert row["state"] == "running"
+    assert int(row["attempts"]) == 1
+    assert row["lease_until"] is not None
+    assert await _job_count(store, key) == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_succeeded_job_is_never_revived(tmp_path) -> None:
+    store = MemoryStore(tmp_path / "memory.sqlite3")
+    await store.start()
+    key = "extract:scope:20202:0:1000:1200"
+    await store.enqueue_job("scope", "conv", 0, "extract", 1200, {}, key, revive_failed=True)
+    claimed = await store.claim_job()
+    assert claimed is not None
+    await store.finish_job(claimed["job_id"], True)
+    assert (await _job(store, key))["state"] == "succeeded"
+
+    await store.enqueue_job("scope", "conv", 0, "extract", 1200, {}, key, revive_failed=True)
+    assert (await _job(store, key))["state"] == "succeeded"
+    assert await _job_count(store, key) == 1
+
+    # 默认不开复活：其它 kind（例如 summary）的 failed 保持原样
+    other = "summary:scope:conv:0:1"
+    await store.enqueue_job("scope", "conv", 0, "summary", 1, {}, other)
+    claimed = await store.claim_job()
+    assert claimed is not None and claimed["dedupe_key"] == other
+    await store.finish_job(claimed["job_id"], False, "ValueError", max_attempts=1)
+    await store.enqueue_job("scope", "conv", 0, "summary", 1, {}, other)
+    assert (await _job(store, other))["state"] == "failed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_service_revives_a_failed_batch_when_it_is_rediscovered(tmp_path) -> None:
+    """provider 恢复后，只要系统再次发现这批 candidate（新消息或重启），failed 作业就会重新排上。"""
+    db_path = tmp_path / "memory.sqlite3"
+    scope_id = await _seed_group_scope(db_path, events=200)
+    gateway = _FlakyGateway()
+    service = MemoryService(enabled=True, db_path=db_path, gateway=gateway)
+    await service.start()  # 启动补排会建 job，但因为 provider 异常而失败
+
+    def _force_failed() -> None:
+        with service.store._c():
+            service.store._c().execute("UPDATE memory_jobs SET state='failed',attempts=3,last_error_code='TimeoutError' WHERE kind='extract'")
+
+    await service.store._call(_force_failed)
+
+    def _state() -> str:
+        row = service.store._c().execute("SELECT state FROM memory_jobs WHERE kind='extract'").fetchone()
+        return str(row[0]) if row else ""
+
+    assert await service.store._call(_state) == "failed"
+
+    gateway.fail = False  # provider 恢复；此后只有“重新发现这批”才会让它再跑起来
+    await service._maybe_schedule_extraction(scope_id, 20202)
+    await _wait_for_cursor(service, scope_id, 20202, 200)
+    assert gateway.payloads
+    await service.aclose()

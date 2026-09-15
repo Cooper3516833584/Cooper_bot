@@ -577,10 +577,17 @@ class MemoryStore:
         with c:c.execute("INSERT INTO memory_usage_daily(day_key,kind,attempts,updated_at) VALUES(?,?,1,?) ON CONFLICT(day_key,kind) DO UPDATE SET attempts=attempts+1,updated_at=excluded.updated_at",(day,kind,now))
         return True
 
-    async def enqueue_job(self, scope_id: str, conversation_id: str, epoch: int, kind: str, target: int, payload: dict, dedupe_key: str, *, base_version: int=0) -> None:
-        await self._call(self._enqueue_job, scope_id, conversation_id, epoch, kind, target, payload, dedupe_key, base_version)
-    def _enqueue_job(self, scope_id, cid, epoch, kind, target, payload, key, base_version):
-        with self._c(): self._c().execute("INSERT OR IGNORE INTO memory_jobs(job_id,scope_id,conversation_id,epoch,kind,target_input_seq,payload_json,state,base_version,not_before,dedupe_key) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)", (uuid.uuid4().hex,scope_id,cid,epoch,kind,target,json.dumps(payload,ensure_ascii=False),base_version,time.time(),key))
+    async def enqueue_job(self, scope_id: str, conversation_id: str, epoch: int, kind: str, target: int, payload: dict, dedupe_key: str, *, base_version: int=0, revive_failed: bool=False) -> None:
+        await self._call(self._enqueue_job, scope_id, conversation_id, epoch, kind, target, payload, dedupe_key, base_version, revive_failed)
+    def _enqueue_job(self, scope_id, cid, epoch, kind, target, payload, key, base_version, revive_failed=False):
+        c=self._c();now=time.time()
+        with c:
+            cur=c.execute("INSERT OR IGNORE INTO memory_jobs(job_id,scope_id,conversation_id,epoch,kind,target_input_seq,payload_json,state,base_version,not_before,dedupe_key) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)", (uuid.uuid4().hex,scope_id,cid,epoch,kind,target,json.dumps(payload,ensure_ascii=False),base_version,now,key))
+            if revive_failed and not cur.rowcount:
+                # 同一批普通重试耗尽后成了 failed，再次发现它仍需要处理时直接复活，
+                # 否则 dedupe key 被占住会让该成员的 extraction cursor 永久卡住。
+                # queued / running / succeeded 一律保持原状（succeeded 表示这批已经处理完，不能重跑）。
+                c.execute("UPDATE memory_jobs SET state='queued',attempts=0,not_before=?,lease_until=NULL,last_error_code=NULL WHERE dedupe_key=? AND state='failed'",(now,key))
     async def requeue_job(self, scope_id: str, conversation_id: str, epoch: int, kind: str, target: int, payload: dict, dedupe_key: str, *, base_version: int=0) -> None:
         """INSERT OR UPDATE：同一 dedupe_key 的作业重新排队（回填触发必须可重复）。
 

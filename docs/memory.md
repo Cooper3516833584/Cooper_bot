@@ -16,4 +16,4 @@
 
 `AI_MEMORY_SUMMARY_ENABLED=false`（高流量群里不做高频摘要）。`AI_MEMORY_AUTO_EXTRACT_ENABLED=true`：按成员累计 `AI_MEMORY_AUTO_EXTRACT_MIN_EVENTS=200` 条新消息才批量判断一次长期事实，每次只看 `cursor` 之后最早的 200 条（一条不落，也不会一次把几千条塞给模型），每条 `own_text` 最多截断 200 字送模型；每天最多 `AI_MEMORY_AUTO_EXTRACT_DAILY_BUDGET=20` 次，超了就把作业推迟一小时再试、cursor 不推进。这两条链路会把记忆内容发往模型网关，`/memory off` 的成员内容不会进入。普通群消息的图片不会为了记忆额外调用视觉模型（`VISION_CAPTURE_CONTEXT_IMAGES=false`）：只有消息真正触发回复时才解析图片，并把已经得到的解析结果随该轮一起写入 `visual_text`。
 
-重启恢复：已开启的会话保持开启（状态存在 SQLite），已保存的聊天不丢，成员抽取游标 `extracted_through_input_seq` 不清零；启动时会把上次崩溃遗留的 `running` 作业立即放回队列（不等旧 lease 过期），并扫一遍已开启 scope 中活跃成员，把"已经够 200 条但崩溃前没来得及排队"的抽取补上。
+重启恢复：已开启的会话保持开启（状态存在 SQLite），已保存的聊天不丢，成员抽取游标 `extracted_through_input_seq` 不清零；启动时会把上次崩溃遗留的 `running` 作业立即放回队列（不等旧 lease 过期），并扫一遍已开启 scope 中活跃成员，把"已经够 200 条但崩溃前没来得及排队"的抽取补上。某批因为普通异常把重试次数用尽变成 `failed` 后，只要系统再次发现这同一批（成员发了新消息，或 Bot 重启触发补排）就会把这条 job 重新激活（`attempts` 归零、清 lease 与错误码），因此不会永久堵住 cursor；`succeeded` 的批不会被重跑。
