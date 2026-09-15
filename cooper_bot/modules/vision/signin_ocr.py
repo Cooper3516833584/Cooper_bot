@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
 import argparse
-import itertools
 import math
 import re
+import shutil
+import subprocess
 import time as time_module
 from typing import Iterable, Optional
 
@@ -20,30 +21,6 @@ _RED_THRESHOLDS = (
     (80, 80),
     (60, 60),
 )
-
-_SEGMENT_PATTERNS = {
-    0: set("abcdef"),
-    1: set("bc"),
-    2: set("abged"),
-    3: set("abgcd"),
-    4: set("fgbc"),
-    5: set("afgcd"),
-    6: set("afgecd"),
-    7: set("abc"),
-    8: set("abcdefg"),
-    9: set("abfgcd"),
-}
-
-_SEGMENT_ZONES = {
-    "a": (0.22, 0.02, 0.78, 0.16),
-    "g": (0.22, 0.43, 0.78, 0.57),
-    "d": (0.22, 0.84, 0.78, 0.98),
-    "f": (0.02, 0.14, 0.25, 0.44),
-    "b": (0.75, 0.14, 0.98, 0.44),
-    "e": (0.02, 0.56, 0.25, 0.86),
-    "c": (0.75, 0.56, 0.98, 0.86),
-}
-
 
 @dataclass(frozen=True)
 class SigninOcrResult:
@@ -107,6 +84,57 @@ def recognize_led_time_from_path(path: str | Path) -> SigninOcrResult:
     )
 
 
+def _find_ssocr_executable() -> Optional[str]:
+    return shutil.which("ssocr") or shutil.which("ssocr.exe")
+
+
+def _parse_ssocr_time_text(text: str) -> Optional[str]:
+    digits = "".join(re.findall(r"\d", str(text or "").strip()))
+    if len(digits) != 6 or not _valid_hhmmss_digits(digits):
+        return None
+    return f"{digits[:2]}:{digits[2:4]}:{digits[4:6]}"
+
+
+def _run_ssocr(mask: np.ndarray, executable: str) -> Optional[str]:
+    if not isinstance(mask, np.ndarray) or mask.dtype != np.uint8 or mask.ndim != 2 or mask.size == 0:
+        return None
+    try:
+        ok, encoded = cv2.imencode(".png", mask)
+    except cv2.error:
+        return None
+    if not ok:
+        return None
+
+    args = [
+        executable,
+        "-d", "6",
+        "-c", "digits",
+        "-f", "white",
+        "-b", "black",
+        "-a",
+        "-t", "50",
+        "-C",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(
+            args,
+            input=encoded.tobytes(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2.0,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    if completed.returncode != 0:
+        return None
+    stdout = completed.stdout
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    return _parse_ssocr_time_text(str(stdout))
+
+
 def _red_mask_hsv(img: np.ndarray, sat_min: int, val_min: int) -> np.ndarray:
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     lower1 = np.array([0, sat_min, val_min], dtype=np.uint8)
@@ -126,7 +154,6 @@ def _has_led_red_candidate(img: np.ndarray) -> bool:
 
 
 def _recognize_visual_time(img: np.ndarray) -> SigninOcrResult:
-    candidates: list[_ParsedCandidate] = []
     panel_ocr_boxes: list[tuple[float, tuple[int, int, int, int]]] = []
     red_ocr_boxes: list[tuple[float, tuple[int, int, int, int]]] = []
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -134,35 +161,25 @@ def _recognize_visual_time(img: np.ndarray) -> SigninOcrResult:
 
     panel_boxes = _black_panel_frame_candidate_boxes(img, gray, panel_mask)[:3]
     for panel_score, panel_box in panel_boxes:
-        for sat_min, val_min in _RED_THRESHOLDS:
-            mask = panel_mask if (sat_min, val_min) == (80, 80) else _red_mask_hsv(img, sat_min, val_min)
-            candidate = _parse_panel_candidate_mask(mask, panel_box, panel_score)
-            if candidate is not None:
-                candidates.append(candidate)
         panel_ocr_boxes.append((panel_score + 1.2, panel_box))
 
     for sat_min, val_min in _RED_THRESHOLDS:
         mask = _red_mask_hsv(img, sat_min, val_min)
         for box in _candidate_boxes_from_mask(mask):
             box_score = _score_candidate_box(img, gray, mask, box)
-            candidate = _parse_candidate_mask(mask, box, box_score)
-            if candidate is not None:
-                candidates.append(candidate)
             if box_score >= 1.15:
                 red_ocr_boxes.append((box_score, box))
 
-    best = _select_consensus_candidate(candidates)
-    if best is not None and best.confidence >= 0.90:
+    ssocr_boxes = panel_ocr_boxes[:2] + red_ocr_boxes[:4]
+    best = _select_consensus_candidate(_recognize_ssocr_candidates(img, ssocr_boxes))
+    if best is not None:
         return SigninOcrResult(best.time_text, best.confidence, "visual", best.reason)
-    if best is None or best.confidence < 0.40 or best.score < -3.0:
-        ocr_boxes = red_ocr_boxes
-    else:
-        ocr_boxes = panel_ocr_boxes[:1] + red_ocr_boxes[:1]
-    if ocr_boxes:
-        candidates.extend(_recognize_ocr_candidates(img, ocr_boxes))
-        best = _select_consensus_candidate(candidates)
 
-    if best is not None and best.score >= -3.0:
+    ocr_boxes = panel_ocr_boxes + red_ocr_boxes
+    if ocr_boxes:
+        best = _select_consensus_candidate(_recognize_ocr_candidates(img, ocr_boxes))
+
+    if best is not None:
         return SigninOcrResult(best.time_text, best.confidence, "visual", best.reason)
     return SigninOcrResult(None, 0.0, "visual", "no_valid_led_time")
 
@@ -445,51 +462,6 @@ def _box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> floa
     return float(inter) / float(union or 1)
 
 
-def _parse_candidate_mask(mask: np.ndarray, box: tuple[int, int, int, int], box_score: float = 0.0) -> Optional[_ParsedCandidate]:
-    x, y, w, h = box
-    crop = mask[y : y + h, x : x + w]
-    if cv2.countNonZero(crop) < 80:
-        return None
-
-    best: Optional[_ParsedCandidate] = None
-    tight_crop = _trim_red_crop(crop)
-    for variant in (tight_crop, _deskew_red_crop(tight_crop), crop, _deskew_red_crop(crop)):
-        if cv2.countNonZero(variant) < 80:
-            continue
-        for digit_width_factor in (0.55, 0.62, 0.68, 0.75, 0.82):
-            windows = _digit_windows_from_crop(variant, digit_width_factor)
-            if len(windows) != 6:
-                continue
-            picked = _pick_valid_time(variant, windows)
-            if picked is None:
-                continue
-            raw, digit_score = picked
-            score = digit_score + box_score * 0.10
-            confidence = _score_to_confidence(score)
-            candidate = _ParsedCandidate(f"{raw[0:2]}:{raw[2:4]}:{raw[4:6]}", confidence, score)
-            if best is None or candidate.score > best.score:
-                best = candidate
-    return best
-
-
-def _parse_panel_candidate_mask(
-    mask: np.ndarray,
-    box: tuple[int, int, int, int],
-    box_score: float = 0.0,
-) -> Optional[_ParsedCandidate]:
-    x, y, w, h = box
-    crop = mask[y : y + h, x : x + w]
-    if cv2.countNonZero(crop) < 80:
-        return None
-
-    best = _parse_candidate_mask(mask, box, box_score)
-    for led_box in _candidate_boxes_from_mask(crop):
-        candidate = _parse_candidate_mask(crop, led_box, box_score + 0.4)
-        if candidate is not None and (best is None or candidate.score > best.score):
-            best = candidate
-    return best
-
-
 def _trim_red_crop(crop: np.ndarray, pad_ratio: float = 0.08) -> np.ndarray:
     ys, xs = np.where(crop > 0)
     if len(xs) < 20:
@@ -528,129 +500,54 @@ def _deskew_red_crop(crop: np.ndarray) -> np.ndarray:
     return rotated[ys2.min() : ys2.max() + 1, xs2.min() : xs2.max() + 1]
 
 
-def _digit_windows_from_crop(crop: np.ndarray, digit_width_factor: float = 0.68) -> list[tuple[int, int, int, int]]:
-    height, width = crop.shape[:2]
+def _prepare_ssocr_mask(mask: np.ndarray) -> Optional[np.ndarray]:
+    if not isinstance(mask, np.ndarray) or mask.ndim != 2 or mask.size == 0:
+        return None
+    normalized = np.where(mask > 0, 255, 0).astype(np.uint8)
+    trimmed = _trim_red_crop(normalized)
+    if trimmed.size == 0 or cv2.countNonZero(trimmed) < 20:
+        return None
+    height, width = trimmed.shape[:2]
     if height <= 0 or width <= 0:
+        return None
+    if height < 120:
+        scale = 120.0 / float(height)
+        trimmed = cv2.resize(
+            trimmed,
+            (max(1, int(round(width * scale))), 120),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    pad = max(4, int(round(trimmed.shape[0] * 0.05)))
+    return cv2.copyMakeBorder(trimmed, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+
+
+def _ssocr_mask_variants(img: np.ndarray, box: tuple[int, int, int, int]) -> list[tuple[str, np.ndarray]]:
+    if not isinstance(img, np.ndarray) or img.ndim != 3 or img.size == 0:
+        return []
+    x, y, w, h = box
+    if w <= 0 or h <= 0:
+        return []
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
+    crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
         return []
 
-    col = (crop > 0).sum(axis=0)
-    min_col = max(1, int(round(height * 0.015)))
-    runs: list[tuple[int, int, int, int]] = []
-    start: Optional[int] = None
-    for idx, value in enumerate(col):
-        active = int(value) >= min_col
-        if active and start is None:
-            start = idx
-        if (not active or idx == width - 1) and start is not None:
-            end = idx if not active else idx + 1
-            area = int(col[start:end].sum())
-            max_col = int(col[start:end].max()) if end > start else 0
-            if area >= max(8, int(height * 0.20)):
-                runs.append((start, end, area, max_col))
-            start = None
-
-    merged: list[tuple[int, int, int, int]] = []
-    for run in runs:
-        if merged and run[0] - merged[-1][1] <= 1:
-            old_start, _old_end, old_area, old_max = merged[-1]
-            merged[-1] = (old_start, run[1], old_area + run[2], max(old_max, run[3]))
-        else:
-            merged.append(run)
-
-    expected_w = max(8.0, float(height) * digit_width_factor)
-    windows: list[tuple[int, int, int, int]] = []
-    for x1, x2, _area, max_col in merged:
-        run_w = x2 - x1
-        if run_w < expected_w * 0.28 and max_col < height * 0.55:
+    red_80 = _red_mask_hsv(crop, 80, 80)
+    raw_variants = (
+        ("ssocr_red_80", red_80),
+        ("ssocr_red_80_deskew", _deskew_red_crop(red_80)),
+        ("ssocr_red_60", _red_mask_hsv(crop, 60, 60)),
+    )
+    variants: list[tuple[str, np.ndarray]] = []
+    for name, raw_mask in raw_variants:
+        prepared = _prepare_ssocr_mask(raw_mask)
+        if prepared is None:
             continue
-        if run_w < expected_w * 1.55:
-            parts = 1
-        else:
-            parts = max(2, min(4, int(round(float(run_w) / expected_w))))
-        for idx in range(parts):
-            part_x1 = int(round(x1 + idx * run_w / parts))
-            part_x2 = int(round(x1 + (idx + 1) * run_w / parts))
-            pad = max(1, int(round(height * 0.03)))
-            wx1 = max(0, part_x1 - pad)
-            wx2 = min(width, part_x2 + pad)
-            if wx2 > wx1:
-                windows.append((wx1, 0, wx2 - wx1, height))
-
-    return windows
-
-
-def _classify_digit(win: np.ndarray) -> tuple[int, float]:
-    ranks = _rank_digit(win)
-    return ranks[0] if ranks else (0, -9.0)
-
-
-def _rank_digit(win: np.ndarray) -> list[tuple[int, float]]:
-    if win.size == 0:
-        return [(0, -9.0)]
-    active_mask = win > 0
-    ys, xs = np.where(active_mask)
-    if len(xs) == 0:
-        return [(0, -9.0)]
-    x1, x2 = int(xs.min()), int(xs.max()) + 1
-    y1, y2 = int(ys.min()), int(ys.max()) + 1
-    pad_x = max(1, int(round((x2 - x1) * 0.08)))
-    pad_y = max(1, int(round((y2 - y1) * 0.08)))
-    x1 = max(0, x1 - pad_x)
-    x2 = min(active_mask.shape[1], x2 + pad_x)
-    y1 = max(0, y1 - pad_y)
-    y2 = min(active_mask.shape[0], y2 + pad_y)
-    active_mask = active_mask[y1:y2, x1:x2]
-    ys, xs = np.where(active_mask)
-    if len(xs) == 0:
-        return [(0, -9.0)]
-    height, width = active_mask.shape
-
-    fg_w = int(xs.max() - xs.min() + 1)
-    fg_h = int(ys.max() - ys.min() + 1)
-    if float(fg_w) / float(max(fg_h, 1)) < 0.42:
-        return [(1, 0.10), (7, -2.20), (4, -2.50)]
-
-    vals = {}
-    for name, (x1, y1, x2, y2) in _SEGMENT_ZONES.items():
-        xx1 = int(round(x1 * width))
-        xx2 = max(xx1 + 1, int(round(x2 * width)))
-        yy1 = int(round(y1 * height))
-        yy2 = max(yy1 + 1, int(round(y2 * height)))
-        region = active_mask[yy1:min(yy2, height), xx1:min(xx2, width)]
-        vals[name] = float(region.mean()) if region.size else 0.0
-
-    max_val = max(vals.values()) if vals else 0.0
-    threshold = max(0.18, max_val * 0.55)
-    active = {name for name, val in vals.items() if val >= threshold}
-
-    ranks: list[tuple[int, float]] = []
-    all_segments = set("abcdefg")
-    for digit, pattern in _SEGMENT_PATTERNS.items():
-        misses = len(pattern - active)
-        extras = len(active - pattern)
-        score = -(1.40 * misses + 0.65 * extras)
-        score += 0.08 * sum(vals[k] for k in pattern)
-        score -= 0.08 * sum(vals[k] for k in all_segments - pattern)
-        ranks.append((digit, score))
-    return sorted(ranks, key=lambda item: item[1], reverse=True)[:5]
-
-
-def _pick_valid_time(crop: np.ndarray, windows: list[tuple[int, int, int, int]]) -> Optional[tuple[str, float]]:
-    ranks = []
-    for wx, wy, ww, wh in windows:
-        ranks.append(_rank_digit(crop[wy : wy + wh, wx : wx + ww]))
-    if len(ranks) != 6 or any(not rank for rank in ranks):
-        return None
-
-    best: Optional[tuple[str, float]] = None
-    for combo in itertools.product(*ranks):
-        raw = "".join(str(digit) for digit, _score in combo)
-        if not _valid_hhmmss_digits(raw):
+        if any(prepared.shape == old_mask.shape and np.array_equal(prepared, old_mask) for _old_name, old_mask in variants):
             continue
-        score = float(sum(score for _digit, score in combo))
-        if best is None or score > best[1]:
-            best = (raw, score)
-    return best
+        variants.append((name, prepared))
+    return variants
 
 
 def _score_to_confidence(score: float) -> float:
@@ -716,6 +613,37 @@ def _recognize_ocr_candidates(
                     confidence = max(0.0, min(0.95, 0.50 + ocr_conf * 0.45 + box_score * 0.03))
                     candidates.append(_ParsedCandidate(parsed, confidence, score, reason))
                     accepted_for_box = True
+    return candidates
+
+
+def _recognize_ssocr_candidates(
+    img: np.ndarray,
+    scored_boxes: list[tuple[float, tuple[int, int, int, int]]],
+) -> list[_ParsedCandidate]:
+    executable = _find_ssocr_executable()
+    if not executable:
+        return []
+
+    boxes: list[tuple[float, tuple[int, int, int, int]]] = []
+    for score, box in sorted(scored_boxes, key=lambda item: item[0], reverse=True):
+        if any(_box_iou(box, old_box) >= 0.72 for _old_score, old_box in boxes):
+            continue
+        boxes.append((score, box))
+        if len(boxes) >= 4:
+            break
+
+    variant_bonus = {
+        "ssocr_red_80": 0.15,
+        "ssocr_red_80_deskew": 0.10,
+        "ssocr_red_60": 0.05,
+    }
+    candidates: list[_ParsedCandidate] = []
+    for box_score, box in boxes:
+        for variant_name, mask in _ssocr_mask_variants(img, box):
+            parsed = _run_ssocr(mask, executable)
+            if parsed:
+                score = 2.5 + box_score * 0.20 + variant_bonus.get(variant_name, 0.0)
+                candidates.append(_ParsedCandidate(parsed, 0.92, score, variant_name))
     return candidates
 
 
