@@ -321,11 +321,16 @@ class MemoryStore:
     async def facts_missing_embeddings(self, scope_id: str, fingerprint: str, limit: int, after_fact_id: str = "") -> list[dict]:
         return await self._call(self._facts_missing_embeddings, scope_id, fingerprint, limit, after_fact_id)
     def _facts_missing_embeddings(self,scope_id,fingerprint,limit,after_fact_id):
+        # 查询阶段先排除不该处理的 fact（失效/过期/成员已 opt-out/已有当前向量），
+        # 避免队头全是 opt-out 事实时后面的正常 fact 永远轮不到回填；
+        # provider 调用前 service 层仍会逐条复查，覆盖查询之后突然 /memory off 的竞态。
         q="""SELECT fact.fact_id,fact.subject_id,fact.revision,fact.text FROM memory_facts AS fact
              WHERE fact.scope_id=? AND fact.status='active' AND fact.fact_id>?
+               AND (fact.expires_at IS NULL OR fact.expires_at>?)
                AND NOT EXISTS (SELECT 1 FROM memory_embeddings AS embedding WHERE embedding.fact_id=fact.fact_id AND embedding.fingerprint=? AND embedding.fact_revision=fact.revision)
+               AND NOT EXISTS (SELECT 1 FROM memory_members AS member WHERE member.scope_id=fact.scope_id AND member.enabled=0 AND fact.subject_id='user:'||member.actor_user_id)
              ORDER BY fact.fact_id LIMIT ?"""
-        return [dict(x) for x in self._c().execute(q,(scope_id,str(after_fact_id or ""),fingerprint,max(1,int(limit)))).fetchall()]
+        return [dict(x) for x in self._c().execute(q,(scope_id,str(after_fact_id or ""),time.time(),fingerprint,max(1,int(limit)))).fetchall()]
 
     async def prune_stale_embeddings(self, scope_id: str) -> int:
         return await self._call(self._prune_stale_embeddings, scope_id)
@@ -580,6 +585,11 @@ class MemoryStore:
         elif int(row["attempts"])>=max(1,int(max_attempts)):state="failed";not_before=time.time()
         else:state="queued";not_before=time.time()+min(300,2**int(row["attempts"]))
         with c:c.execute("UPDATE memory_jobs SET state=?,not_before=?,lease_until=NULL,last_error_code=? WHERE job_id=? AND state='running'",(state,not_before,error[:80],job_id))
+    async def defer_job(self, job_id: str, delay_seconds: float) -> None: await self._call(self._defer_job,job_id,delay_seconds)
+    def _defer_job(self,job_id,delay_seconds):
+        """把作业推迟到 not_before 再跑：attempts 清零，不占用普通 max_attempts，也不会变成 failed。"""
+        with self._c():
+            self._c().execute("UPDATE memory_jobs SET state='queued',attempts=0,not_before=?,lease_until=NULL,last_error_code='deferred' WHERE job_id=? AND state='running'",(time.time()+max(0.0,float(delay_seconds)),job_id))
     async def backup(self,destination:Path)->None: await self._call(self._backup,destination)
     def _backup(self,destination:Path)->None:
         destination=Path(destination); destination.parent.mkdir(parents=True,exist_ok=True); dest=sqlite3.connect(str(destination)); self._c().backup(dest); dest.close()

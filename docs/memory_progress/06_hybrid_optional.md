@@ -13,7 +13,10 @@
 第二轮 R2-D04/R2-D09：向量路径补上 opt-out 与缓存失效闭环。
 
 - 外发：每条事实调用 provider 前都会走 `fact_is_embedding_eligible`（scope 仍启用、成员未退出、fact 仍 active、revision 未变、embedding 仍启用）；成员 `/memory off` 后其事实不再外发，batch 中途退出也只停该成员的剩余条目。
-- 回填调度：`requeue_job` 的 `state IN (...)` 现在包含 `running`，回填作业运行期间新写入的事实不会被丢弃；处理器只在"本批确实写出过向量且仍有缺口"时重排并从头重扫，既不空转也不会因为按随机 `fact_id` 分页而永久跳过后来的事实。
+- 回填调度：`requeue_job` 的 `state IN (...)` 包含 `running`，回填作业运行期间新写入的事实不会被丢弃；处理器按 `fact_id` 分页取批，取满一批就按本批最后一个 `fact_id` 继续下一批，取不满即结束。
+- 队头阻塞：`facts_missing_embeddings` 在查询阶段就排除失效/过期 fact、subject 属于已 opt-out 成员的事实、以及已有当前 fingerprint + revision 的 fact；provider 调用前 `fact_is_embedding_eligible` 再逐条复查（覆盖查询之后突然 `/memory off` 的竞态）。
 - 缓存：新增 `_clear_query_vector_cache(scope_id)`，在 member off / scope off / forget / clear / group clear / new（epoch 轮转）成功后清掉该 scope 的 query 向量；缓存项同时记录 fingerprint，换 embedding 模型后旧查询向量不再命中。
 
-验证：`test/unit/test_memory_r2_regressions.py`（25 passed，含 T-R2-06/07、T-R2-17~T-R2-19）；负向对照确认旧实现下"off 后 fact 仍外发""clear 后缓存仍命中""回填作业 running 期间新增事实永久缺向量"均可复现。真实 provider 只在 2026-09-14 的历史探针中运行过，本轮未重跑。
+验证：`test/unit/test_memory_r2_regressions.py`（28 passed，含 T-R2-06/07、T-R2-17~T-R2-19）；负向对照确认旧实现下"off 后 fact 仍外发""clear 后缓存仍命中""回填作业 running 期间新增事实永久缺向量"均可复现。真实 provider 只在 2026-09-14 的历史探针中运行过，本轮未重跑。
+
+第三轮 R3：回填取批改为在查询阶段就过滤，处理器按 `fact_id` 分页继续下一批，不再用"本批是否写出过向量"决定是否继续扫描——队头是已 opt-out 成员的事实时，后面的正常 fact 仍能拿到向量。验证：`test_memory_r2_regressions.py::test_r3_embedding_not_blocked_by_opt_out_fact`（负向对照下旧实现 provider 零调用、该 fact 永远缺向量）。

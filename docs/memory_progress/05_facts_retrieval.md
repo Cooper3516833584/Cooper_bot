@@ -17,6 +17,8 @@
 - 查询层：`list_facts` 与 `history` 都带 `memory_members.enabled=0` 的 NOT EXISTS 过滤，已 `/memory off` 的成员，其事实与正文对任何调用方都不可见（含本人），而其他成员不受影响。
 - 外发层：`fact_is_embedding_eligible(scope_id, fact_id, revision)` 在每条事实真正调用 embedding provider 之前复核 scope 开关、成员 opt-out、fact active 与 revision；batch 中途 opt-out 只停该成员的剩余事实，其他成员继续。回填作业的 `requeue` 现在也覆盖 `running`，扫描期间新写入的事实不会因为"作业正在跑"而丢掉排队。
 - 优先级：`_apply_extracted_facts` 去掉了"该 subject 存在任意 explicit 就跳过全部 auto 候选"的全局闸门，改为只按同一 `(scope_id, subject_id, fact_key)` 判断——active explicit 存在则忽略 auto，否则更新 auto revision；`_save_explicit_fact` 与 supersede 语句同样按 key 收敛，保证同一 key 最多一个 active revision。freeform explicit（`explicit.<hash>` key）不再阻断无关 auto key。
-- cursor：抽取改为显式结果 `ExtractionResult(executed, facts, retryable)`。只有模型真正执行（含合法返回 `[]`）才推进 cursor；budget 耗尽或 provider 不可用时抛 `ExtractionDeferred`，cursor 不推进、作业由 worker 退避重试。
+- cursor：抽取改为显式结果 `ExtractionResult(executed, facts, retryable)`。只有模型真正执行（含合法返回 `[]`）才推进 cursor；预算耗尽时抛 `ExtractionDeferred`，cursor 不推进、作业推迟一小时再试（`EXTRACTION_DEFER_SECONDS`，不计入普通 max_attempts，也不会变成 failed）；provider 异常 / JSON 错误仍走普通有限重试，cursor 同样不推进。
 
-验证：`test/unit/test_memory_r2_regressions.py`（25 passed，含 T-R2-05~T-R2-16）；负向对照确认旧实现下"off 后历史泄露正文""off 后事实仍外发""budget=0 仍推进 cursor""任意 explicit 阻断全部 auto"均可复现。真实 provider 与真实 QQ 链路未运行。
+验证：`test/unit/test_memory_r2_regressions.py`（28 passed，含 T-R2-05~T-R2-16）；负向对照确认旧实现下"off 后历史泄露正文""off 后事实仍外发""budget=0 仍推进 cursor""任意 explicit 阻断全部 auto""预算耗尽直接计 attempts"均可复现。真实 provider 与真实 QQ 链路未运行。
+
+第三轮 R3-D01（简化）：`prompt_context` 把 `explicit_memory` 排在 `auto_extracted` 之前，并固定带上 `conflict_rule`（"如果显式记忆与自动提取的记忆冲突，以用户显式要求记住的内容为准。"）；不做任何语义分类或合并，同 key 冲突继续沿用 explicit 优先 / supersede。验证：`test_r3_prompt_puts_explicit_first_and_states_conflict_rule`。

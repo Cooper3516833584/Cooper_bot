@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
+from .models import ExtractionDeferred
+
+# 抽取被 defer（预算耗尽 / 提供方暂不可用）后的重试间隔；不计入普通 max_attempts。
+EXTRACTION_DEFER_SECONDS = 3600
+
 
 class MemoryJobWorker:
     """Single bounded worker. SQLite, rather than message tasks, owns jobs."""
@@ -35,6 +40,9 @@ class MemoryJobWorker:
                 await self.store.finish_job(job["job_id"], True)
             except asyncio.CancelledError:
                 raise
+            except ExtractionDeferred:
+                # 暂时没执行（预算/提供方）：推迟一小时再试，不因 attempts=3 变成永久 failed。
+                await self.store.defer_job(job["job_id"], EXTRACTION_DEFER_SECONDS)
             except Exception as exc:
                 await self.store.finish_job(job["job_id"], False, type(exc).__name__)
 

@@ -16,6 +16,7 @@ import pytest
 
 import cooper_bot.commands.commands as commands
 from cooper_bot.core import config
+from cooper_bot.modules.memory.jobs import EXTRACTION_DEFER_SECONDS
 from cooper_bot.modules.memory.models import CapturedInput, MemoryIdentity
 from cooper_bot.modules.memory.policy import scope_for
 from cooper_bot.modules.memory.service import MemoryService
@@ -135,14 +136,14 @@ async def _wait_for_cursor(service: MemoryService, identity: MemoryIdentity, tar
 
 
 async def _wait_for_job_attempt(service: MemoryService, kind: str, *, attempts: int = 1, timeout: float = 5.0) -> None:
-    """等 worker 真正领过这个作业：状态不重要，attempts 增长就说明处理器跑过。"""
+    """等 worker 真正领过这个作业：attempts 增长（普通重试）或 last_error_code='deferred'（被推迟）都算跑过。"""
 
-    def _rows() -> list[int]:
-        return [int(row[0]) for row in service.store._c().execute("SELECT attempts FROM memory_jobs WHERE kind=?", (kind,)).fetchall()]
+    def _rows() -> list[tuple[int, str]]:
+        return [(int(row[0]), str(row[1] or "")) for row in service.store._c().execute("SELECT attempts,last_error_code FROM memory_jobs WHERE kind=?", (kind,)).fetchall()]
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if any(value >= attempts for value in await service.store._call(_rows)):
+        if any(value >= attempts or code == "deferred" for value, code in await service.store._call(_rows)):
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"{kind} job was never attempted")
@@ -710,3 +711,88 @@ def test_r2_t20_env_can_disable_both_switches_in_isolated_process() -> None:
     result = subprocess.run([sys.executable, "-c", script], cwd=str(PROJECT_ROOT), env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout.strip().splitlines()[-1]) == [False, False]
+
+
+# =====================================================================
+# 第三轮（R3）简化修复的回归测试
+# =====================================================================
+
+
+async def _wait_for_job_deferred(service: MemoryService, kind: str, *, timeout: float = 5.0) -> None:
+    def _codes() -> list[str]:
+        return [str(row[0] or "") for row in service.store._c().execute("SELECT last_error_code FROM memory_jobs WHERE kind=?", (kind,)).fetchall()]
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if "deferred" in await service.store._call(_codes):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"{kind} job was never deferred")
+
+
+@pytest.mark.asyncio
+async def test_r3_embedding_not_blocked_by_opt_out_fact(tmp_path, monkeypatch) -> None:
+    """队头是已退出成员的事实时，后面的正常事实仍要拿到向量。"""
+    _allow_group(monkeypatch)
+    monkeypatch.setattr(config, "AI_MEMORY_EMBEDDING_BATCH_SIZE", 1)
+    gateway = _EmbedGateway()
+    service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3", gateway=gateway)
+    admin, member_a, member_b = _group_identity(90909, personal_admin=True), _group_identity(20202), _group_identity(20203)
+    await service.set_group_enabled(admin, True, "all")
+    scope_id = scope_for(member_a)
+    # a1 的 fact_id 排在 b1 前面：只按 "缺向量" 取批会先取到 a1，被跳过之后 b1 永远轮不到
+    await service.store.save_explicit_fact(scope_id, "user:20202", "A-私密事实", fact_id="a1")
+    await service.store.save_explicit_fact(scope_id, "user:20203", "B-普通事实", fact_id="b1")
+    await service.set_member_enabled(member_a, False)
+
+    await service._maybe_schedule_embedding(scope_id)
+    await _wait_for_embeddings(service, scope_id, 1)
+    await _wait_for_idle(service)
+
+    assert "A-私密事实" not in gateway.calls
+    assert gateway.calls == ["B-普通事实"]
+    await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_r3_deferred_extraction_stays_retryable(tmp_path, monkeypatch) -> None:
+    """预算耗尽时抽取被推迟：cursor 不动，作业保持可再执行而不是 failed。"""
+    _enable_auto(monkeypatch, budget=0)
+    gateway = _ExtractGateway(lambda _payload: {"schema_version": 1, "facts": []})
+    service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3", gateway=gateway)
+    identity = _private_identity()
+    await service.set_enabled(identity, True)
+    await _complete(service, identity, "defer", "今天讨论一个临时问题")
+    await _wait_for_job_deferred(service, "extract")
+
+    def _job() -> dict:
+        return dict(service.store._c().execute("SELECT * FROM memory_jobs WHERE kind='extract'").fetchone())
+
+    job = await service.store._call(_job)
+    assert job["state"] == "queued"
+    assert int(job["attempts"]) == 0
+    assert float(job["not_before"]) >= time.time() + EXTRACTION_DEFER_SECONDS - 5
+    assert gateway.payloads == []
+    assert await _cursor(service, identity) == 0
+    await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_r3_prompt_puts_explicit_first_and_states_conflict_rule(tmp_path) -> None:
+    """memory prompt 里 explicit 事实在前，并带固定的冲突口径。"""
+    service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    identity = _private_identity()
+    await service.set_enabled(identity, True)
+    scope_id = scope_for(identity)
+    await service.remember_explicit(identity, "以后回答简洁")
+    # auto 事实写入更晚（updated_at 更新），所以库里顺序正好相反
+    await _seed_auto_fact(service, scope_id, "user:20202", "preference.answer_style", "喜欢详细回答")
+
+    stored = await service.list_facts(identity)
+    assert [row["source_kind"] for row in stored] == ["auto_extracted", "explicit_memory"]
+
+    context = await service.prompt_context(identity, "")
+    assert [fact["source_kind"] for fact in context["facts"]] == ["explicit_memory", "auto_extracted"]
+    assert context["facts"][0]["text"] == "以后回答简洁"
+    assert context["conflict_rule"] == "如果显式记忆与自动提取的记忆冲突，以用户显式要求记住的内容为准。"
+    await service.aclose()
