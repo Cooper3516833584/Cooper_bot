@@ -35,9 +35,22 @@ class MemorySnapshot:
     summary: dict | None = None
 
 
+@dataclass(frozen=True)
+class ExtractionResult:
+    """自动抽取的显式结果：区分「执行后没有事实」与「模型根本没执行」。"""
+
+    executed: bool
+    facts: tuple[dict, ...] = ()
+    retryable: bool = False
+
+
 class MemoryError(RuntimeError):
     pass
 
 
 class MemoryDisabled(MemoryError):
     pass
+
+
+class ExtractionDeferred(MemoryError):
+    """抽取未真正执行（预算耗尽或提供方不可用）。cursor 不得推进，作业应退避重试。"""

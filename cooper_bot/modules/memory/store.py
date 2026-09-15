@@ -168,7 +168,9 @@ class MemoryStore:
                 c.execute("DELETE FROM memory_events WHERE scope_id=? AND role='assistant'",(scope_id,))
                 c.execute("DELETE FROM memory_summaries WHERE scope_id=?",(scope_id,))
                 c.execute("UPDATE memory_jobs SET state='cancelled',lease_until=NULL WHERE scope_id=? AND state IN ('queued','running')",(scope_id,))
-                c.execute("DELETE FROM memory_facts WHERE scope_id=? AND source_kind!='explicit_memory'",(scope_id,))
+                # 退出只停止"使用"该成员记忆，不再物理删除 scope 内全部派生事实：
+                # 否则会把同 scope 其他成员的 auto facts 一并删掉，并让 extraction cursor 与实际事实不一致。
+                # 该成员事实的可见性由 member.enabled + eligibility 查询控制。
         return changed
 
     async def member_enabled(self, scope_id: str, actor: int) -> bool:
@@ -272,10 +274,13 @@ class MemoryStore:
             old=c.execute("SELECT * FROM memory_facts WHERE fact_id=? AND scope_id=? AND subject_id=? AND status='active'",(replace_id,scope_id,subject)).fetchone()
             if not old: raise ValueError("fact not found")
             key, fact_id=old['fact_key'],uuid.uuid4().hex
-            with c:c.execute("UPDATE memory_facts SET status='superseded',updated_at=? WHERE fact_id=?",(now,old['fact_id']))
+            with c:c.execute("UPDATE memory_facts SET status='superseded',updated_at=? WHERE scope_id=? AND subject_id=? AND fact_key=? AND status='active'",(now,scope_id,subject,key))
         else:
             old=c.execute("SELECT * FROM memory_facts WHERE scope_id=? AND subject_id=? AND fact_key=? AND status='active'",(scope_id,subject,key)).fetchone()
-            if old:return dict(old)
+            if old:
+                if old['source_kind']=='explicit_memory':return dict(old)
+                # 同一 fact_key 上 explicit 优先：先让 active auto 失效，避免同 key 出现两个 active revision。
+                with c:c.execute("UPDATE memory_facts SET status='superseded',updated_at=? WHERE fact_id=?",(now,old['fact_id']))
             fact_id=fact_id or uuid.uuid4().hex
         rev=int(c.execute("SELECT COALESCE(MAX(revision),0)+1 FROM memory_facts WHERE scope_id=? AND subject_id=? AND fact_key=?",(scope_id,subject,key)).fetchone()[0])
         with c:c.execute("INSERT INTO memory_facts(fact_id,scope_id,subject_id,fact_key,revision,status,text,source_kind,valid_from,created_at,updated_at) VALUES(?,?,?,?,?,'active',?,'explicit_memory',?,?,?)",(fact_id,scope_id,subject,key,rev,text,now,now,now))
@@ -285,7 +290,13 @@ class MemoryStore:
         return await self._call(self._list_facts,scope_id,subjects)
     def _list_facts(self,scope_id:str,subjects:tuple[str,...])->list[dict]:
         if not subjects:return []
-        marks=','.join('?'*len(subjects)); q=f"SELECT * FROM memory_facts WHERE scope_id=? AND subject_id IN ({marks}) AND status='active' AND (expires_at IS NULL OR expires_at>?) ORDER BY updated_at DESC,fact_id"; return [dict(x) for x in self._c().execute(q,(scope_id,*subjects,time.time())).fetchall()]
+        marks=','.join('?'*len(subjects))
+        # 退出记忆的成员，其 user:<id> 事实不再参与召回/列表（subject 为 user:<actor> 时与成员一一对应）。
+        q=f"""SELECT * FROM memory_facts AS fact WHERE fact.scope_id=? AND fact.subject_id IN ({marks}) AND fact.status='active'
+              AND (fact.expires_at IS NULL OR fact.expires_at>?)
+              AND NOT EXISTS (SELECT 1 FROM memory_members AS member WHERE member.scope_id=fact.scope_id AND member.enabled=0 AND fact.subject_id='user:'||member.actor_user_id)
+              ORDER BY fact.updated_at DESC,fact.fact_id"""
+        return [dict(x) for x in self._c().execute(q,(scope_id,*subjects,time.time())).fetchall()]
 
     async def put_embedding(self, scope_id: str, fact_id: str, fingerprint: str, revision: int, vector: bytes, dimension: int) -> None:
         await self._call(self._put_embedding, scope_id, fact_id, fingerprint, revision, vector, dimension)
@@ -329,6 +340,17 @@ class MemoryStore:
     def _count_embeddings(self,scope_id,fingerprint):
         return int(self._c().execute("SELECT COUNT(*) FROM memory_embeddings WHERE scope_id=? AND fingerprint=?",(scope_id,fingerprint)).fetchone()[0])
 
+    async def embedding_eligible(self, scope_id: str, fact_id: str, revision: int) -> bool:
+        """逐条外发前复核：scope 仍启用、成员未退出、事实仍 active 且 revision 未变。"""
+        return await self._call(self._embedding_eligible, scope_id, fact_id, revision)
+    def _embedding_eligible(self,scope_id,fact_id,revision):
+        row=self._c().execute("""SELECT 1 FROM memory_facts AS fact JOIN memory_scopes AS scope ON scope.scope_id=fact.scope_id
+              WHERE fact.fact_id=? AND fact.scope_id=? AND fact.status='active' AND fact.revision=? AND scope.enabled=1
+                AND (fact.expires_at IS NULL OR fact.expires_at>?)
+                AND NOT EXISTS (SELECT 1 FROM memory_members AS member WHERE member.scope_id=fact.scope_id AND member.enabled=0 AND fact.subject_id='user:'||member.actor_user_id)""",
+            (fact_id,scope_id,int(revision),time.time())).fetchone()
+        return row is not None
+
     async def scope_ids(self) -> list[str]:
         return await self._call(self._scope_ids)
     def _scope_ids(self):
@@ -344,7 +366,9 @@ class MemoryStore:
     async def history(self, scope_id: str, *, query: str="", before: int | None=None, limit: int=20) -> list[dict]:
         return await self._call(self._history, scope_id, query, before, limit)
     def _history(self, scope_id, query, before, limit):
-        where="scope_id=? AND state IN ('completed','confirmed','observed','explicit')"
+        # 与 snapshot 口径一致：已退出记忆的成员，其输入与为该输入生成的回复都不再出现在 history。
+        where=("scope_id=? AND state IN ('completed','confirmed','observed','explicit')"
+               " AND NOT EXISTS (SELECT 1 FROM memory_members AS member WHERE member.scope_id=memory_events.scope_id AND member.actor_user_id=memory_events.actor_user_id AND member.enabled=0)")
         args=[scope_id]
         if query:
             where += " AND (own_text LIKE ? OR quoted_text LIKE ? OR visual_text LIKE ?)"
@@ -439,18 +463,17 @@ class MemoryStore:
             if not scope or not bool(scope["enabled"]) or scope["profile"]!="public" or int(scope["epoch"])!=int(job["epoch"]) or scope["active_conversation_id"]!=job["conversation_id"] or not self._member_enabled(job["scope_id"],actor):return False
             member=c.execute("SELECT extracted_through_input_seq FROM memory_members WHERE scope_id=? AND actor_user_id=?",(job["scope_id"],actor)).fetchone();current_cursor=int(member[0]) if member else 0
             if current_cursor!=int(cursor):return False
-            has_explicit=bool(c.execute("SELECT 1 FROM memory_facts WHERE scope_id=? AND subject_id=? AND status='active' AND source_kind='explicit_memory' LIMIT 1",(job["scope_id"],subject)).fetchone())
             for candidate in candidates:
-                if has_explicit:continue
                 key=str(candidate["fact_key"]);text=str(candidate["text"]);evidence_seq=int(candidate["evidence_input_seq"]);quote=str(candidate["evidence_quote"])
                 evidence=c.execute("SELECT own_text FROM memory_events WHERE scope_id=? AND conversation_id=? AND actor_user_id=? AND role='user' AND seq=? AND seq>? AND seq<=? AND source_kind IN ('direct_chat','passive_chat') AND state IN ('completed','observed','unconfirmed')",(job["scope_id"],job["conversation_id"],actor,evidence_seq,cursor,target)).fetchone()
                 if not evidence or not quote or quote not in str(evidence[0]):continue
                 marker=c.execute("SELECT blocked_through_input_seq FROM memory_forget_markers WHERE scope_id=? AND subject_id=? AND fact_key=?",(job["scope_id"],subject,key)).fetchone()
                 if marker and evidence_seq<=int(marker[0]):continue
                 active=c.execute("SELECT * FROM memory_facts WHERE scope_id=? AND subject_id=? AND fact_key=? AND status='active' ORDER BY revision DESC",(job["scope_id"],subject,key)).fetchone()
+                # 优先级只按同一 fact_key 判定：explicit > auto。与该 key 无关的 explicit（freeform key）不得阻断 auto 候选。
                 if active and active["source_kind"]=="explicit_memory":continue
                 if active and active["text"]==text:continue
-                if active:c.execute("UPDATE memory_facts SET status='superseded',updated_at=? WHERE fact_id=?",(now,active["fact_id"]))
+                if active:c.execute("UPDATE memory_facts SET status='superseded',updated_at=? WHERE scope_id=? AND subject_id=? AND fact_key=? AND status='active'",(now,job["scope_id"],subject,key))
                 revision=int(c.execute("SELECT COALESCE(MAX(revision),0)+1 FROM memory_facts WHERE scope_id=? AND subject_id=? AND fact_key=?",(job["scope_id"],subject,key)).fetchone()[0])
                 c.execute("INSERT INTO memory_facts(fact_id,scope_id,subject_id,fact_key,revision,status,text,source_kind,source_input_seqs_json,evidence_json,valid_from,created_at,updated_at) VALUES(?,?,?,?,?,'active',?,'auto_extracted',?,?,?,?,?)",(uuid.uuid4().hex,job["scope_id"],subject,key,revision,text,json.dumps([evidence_seq]),json.dumps([{"input_seq":evidence_seq,"quote":quote}],ensure_ascii=False),now,now,now))
             c.execute("INSERT INTO memory_members(scope_id,actor_user_id,enabled,extracted_through_input_seq,updated_at) VALUES(?,?,1,?,?) ON CONFLICT(scope_id,actor_user_id) DO UPDATE SET extracted_through_input_seq=excluded.extracted_through_input_seq,updated_at=excluded.updated_at",(job["scope_id"],actor,target,now))
@@ -527,12 +550,16 @@ class MemoryStore:
     def _enqueue_job(self, scope_id, cid, epoch, kind, target, payload, key, base_version):
         with self._c(): self._c().execute("INSERT OR IGNORE INTO memory_jobs(job_id,scope_id,conversation_id,epoch,kind,target_input_seq,payload_json,state,base_version,not_before,dedupe_key) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)", (uuid.uuid4().hex,scope_id,cid,epoch,kind,target,json.dumps(payload,ensure_ascii=False),base_version,time.time(),key))
     async def requeue_job(self, scope_id: str, conversation_id: str, epoch: int, kind: str, target: int, payload: dict, dedupe_key: str, *, base_version: int=0) -> None:
-        """INSERT OR UPDATE：同一 dedupe_key 的终结作业重新排队（回填触发必须可重复）。"""
+        """INSERT OR UPDATE：同一 dedupe_key 的作业重新排队（回填触发必须可重复）。
+
+        包含 running：回填作业在扫描/请求 provider 期间新写入的事实也必须能被再次排队，
+        否则这批新增事实会永久停留在"缺向量"状态。
+        """
         await self._call(self._requeue_job, scope_id, conversation_id, epoch, kind, target, payload, dedupe_key, base_version)
     def _requeue_job(self, scope_id, cid, epoch, kind, target, payload, key, base_version):
         c=self._c();now=time.time()
         with c:
-            c.execute("UPDATE memory_jobs SET state='queued',attempts=0,not_before=?,lease_until=NULL,last_error_code=NULL WHERE dedupe_key=? AND state IN ('succeeded','failed','cancelled')",(now,key))
+            c.execute("UPDATE memory_jobs SET state='queued',attempts=0,not_before=?,lease_until=NULL,last_error_code=NULL WHERE dedupe_key=? AND state IN ('succeeded','failed','cancelled','running')",(now,key))
             c.execute("INSERT OR IGNORE INTO memory_jobs(job_id,scope_id,conversation_id,epoch,kind,target_input_seq,payload_json,state,base_version,not_before,dedupe_key) VALUES(?,?,?,?,?,?,?,'queued',?,?,?)", (uuid.uuid4().hex,scope_id,cid,epoch,kind,target,json.dumps(payload,ensure_ascii=False),base_version,now,key))
     async def claim_job(self, *, max_attempts: int=3, lease_seconds: int=120) -> dict | None: return await self._call(self._claim_job,max_attempts,lease_seconds)
     def _claim_job(self,max_attempts,lease_seconds):

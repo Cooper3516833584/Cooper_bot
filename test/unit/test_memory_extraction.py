@@ -168,9 +168,14 @@ async def test_explicit_fact_wins_same_key_auto_conflict(tmp_path, monkeypatch) 
     identity = _identity()
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3", gateway=gateway)
     await service.set_enabled(identity, True)
-    await service.remember_explicit(identity, "显式事实优先")
     seq = await _complete(service, identity, "conflict", "我的偏好已经明确")
     await _wait_for_cursor(service, identity, seq)
+    auto = await service.list_facts(identity)
+    assert [(row["source_kind"], row["fact_key"]) for row in auto] == [("auto_extracted", "preference.explanation_style")]
+
+    # 优先级只按同一 fact_key 判定：显式覆盖该 key 后，auto 不得再保持 active。
+    explicit = await service.remember_explicit(identity, "显式事实优先", replace_id=auto[0]["fact_id"])
+    assert explicit["fact_key"] == auto[0]["fact_key"]
     facts = await service.list_facts(identity)
     assert [(row["source_kind"], row["text"]) for row in facts] == [("explicit_memory", "显式事实优先")]
     await service.aclose()

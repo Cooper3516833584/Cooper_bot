@@ -95,3 +95,95 @@ embedding provider：**已实测**（2026-09-14，用户授权联网）。`tools
 ## 是否可上线
 
 **不能判定为"已验证可上线"**。memory 的阻断安全项与向量检索都有自动测试证据，embedding provider 也已实测可用，默认开关按产品要求打开；但真实 QQ/Kimi/DeepSeek 消息链路、真实灰度与生产回滚均未执行，高并发 DB 排队容量未验证，summary/auto_extract 仍默认关闭且未在真实 provider 下端到端跑过，全量测试也仍有一个基线 vision 断言失败。按 08 第 10 节，这不满足"可上线"的举证要求——默认开启属于产品决定，风险需以真实灰度结果来确认或回退。
+
+## 第二轮 R2 修复（2026-09-15）
+
+审查基线 `986cb4e52c6a8a08b794bcecc033a738dc8ffa18`（HEAD 未变，无 reset / rebase）。对应修复包 `Downloads/Cooper_bot_memory_repair_round2_986cb4e` 的 00–05 号文档；所有数字来自本机实际执行，未执行项标注 NOT RUN。
+
+### 修改文件
+
+- `cooper_bot/modules/memory/service.py`：`_Turn` 生命周期（`__aenter__` 以 `try/except BaseException` 包住准备阶段、抽出 `_enter`、新增 `_release_lock`、`abort()` 区分"未生成 / 已生成"、`__aexit__` 改为按记账释放锁）；新增 `_clear_query_vector_cache` 与 query 向量 fingerprint 校验；新增 `fact_is_embedding_eligible`；回填作业逐条 eligibility 复核 + 仅在"写出过向量且仍有缺口"时重排；抽取改为 `ExtractionResult` / `ExtractionDeferred`。
+- `cooper_bot/modules/memory/store.py`：member off 不再删除整个 scope 的派生事实；`list_facts` / `history` 过滤 opt-out 成员；新增 `embedding_eligible`；`apply_extracted_facts` 去掉全局 explicit 闸门并改为按 key 收敛 active；`save_explicit_fact` 同 key 收敛；`requeue_job` 覆盖 `running`。
+- `cooper_bot/modules/memory/models.py`：新增 `ExtractionResult`、`ExtractionDeferred`。
+- 测试：新增 `test/unit/test_memory_r2_regressions.py`（25 例）；`test/unit/test_memory_extraction.py` 中 1 例按"同一 fact_key 才判优先级"的新语义改写。
+- 文档：`docs/memory.md`、`docs/memory_progress/` 的 `00_baseline.md`、`01_storage.md`、`02_chat_integration.md`、`05_facts_retrieval.md`、`06_hybrid_optional.md`、本文件。
+- **未改动** `cooper_bot/core/config.py`（R2-D10 见下）；未改动 `commands.py` / `aisvc.py` 消息主路径。
+
+### R2-D01 ~ R2-D10
+
+| ID | 级别 | 状态 | 修复点 | 回归测试 |
+|---|---|---|---|---|
+| R2-D01 | P0 | PASS（单测） | `abort()` 在未 generated 时把 pending 输入收尾为 `failed`，不再永久占用同一 `source_event_id` | T-R2-01（service 层 + commands 触发路径） |
+| R2-D02 | P0 | PASS（单测） | `__aenter__` 异常（含取消）释放 scope lock，`_lock_acquired` 记账防 double release | T-R2-02（snapshot_rows / search_facts 两个失败点） |
+| R2-D03 | P0 | PASS（单测） | `_history` 关联 `memory_members`，只返回 enabled 成员 | T-R2-05 |
+| R2-D04 | P0 | PASS（单测） | 每条 fact 真正调用 provider 前 `fact_is_embedding_eligible` 复核 | T-R2-06、T-R2-07 |
+| R2-D05 | P1 | PASS（单测） | 删除 `DELETE FROM memory_facts WHERE source_kind!='explicit_memory'`，off 只停用不物理删除 | T-R2-08 |
+| R2-D06 | P1 | PASS（单测） | `ExtractionResult.executed=False` 时抛 `ExtractionDeferred`：cursor 不推进、作业退避重试 | T-R2-10、T-R2-11、T-R2-12 |
+| R2-D07 | P1 | PASS（单测） | 去掉"该 subject 存在任意 explicit 就跳过全部 auto 候选"的全局闸门 | T-R2-13 |
+| R2-D08 | P1 | PASS（单测） | 同一 `(scope_id, subject_id, fact_key)` 最多一个 active revision：explicit 优先、active auto 被 supersede | T-R2-14、T-R2-15 |
+| R2-D09 | P1 | PASS（单测） | `_clear_query_vector_cache` 接入 member off / scope off / forget / clear / group clear / new，缓存项带 fingerprint | T-R2-17、T-R2-18、T-R2-19 |
+| R2-D10 | 配置 | REVIEWED（维护者决定保留默认开启） | 未改 `config.py`；`docs/memory.md` 补齐 embedding 外发语义与 opt-out 语义 | T-R2-20 |
+
+未被列进矩阵但同属本轮修复的一个确定性漏洞：回填作业 `running` 期间新写入的事实无法再排队（`requeue_job` 只匹配终结状态）→ 该批事实永久缺向量。已修为 `state IN (...)` 含 `running`，并有确定性回归测试 `test_r2_embed_backfill_picks_up_facts_written_while_job_runs`。
+
+### T-R2-01 ~ T-R2-20
+
+| ID | 场景 | 结果 | 测试 |
+|---|---|---|---|
+| T-R2-01 | 生成前异常不留 pending | PASS | `test_r2_t01_pre_generate_exception_does_not_leave_pending_input`、`test_r2_t01_kimi_path_failure_leaves_no_pending_input` |
+| T-R2-02 | `__aenter__` 异常不泄漏 lock | PASS | `test_r2_t02_enter_failure_releases_scope_lock[snapshot_rows]` / `[search_facts]` |
+| T-R2-03 | failed input 不阻塞 stable cutoff | PASS | `test_r2_t03_failed_input_does_not_block_stable_cutoff` |
+| T-R2-04 | generated 后异常状态机一致 | PASS | `test_r2_t04_exception_after_generate_finishes_turn_as_failed` |
+| T-R2-05 | opt-out 后 history 不泄露旧正文 | PASS | `test_r2_t05_opt_out_member_is_hidden_from_history` |
+| T-R2-06 | opt-out 后 embedding backfill 不外发 | PASS | `test_r2_t06_opt_out_member_facts_are_not_sent_to_embedding` |
+| T-R2-07 | embedding batch 中途 off 停止后续外发 | PASS | `test_r2_t07_mid_batch_opt_out_stops_remaining_sends` |
+| T-R2-08 | B facts 不受 A off 影响 | PASS | `test_r2_t08_opt_out_keeps_other_members_auto_facts` |
+| T-R2-09 | A off 不删除 B auto facts | PASS | 同上（断言 `auto_extracted` 计数仍为 2） |
+| T-R2-10 | budget=0 cursor 不推进 | PASS | `test_r2_t10_budget_exhausted_does_not_advance_cursor` |
+| T-R2-11 | provider timeout cursor 不推进 | PASS | `test_r2_t11_provider_failure_does_not_advance_cursor` |
+| T-R2-12 | 模型真实返回空 facts 时 cursor 推进 | PASS | `test_r2_t12_genuine_empty_result_advances_cursor` |
+| T-R2-13 | explicit answer_style 不阻止 auto location | PASS | `test_r2_t13_freeform_explicit_does_not_block_unrelated_auto_key` |
+| T-R2-14 | explicit 同 key 优先于 auto | PASS | `test_r2_t14_explicit_same_key_wins_over_auto` |
+| T-R2-15 | auto 后 explicit 能 supersede | PASS | `test_r2_t15_explicit_supersedes_previous_auto` |
+| T-R2-16 | freeform explicit 不阻断其他 key | PASS | 同 T-R2-13（并断言 explicit key 为 `explicit.` 前缀） |
+| T-R2-17 | clear 清 query-vector cache | PASS | `test_r2_t17_privacy_actions_invalidate_query_vector_cache[clear]` |
+| T-R2-18 | forget 清 query-vector cache | PASS | 同上 `[forget]`（另有 `[new]` / `[member_off]` / `[scope_off]`） |
+| T-R2-19 | epoch rotate 后旧 cache 不命中 | PASS | `test_r2_t19_epoch_rotate_does_not_reuse_stale_query_vector` |
+| T-R2-20 | 默认配置与文档一致 | PASS | `test_r2_t20_memory_switches_default_and_docs_agree`、`test_r2_t20_env_can_disable_both_switches_in_isolated_process` |
+
+### 对抗性并发（05 号文档 A/B/C）
+
+- A. enter 异常：T-R2-02 覆盖——turn1 在 `snapshot_rows` / `search_facts` 抛异常后，turn2 在 `asyncio.timeout(5)` 内成功 acquire，且锁最终为未占用。
+- B. embedding 中途 off：T-R2-07 覆盖——batch `a1,a2,b1`；a1 已发出（无法撤回）、`A /memory off` 后 a2 停止外发、b1 正常发送。
+- C. budget exhaustion：T-R2-10 覆盖——`daily budget=0` 时 cursor 保持 0（`< target`）且模型完全未被调用；恢复预算后同一批事件仍能抽取到目标 seq。
+
+### 实际测试命令 + 结果
+
+- `python -m compileall -q cooper_bot client.py`：退出码 0。
+- `python -m pytest -q test/unit/test_memory_r2_regressions.py`：25 passed；单独连跑 10 次全绿。
+- 11 个 memory 专项文件（policy / store / turn_safety / commands / deletion / prompting / summary / extraction / vectors / chat_flow + 本轮新增）：93 passed，退出码 0。
+- `python -m pytest test`（单进程独占，避免与其它 pytest 共用 `--basetemp`）：`1 failed, 445 passed in 50.43s`；唯一失败是基线已有的 `test/unit/test_vision_skill.py::test_resolve_image_ready`（实际 1600、旧断言 800），与 memory 无关，本轮未改动。
+- 负向对照（把旧实现临时装回运行期验证测试有效，脚本跑完即删、未留在仓库）：R2-D01/D02/D03/D04/D05/D06/D07/D09 八项违规全部复现；另确认"回填作业 running 期间新写入事实永久缺向量"在旧的 `requeue_job` 下确定复现。
+- 说明：本轮曾出现一次 `test_memory_vectors.py::test_embedding_has_no_daily_cap_and_drains_the_backlog` 偶发失败，当时存在我自己并发运行多个 pytest 进程共用 `--basetemp=.pytest_tmp` 的情况，因此无法把该次失败单独归因；单进程口径下该用例 3/3 通过。上一条中那个真实漏洞与该表现一致，已独立用确定性测试锁定并修复。
+
+### 未执行项（NOT RUN）
+
+- 真实 QQ / Kimi CLI / DeepSeek 消息链路：NOT RUN（全程使用 fake runner 与 fake gateway）。
+- 真实 embedding provider 调用：NOT RUN（本轮全部 fake provider；上次真实调用是 2026-09-14 的历史探针）。
+- 生产灰度部署与生产回滚演练：NOT RUN。
+- 真实群多成员并发 opt-out、provider 限流 / 超时错误码 / 配额行为：NOT RUN。
+
+### 残余风险
+
+- `requeue_job` 现在会把 `running` 的回填作业重新置为 `queued`，同一作业可能被 worker 再领一次；处理器幂等（只处理仍缺向量的 fact，写入为 REPLACE），且只在"写出过向量且仍有缺口"时重排，未观察到活锁。这是本轮唯一改动作业状态机的点，灰度时应观察 provider 请求量。
+- 重排改为从头重扫缺失事实后，大 scope（已向量化条目很多、缺失很少）的单次扫描会退化为 O(已向量化条数)；功能正确、无活锁，但换 embedding 模型的整库回填会比之前更频繁地重扫。
+- `/memory off`、`forget`、成员策略变化仍删除该 scope 全部 assistant 混合回复与摘要（沿用上一轮隐私优先口径），代价是其他成员的历史摘要一起失效；本轮只去掉了"连带删除其他成员 auto facts"这一步。
+- budget 持续耗尽时抽取作业重试 3 次后标记 failed，同一批事件要等新消息触发新作业才会继续（cursor 未推进，不丢事实，但延迟取决于是否有后续对话）。
+- `ExtractionResult.retryable` 目前恒为 True（非执行态都算可重试），保留为后续区分"可重试 / 不可重试"的接口位。
+- 全量测试仍有 1 个基线 vision 断言失败。
+
+### 是否建议进入真实 QQ 小流量灰度
+
+建议按 05 号文档进入**第一阶段**小流量灰度：`AI_MEMORY_ENABLED=true`、`AI_MEMORY_SUMMARY_ENABLED=false`、`AI_MEMORY_AUTO_EXTRACT_ENABLED=false`、`AI_MEMORY_EMBEDDING_ENABLED=false`，先验证近期持久历史、explicit remember、off / clear / new 与 admin 电脑操作；随后依次放开 summary、auto facts，最后才考虑 embedding。
+
+但必须明确：本轮结论全部来自 fake provider 与单进程自动测试，真实 QQ / Kimi / DeepSeek / embedding provider 与生产回滚均为 NOT RUN，因此上述建议是"可以开始小流量验证"，**不是"已验证可上线"**。
