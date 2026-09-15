@@ -13,6 +13,13 @@ from cooper_bot.modules.memory.service import MemoryService
 
 EMBED_MODEL = "embed-model"
 DIMENSION = 3
+
+
+@pytest.fixture(autouse=True)
+def _embedding_lane_enabled(monkeypatch):
+    """向量链路默认关闭（默认全关策略）；本文件专门验证向量行为，显式打开。"""
+    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_EMBEDDING_ENABLED", True)
+
 # 每个维度对应一组关键词：测试用确定性的"假向量空间"，不联网。
 AXES = (("作业", "deadline", "截止"), ("课程", "class", "课表"), ("偏好", "preference", "喜欢"))
 

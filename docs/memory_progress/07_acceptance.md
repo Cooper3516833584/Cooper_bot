@@ -7,9 +7,11 @@
 - 审查基线 SHA：`9563319a43bd2e4744b6064199530c6dc73c415a`；memory 修复与向量检索都是该 HEAD 之上的提交/working tree。
 - Python / SQLite：3.13.5 / 3.49.1。
 - 默认配置（`cooper_bot/core/config.py`）：
-  - `AI_MEMORY_ENABLED=true`、`AI_MEMORY_EMBEDDING_ENABLED=true` —— **2026-09-14 按产品决定改为默认开启，覆盖修复包 D15「master switch 应默认关闭」的口径**；关闭时不创建也不打开数据库。
-  - `AI_MEMORY_SUMMARY_ENABLED=false`、`AI_MEMORY_AUTO_EXTRACT_ENABLED=false` —— 这两条链路会把群聊原文送给模型网关，且从未接过真实 provider，保持关闭。
-  - `AI_MEMORY_GROUP_ALLOWLIST` 默认空（群记忆必须显式配置）；`AI_MEMORY_MAX_EVENTS_PER_SCOPE=3000`、`AI_MEMORY_RECENT_EVENTS=40`、`AI_MEMORY_TOP_K=6`、`AI_MEMORY_CONTEXT_CHAR_BUDGET=10000`。
+  - `AI_MEMORY_ENABLED=true` —— 总开关保持开启，因为 `/memory on` 需要它才能工作（它本身不采集、不外发）；设为 `false` 后重启则完全不创建/不打开数据库。
+  - `AI_MEMORY_SUMMARY_ENABLED=false`、`AI_MEMORY_AUTO_EXTRACT_ENABLED=false`、`AI_MEMORY_EMBEDDING_ENABLED=false` —— **2026-09-15 按维护者要求改为默认关闭**（此前一轮的"默认开启"口径作废）。三条链路分别会把摘要 events / 待抽取 `own_text` / 事实文本发往模型网关或 embedding provider，需要时设为 `true` 后重启。
+  - `AI_MEMORY_GROUP_ALLOWLIST` 默认空 = 不限制可开启的群（哪个群真正启用仍由 `/memory group on` 决定）；显式列出群号则只有这些群能开启。
+  - 作用域默认：新建作用域即 `enabled=0`、`capture_mode='directed'`；私聊要 `/memory on`，群里要可信个人管理员 `/memory on`（或 `/memory group on directed|all`）+ 成员 `/memory on`。
+  - `AI_MEMORY_MAX_EVENTS_PER_SCOPE=3000`、`AI_MEMORY_RECENT_EVENTS=40`、`AI_MEMORY_TOP_K=6`、`AI_MEMORY_CONTEXT_CHAR_BUDGET=10000`。
   - 向量：`AI_MEMORY_EMBEDDING_MIN_SIMILARITY=0.35`、`AI_MEMORY_EMBEDDING_BATCH_SIZE=16`、`AI_MEMORY_EMBEDDING_TIMEOUT_SECONDS=30`。**embedding 没有日预算上限**（2026-09-14 按产品决定移除 `AI_MEMORY_EMBEDDING_DAILY_BUDGET`）。
 - 执行前仓库已有未跟踪 `runtime/`，未覆盖或清理。测试临时目录 `.pytest_tmp` 曾 ACL 异常（`Get-Acl`/`ls` 均被拒绝），已重命名为 `.pytest_tmp_broken_20260914` 让 pytest 重建；未删除任何用户数据。
 

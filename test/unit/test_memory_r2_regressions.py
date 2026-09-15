@@ -26,6 +26,12 @@ GROUP_ID = 30303
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse=True)
+def _embedding_lane_enabled(monkeypatch):
+    """向量链路默认关闭（默认全关策略）；本文件的向量用例显式打开。"""
+    monkeypatch.setattr(config, "AI_MEMORY_EMBEDDING_ENABLED", True)
+
+
 # ---------------------------------------------------------------- helpers
 
 
@@ -692,25 +698,34 @@ async def test_r2_t19_epoch_rotate_does_not_reuse_stale_query_vector(tmp_path) -
 # ------------------------------------------------------------- T-R2-20 默认开关
 
 
-def test_r2_t20_memory_switches_default_and_docs_agree() -> None:
-    assert config.AI_MEMORY_ENABLED is True
-    assert config.AI_MEMORY_EMBEDDING_ENABLED is True
-    document = (PROJECT_ROOT / "docs" / "memory.md").read_text(encoding="utf-8")
-    assert "AI_MEMORY_ENABLED=true" in document
-    assert "AI_MEMORY_EMBEDDING_ENABLED=true" in document
-
-
-@pytest.mark.skipif(not sys.executable, reason="needs an interpreter for the isolated env check")
-def test_r2_t20_env_can_disable_both_switches_in_isolated_process() -> None:
+def _isolated_switches(overrides: dict[str, str]) -> list[bool]:
+    """在干净子进程里读开关：父进程的 monkeypatch / 真实环境变量都不参与。"""
     script = (
         "import json;"
         "from cooper_bot.core import config;"
-        "print(json.dumps([config.AI_MEMORY_ENABLED, config.AI_MEMORY_EMBEDDING_ENABLED]))"
+        "print(json.dumps([config.AI_MEMORY_ENABLED, config.AI_MEMORY_EMBEDDING_ENABLED,"
+        " config.AI_MEMORY_SUMMARY_ENABLED, config.AI_MEMORY_AUTO_EXTRACT_ENABLED]))"
     )
-    env = {**os.environ, "AI_MEMORY_ENABLED": "false", "AI_MEMORY_EMBEDDING_ENABLED": "false"}
+    env = {key: value for key, value in os.environ.items() if not key.startswith("AI_MEMORY")}
+    env.update(overrides)
     result = subprocess.run([sys.executable, "-c", script], cwd=str(PROJECT_ROOT), env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout.strip().splitlines()[-1]) == [False, False]
+    return list(json.loads(result.stdout.strip().splitlines()[-1]))
+
+
+@pytest.mark.skipif(not sys.executable, reason="needs an interpreter for the isolated env check")
+def test_r2_t20_defaults_match_docs_and_env_can_enable() -> None:
+    """默认全关：只有总开关开启（/memory on 需要它），三条链路默认关闭；文档口径一致。"""
+    assert _isolated_switches({}) == [True, False, False, False]
+
+    enabled = {name: "true" for name in (
+        "AI_MEMORY_ENABLED", "AI_MEMORY_EMBEDDING_ENABLED", "AI_MEMORY_SUMMARY_ENABLED", "AI_MEMORY_AUTO_EXTRACT_ENABLED")}
+    assert _isolated_switches(enabled) == [True, True, True, True]
+
+    document = (PROJECT_ROOT / "docs" / "memory.md").read_text(encoding="utf-8")
+    assert "AI_MEMORY_ENABLED=true" in document
+    for name in ("AI_MEMORY_SUMMARY_ENABLED", "AI_MEMORY_AUTO_EXTRACT_ENABLED", "AI_MEMORY_EMBEDDING_ENABLED"):
+        assert f"{name}=false" in document
 
 
 # =====================================================================

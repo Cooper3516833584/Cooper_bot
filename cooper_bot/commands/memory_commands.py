@@ -40,7 +40,7 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
     argument = parts[2] if len(parts) > 2 else ""
     private = identity.profile == "admin" and identity.scene == "group"
     if action in {"help", ""}:
-        return ("记忆：on/off/status、remember/list/search/forget、history/new/clear。群内 on 只管理本人；可信管理员用 group on [directed|all]/off/remember/clear。off 不物理删除，new 保留长期事实，clear 不能撤回已在途请求。", private)
+        return ("记忆默认关闭，用 /memory on 开启当前会话（群里普通成员只管理本人，可信个人管理员 on 会同时开启当前群会话；也可用 group on [directed|all]/off/remember/clear）。另有 status、remember/list/search/forget、history/new/clear；off 不物理删除，new 保留长期事实，clear 不能撤回已在途请求。", private)
     try:
         if action == "status":
             status = await service.status(identity)
@@ -53,8 +53,15 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
         if not service.enabled:
             return ("聊天记忆总开关当前关闭；请由部署者设置 AI_MEMORY_ENABLED=true 后重启。", private)
         if action == "on":
-            if identity.scene == "group" and identity.profile == "public":
-                await service.set_member_enabled(identity, True, require_scope_enabled=True)
+            if identity.scene == "group":
+                if identity.personal_admin:
+                    # 可信个人管理员在群里 /memory on 等同于开启当前群会话（与 /memory group on directed 一致）。
+                    await service.set_group_enabled(replace(identity, profile="public"), True, "directed")
+                if identity.profile == "public":
+                    await service.set_member_enabled(identity, True, require_scope_enabled=True)
+                else:
+                    await service.set_enabled(identity, True)
+                    await service.set_member_enabled(identity, True)
             else:
                 await service.set_enabled(identity, True)
                 await service.set_member_enabled(identity, True)

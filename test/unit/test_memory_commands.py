@@ -19,35 +19,77 @@ def _group_identity(actor: int, *, group_id: int = GROUP_ID, admin_profile: bool
 
 
 @pytest.mark.asyncio
-async def test_regular_group_member_on_does_not_enable_scope(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {GROUP_ID})
-    identity = _group_identity(20202)
+async def test_group_scope_is_off_by_default_until_admin_enables(tmp_path) -> None:
+    """默认全关：群作用域未开启时，普通成员 /memory on 只能被告知需要管理员先开。"""
+    member = _group_identity(20202)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    scope_id = scope_for(member)
 
-    reply, _ = await handle_memory_command(service, identity, "/memory on")
-    scope = await service.store.scope(scope_for(identity))
+    reply, _ = await handle_memory_command(service, member, "/memory on")
     assert "未由管理员开启" in reply
+    scope = await service.store.scope(scope_id)
     assert scope is not None and not bool(scope["enabled"])
     await service.aclose()
 
 
 @pytest.mark.asyncio
-async def test_regular_group_member_remember_cannot_enable_disabled_scope(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {GROUP_ID})
-    identity = _group_identity(20202)
+async def test_group_member_on_off_only_affects_own_membership(tmp_path) -> None:
+    """管理员开启群会话后，普通成员 on/off 只改本人，不动群级策略。"""
+    admin = _group_identity(90909, personal_admin=True)
+    member = _group_identity(20202)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    scope_id = scope_for(member)
 
-    reply, _ = await handle_memory_command(service, identity, "/memory remember 不应写入")
-    scope = await service.store.scope(scope_for(identity))
-    assert "未由管理员开启" in reply
-    assert scope is not None and not bool(scope["enabled"])
-    assert await service.list_facts(identity) == []
+    await service.set_group_enabled(admin, True, "all")
+    reply, _ = await handle_memory_command(service, member, "/memory off")
+    assert "已停止采集和使用" in reply
+    assert await service.store.member_enabled(scope_id, 20202) is False
+
+    reply, _ = await handle_memory_command(service, member, "/memory on")
+    assert "已开启当前作用域的记忆" in reply
+    assert await service.store.member_enabled(scope_id, 20202) is True
+    scope = await service.store.scope(scope_id)
+    assert scope is not None and bool(scope["enabled"]) and scope["capture_mode"] == "all"
     await service.aclose()
 
 
 @pytest.mark.asyncio
-async def test_admin_group_memory_still_requires_deployment_allowlist(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", set())
+async def test_personal_admin_memory_on_enables_current_group_session(tmp_path) -> None:
+    """可信个人管理员在群里 /memory on 等价于开启当前群会话，不必再发 group on。"""
+    admin = _group_identity(90909, personal_admin=True)
+    service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    scope_id = scope_for(admin)
+
+    reply, _ = await handle_memory_command(service, admin, "/memory on")
+    assert "已开启当前作用域的记忆" in reply
+    scope = await service.store.scope(scope_id)
+    assert scope is not None and bool(scope["enabled"]) and scope["capture_mode"] == "directed"
+    assert await service.store.member_enabled(scope_id, 90909) is True
+    await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_group_off_by_admin_blocks_member_remember_and_on(tmp_path) -> None:
+    """群级策略仍只由可信管理员控制：管理员关掉后，普通成员不能靠 remember/on 重新打开。"""
+    admin = _group_identity(90909, personal_admin=True)
+    member = _group_identity(20202)
+    service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    await service.set_group_enabled(admin, False)
+
+    reply, _ = await handle_memory_command(service, member, "/memory remember 不应写入")
+    assert "未由管理员开启" in reply
+    reply, _ = await handle_memory_command(service, member, "/memory on")
+    assert "未由管理员开启" in reply
+    scope = await service.store.scope(scope_for(member))
+    assert scope is not None and not bool(scope["enabled"])
+    assert await service.list_facts(member) == []
+    await service.aclose()
+
+
+@pytest.mark.asyncio
+async def test_group_allowlist_can_still_restrict_scope(tmp_path, monkeypatch) -> None:
+    """allowlist 留空 = 所有群；显式列出别的群号时，当前群被排除。"""
+    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {GROUP_ID + 1})
     identity = _group_identity(90909, admin_profile=True, personal_admin=True)
     db_path = tmp_path / "memory.sqlite3"
     service = MemoryService(enabled=True, db_path=db_path)
@@ -55,6 +97,7 @@ async def test_admin_group_memory_still_requires_deployment_allowlist(tmp_path, 
     with pytest.raises(ValueError, match="not available"):
         await service.remember_explicit(identity, "管理员内容")
     assert not db_path.exists()
+    await service.aclose()
 
 
 @pytest.mark.asyncio
@@ -125,13 +168,13 @@ async def test_regular_group_member_cannot_rotate_public_group_conversation(tmp_
 
 
 @pytest.mark.asyncio
-async def test_group_policy_and_group_remember_require_admin_path(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {GROUP_ID})
+async def test_group_policy_and_group_remember_require_admin_path(tmp_path) -> None:
     admin = _group_identity(90909, personal_admin=True)
     service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
 
     with pytest.raises(ValueError, match="trusted administrator"):
         await service.set_enabled(admin, True)
+    # 默认关闭：管理员开群之前 remember 会被拒绝
     reply, _ = await handle_memory_command(service, admin, "/memory group remember 群约定")
     scope = await service.store.scope(scope_for(admin))
     assert "未由管理员开启" in reply
@@ -139,7 +182,7 @@ async def test_group_policy_and_group_remember_require_admin_path(tmp_path, monk
 
     reply, _ = await handle_memory_command(service, admin, "/memory group on all")
     assert "已开启当前群记忆" in reply
-    reply, _ = await handle_memory_command(service, admin, "/memory group remember 群约定")
+    reply, _ = await handle_memory_command(service, admin, "/memory group remember 群约定二")
     assert "已保存群约定" in reply
     await service.aclose()
 

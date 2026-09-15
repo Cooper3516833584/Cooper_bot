@@ -228,7 +228,8 @@ class MemoryService:
 
     def _identity_scope(self, identity: MemoryIdentity) -> str | None:
         if not self.enabled or not valid_identity(identity): return None
-        if identity.scene == "group" and identity.group_id not in config.AI_MEMORY_GROUP_ALLOWLIST: return None
+        # 群记忆默认全开：allowlist 留空 = 所有群都启用；显式列出群号时只在这些群启用。
+        if identity.scene == "group" and config.AI_MEMORY_GROUP_ALLOWLIST and identity.group_id not in config.AI_MEMORY_GROUP_ALLOWLIST: return None
         return scope_for(identity)
 
     async def _ensure(self, identity: MemoryIdentity):

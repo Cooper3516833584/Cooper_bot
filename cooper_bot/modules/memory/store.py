@@ -12,6 +12,10 @@ from typing import Any, Callable
 
 _SCHEMA_VERSION = 3
 
+# 新 scope 的默认策略：默认不采集，必须显式开启（私聊 /memory on；群由可信管理员 /memory group on）。
+_DEFAULT_SCOPE_ENABLED = 0
+_DEFAULT_CAPTURE_MODE = "directed"
+
 
 class MemoryStore:
     """SQLite facade whose connection never escapes its one worker thread."""
@@ -127,7 +131,8 @@ class MemoryStore:
     def _ensure_scope(self, scope_id: str, bot_id: int, profile: str, kind: str, target_id: int, owner_user_id: int | None) -> dict:
         c, now = self._c(), time.time()
         with c:
-            c.execute("INSERT OR IGNORE INTO memory_scopes(scope_id,bot_id,profile,kind,target_id,owner_user_id,active_conversation_id,updated_at) VALUES(?,?,?,?,?,?,?,?)", (scope_id,bot_id,profile,kind,target_id,owner_user_id,uuid.uuid4().hex,now))
+            # 新作用域默认关闭；已有作用域保持自己的 on/off 与 capture_mode（用户操作过的不被覆盖）。
+            c.execute("INSERT OR IGNORE INTO memory_scopes(scope_id,bot_id,profile,kind,target_id,owner_user_id,enabled,capture_mode,active_conversation_id,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (scope_id,bot_id,profile,kind,target_id,owner_user_id,_DEFAULT_SCOPE_ENABLED,_DEFAULT_CAPTURE_MODE,uuid.uuid4().hex,now))
             c.execute("UPDATE memory_scopes SET updated_at=? WHERE scope_id=?", (now, scope_id))
         return dict(c.execute("SELECT * FROM memory_scopes WHERE scope_id=?", (scope_id,)).fetchone())
 
