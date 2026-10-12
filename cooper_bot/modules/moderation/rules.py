@@ -18,8 +18,10 @@ _AD_PHRASES = (
     "报名优惠", "限时优惠", "私聊领取", "免费领取", "添加微信", "加微信",
 )
 _GROUP_INVITE_ACTION_RE = re.compile(
-    r"加群|进群|入群|加入新群|转入新群|扫码进群|进交流群|加入交流群|家教群|资料群|技能学习交流群|学习交流群"
+    r"加群|进群|入群|加入新群|转入新群|扫码进群|进交流群|加入交流群|家教群|资料群|技能学习交流群|学习交流群|进入新群|进新群|前往新群"
 )
+_GROUP_MIGRATION_RE = re.compile(r"本群(?:即将|将|马上)?(?:解散|停用|关闭|停止使用)")
+_NEW_GROUP_HINT_RE = re.compile(r"新群|换群|转群|群二维码")
 _GROUP_NUMBER_RE = re.compile(r"(?:QQ群号?|群号|加群|进群)[^\d]{0,8}\d{5,12}|\d{5,12}[^\d]{0,5}(?:群号|QQ群)")
 
 
@@ -162,9 +164,11 @@ def calculate_local_votes(records: Iterable[dict], anchor_at: float) -> VoteResu
     any_image = False
     any_ad_phrase = False
     any_group_invite = False
+    window_combined_parts: list[str] = []
     for row, text in zip(in_window, texts):
         card_text, card_targets, card_invite = record_card_text_and_targets(row)
         combined = normalize_visible_text(text + " " + card_text)
+        window_combined_parts.append(combined)
         targets = _URL_RE.findall(normalize_visible_text(text)) + card_targets
         if targets:
             any_link = True
@@ -182,6 +186,9 @@ def calculate_local_votes(records: Iterable[dict], anchor_at: float) -> VoteResu
                 host = ""
             if host in {"jq.qq.com", "qun.qq.com"}:
                 any_group_invite = True
+    window_combined = " ".join(window_combined_parts)
+    if _GROUP_MIGRATION_RE.search(window_combined) and _NEW_GROUP_HINT_RE.search(window_combined):
+        any_group_invite = True
 
     votes = {
         "L": 0,

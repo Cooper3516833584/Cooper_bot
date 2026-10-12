@@ -795,12 +795,12 @@ class ModerationService:
                     target = str(data.get("qq") or data.get("user_id") or "")
                     if not target:
                         raise ValueError("incomplete original at segment")
-                    content.append({"type": "text", "data": {"text": f"（原@对象 QQ:{target}，未触发通知）"}})
+                    content_segments.append({"type": "text", "data": {"text": f"（原@对象 QQ:{target}，未触发通知）"}})
                 elif kind == "reply":
                     reply_id = str(data.get("id") or data.get("message_id") or "")
                     if not reply_id:
                         raise ValueError("incomplete original reply segment")
-                    content.append({"type": "text", "data": {"text": f"（原引用消息 ID:{reply_id}）"}})
+                    content_segments.append({"type": "text", "data": {"text": f"（原引用消息 ID:{reply_id}）"}})
                 elif kind not in _FORWARD_SEGMENTS:
                     raise ValueError("unsupported original segment")
                 elif kind == "text":

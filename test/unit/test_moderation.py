@@ -63,6 +63,60 @@ def test_short_burst_vote_uses_closed_20_second_window_and_100_characters():
     assert calculate_local_votes(duplicate_id, anchor).votes["B"] == 0
 
 
+def test_direct_new_group_phrase_with_image_reaches_review_at_low_member_level():
+    row = _text_record("401", 1000.0, "本群即将解散，请扫下方二维码进入新群")
+    row["segments"].append({"type": "image", "data": {"file": "ad.jpg"}})
+    votes = with_member_level(calculate_local_votes([row], 1000.0), 1)
+
+    assert votes.votes["L"] == 1
+    assert votes.votes["I"] == 1
+    assert votes.votes["G"] == 1
+    assert votes.total == 3
+    assert votes.needs_review
+
+
+def test_group_migration_and_new_group_hint_combine_only_inside_vote_window():
+    anchor = 1000.0
+    migration = _text_record("402", anchor - 5, "本群即将解散")
+    new_group = _text_record("403", anchor, "新群二维码在群公告")
+    assert calculate_local_votes([migration, new_group], anchor).votes["G"] == 1
+
+    card_hint = _text_record("407", anchor, "")
+    card_hint["segments"] = [{"type": "share", "data": {"title": "新群二维码", "content": "请查看群公告"}}]
+    assert calculate_local_votes([migration, card_hint], anchor).votes["G"] == 1
+
+    outside_window = _text_record("404", anchor - 20.001, "本群即将解散")
+    assert calculate_local_votes([outside_window, new_group], anchor).votes["G"] == 0
+
+
+@pytest.mark.parametrize("text", ["本群即将解散", "新群有多少人", "QQ群里今天很热闹"])
+def test_group_migration_vote_requires_a_specific_new_group_hint(text):
+    assert calculate_local_votes([_text_record("405", 1000.0, text)], 1000.0).votes["G"] == 0
+
+
+def test_group_invite_does_not_change_b_vote_or_review_threshold():
+    anchor = 1000.0
+    long_text = "本群即将解散，请进入新群。" + ("补充说明。" * 30)
+    row = _text_record("same", anchor, long_text)
+    local = calculate_local_votes([row], anchor)
+    assert local.text_count >= 100
+    assert local.votes["B"] == 0
+    assert local.votes["G"] == 1
+
+    duplicate_id = _text_record("same", anchor - 1, long_text)
+    duplicate = calculate_local_votes([duplicate_id, row], anchor)
+    assert duplicate.votes["B"] == 0
+
+    low_level = with_member_level(local, 1)
+    assert low_level.total == 2
+    assert low_level.needs_review is False
+
+
+def test_group_invite_uses_existing_visible_text_normalization():
+    row = _text_record("406", 1000.0, "本群即将解散，请进入\u200b新群")
+    assert calculate_local_votes([row], 1000.0).votes["G"] == 1
+
+
 def test_store_deduplicates_by_message_id_and_preserves_case_evidence(tmp_path):
     store = ModerationStore(tmp_path / "moderation.sqlite3")
     assert store.get_group_state(500, 700)["enabled"] is False
@@ -379,7 +433,7 @@ async def test_on_requires_bot_admin_but_off_does_not(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("decision", ["block", "uncertain", "image_failure"])
+@pytest.mark.parametrize("decision", ["block", "uncertain", "image_failure", "malformed_at", "malformed_reply"])
 async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monkeypatch, decision):
     now = time.time()
     api = _FakeAPI()
@@ -405,6 +459,13 @@ async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monk
 
         first = _text_record("101", now - 8, "课程资料说明与作业安排。" * 6)
         second = _text_record("102", now - 2, "有偿家教推广，添加微信了解详情 https://example.invalid/offer。" + ("报名说明。" * 5))
+        if decision == "block":
+            second["segments"].extend([
+                {"type": "at", "data": {"qq": "all"}},
+                {"type": "reply", "data": {"id": "12345"}},
+            ])
+        elif decision.startswith("malformed_"):
+            second["segments"].append({"type": decision.removeprefix("malformed_"), "data": {}})
         if decision == "image_failure":
             second["segments"].extend(
                 {"type": "image", "data": {"file_id": f"img-{index}", "url": f"https://media.invalid/{index}"}}
@@ -426,6 +487,9 @@ async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monk
             assert api.writes == []
             if decision == "image_failure":
                 assert gateway.payload is None
+        elif decision.startswith("malformed_"):
+            assert cases["decision"] == "skipped"
+            assert api.writes == []
         else:
             assert cases["decision"] == "block"
             assert [item[0] for item in api.writes] == ["forward", "notice", "kick", "delete", "result"]
@@ -433,6 +497,19 @@ async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monk
             assert api.writes[3] == ("delete", 102)
             notice_text = api.writes[1][2][0]["data"]["text"]
             assert "如认为踢出错误请找管理员申诉" in notice_text
+            forward_node = next(
+                node for node in api.writes[0][2][1:]
+                if any("message_id=102" in segment.get("data", {}).get("text", "")
+                       for segment in node["data"]["content"])
+            )
+            forward_content = forward_node["data"]["content"]
+            forward_text = "".join(
+                segment.get("data", {}).get("text", "")
+                for segment in forward_content if segment.get("type") == "text"
+            )
+            assert "原@对象 QQ:all，未触发通知" in forward_text
+            assert "原引用消息 ID:12345" in forward_text
+            assert not any(segment.get("type") in {"at", "reply"} for segment in forward_content)
     finally:
         await service.close()
 
@@ -466,6 +543,74 @@ def test_forward_batches_split_by_count_and_preserve_long_text():
             {"user_id": 900, "messages": batch}, ensure_ascii=False, separators=(",", ":")
         )
         assert len(payload.encode("utf-8")) <= 256 * 1024
+
+
+def test_original_nodes_safely_preserve_mixed_at_reply_image_and_text_order():
+    service = ModerationService(store=SimpleNamespace())
+    occurred_at = 1_800_000_050.0
+    row = _text_record("301", occurred_at, "请看结尾")
+    row["segments"] = [
+        {"type": "text", "data": {"text": "请看"}},
+        {"type": "at", "data": {"qq": "all"}},
+        {"type": "reply", "data": {"id": "12345"}},
+        {"type": "image", "data": {"url": "https://media.invalid/test.jpg", "file": "test.jpg"}},
+        {"type": "text", "data": {"text": "结尾"}},
+    ]
+    original_nodes = service._original_nodes(100, [row])
+    batches = service._build_forward_batches(
+        self_id=500, group_id=700, user_id=100, case_id="case-mixed", category="unsolicited_ad",
+        recipient=900, messages=[row], action_at=1_800_000_100,
+        enabled_at=1_800_000_000, gap_at=None,
+    )
+
+    node = original_nodes[0][0]
+    content = node["data"]["content"]
+    text_segments = [segment["data"]["text"] for segment in content if segment.get("type") == "text"]
+    joined_text = "".join(text_segments)
+    assert "message_id=301" in text_segments[0]
+    assert service._message_time(occurred_at) in text_segments[0]
+    assert joined_text.index("请看") < joined_text.index("原@对象 QQ:all")
+    assert joined_text.index("原@对象 QQ:all") < joined_text.index("原引用消息 ID:12345")
+    assert joined_text.index("原引用消息 ID:12345") < joined_text.index("结尾")
+    assert not any(segment.get("type") in {"at", "reply"} for segment in content)
+    assert next(segment for segment in content if segment.get("type") == "image") == row["segments"][3]
+
+    batch_node = batches[0][1]
+    assert batch_node["data"]["content"] == content
+    for batch in batches:
+        payload = json.dumps(
+            {"user_id": 900, "messages": batch}, ensure_ascii=False, separators=(",", ":")
+        )
+        assert len(payload.encode("utf-8")) <= 256 * 1024
+
+
+@pytest.mark.parametrize("kind", ["at", "reply"])
+def test_original_nodes_reject_incomplete_at_or_reply_segments(kind):
+    service = ModerationService(store=SimpleNamespace())
+    row = _text_record("302", 1_800_000_050.0, "缺少字段")
+    row["segments"] = [{"type": kind, "data": {}}]
+    with pytest.raises(ValueError, match="incomplete original"):
+        service._original_nodes(100, [row])
+
+
+def test_record_from_event_preserves_array_segments_and_does_not_parse_cq_text():
+    segments = [
+        {"type": "text", "data": {"text": "看这里"}},
+        {"type": "image", "data": {"file": "test.jpg"}},
+        {"type": "at", "data": {"qq": "all"}},
+        {"type": "reply", "data": {"id": "12345"}},
+    ]
+    event = {
+        "post_type": "message", "message_type": "group", "self_id": 500, "group_id": 700,
+        "user_id": 100, "message_id": 501, "time": 1000.0, "message": segments,
+    }
+    record = service_module._record_from_event(event, 1000.0)
+    assert record["segments"] == segments
+    assert [segment["type"] for segment in record["segments"]] == ["text", "image", "at", "reply"]
+
+    cq_event = {**event, "message_id": 502, "message": "[CQ:image,file=not-a-real-image.jpg]"}
+    cq_record = service_module._record_from_event(cq_event, 1000.0)
+    assert [segment["type"] for segment in cq_record["segments"]] == ["text"]
 
 
 @pytest.mark.asyncio
