@@ -192,11 +192,11 @@ def calculate_local_votes(records: Iterable[dict], anchor_at: float) -> VoteResu
 
     votes = {
         "L": 0,
-        "B": b_vote,
+        "B": 2 * b_vote,
         "U": int(any_link),
         "I": int(any_image),
-        "K": int(any_ad_phrase),
-        "G": int(any_group_invite),
+        "K": 3 * int(any_ad_phrase),
+        "G": 3 * int(any_group_invite),
     }
     hits = tuple(name for name in VOTE_ORDER if votes[name])
     return VoteResult(votes, sum(votes.values()), hits, ids, count)
@@ -205,7 +205,7 @@ def calculate_local_votes(records: Iterable[dict], anchor_at: float) -> VoteResu
 def with_member_level(local: VoteResult, member_level: object) -> VoteResult:
     level = parse_group_level(member_level)
     votes = dict(local.votes)
-    votes["L"] = int(level in {0, 1, 2}) if level is not None else 0
+    votes["L"] = int(level is not None and level <= 4)
     return VoteResult(
         votes=votes,
         total=sum(votes.values()),

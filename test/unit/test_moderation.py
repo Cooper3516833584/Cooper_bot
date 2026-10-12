@@ -46,9 +46,11 @@ def test_group_level_is_strict_and_votes_are_bounded():
         [_text_record("1", now - 10, text_a), _text_record("2", now, text_b)], now,
     )
     full = with_member_level(vote, "1")
-    assert vote.votes == {"L": 0, "B": 1, "U": 1, "I": 0, "K": 1, "G": 0}
-    assert full.total == 4
+    assert vote.votes == {"L": 0, "B": 2, "U": 1, "I": 0, "K": 3, "G": 0}
+    assert full.total == 7
     assert with_member_level(vote, True).votes["L"] == 0
+    assert with_member_level(vote, 4).votes["L"] == 1
+    assert with_member_level(vote, 5).votes["L"] == 0
 
 
 def test_short_burst_vote_uses_closed_20_second_window_and_100_characters():
@@ -57,7 +59,7 @@ def test_short_burst_vote_uses_closed_20_second_window_and_100_characters():
     ninety_nine = [_text_record("a", 980.0, "x" * 49), _text_record("b", anchor, "y" * 50)]
     outside_window = [_text_record("a", 979.999, "x" * 100), _text_record("b", anchor, "y" * 100)]
     duplicate_id = [_text_record("same", 980.0, "x" * 100), _text_record("same", anchor, "y" * 100)]
-    assert calculate_local_votes(exactly_100, anchor).votes["B"] == 1
+    assert calculate_local_votes(exactly_100, anchor).votes["B"] == 2
     assert calculate_local_votes(ninety_nine, anchor).votes["B"] == 0
     assert calculate_local_votes(outside_window, anchor).votes["B"] == 0
     assert calculate_local_votes(duplicate_id, anchor).votes["B"] == 0
@@ -70,8 +72,8 @@ def test_direct_new_group_phrase_with_image_reaches_review_at_low_member_level()
 
     assert votes.votes["L"] == 1
     assert votes.votes["I"] == 1
-    assert votes.votes["G"] == 1
-    assert votes.total == 3
+    assert votes.votes["G"] == 3
+    assert votes.total == 5
     assert votes.needs_review
 
 
@@ -79,11 +81,11 @@ def test_group_migration_and_new_group_hint_combine_only_inside_vote_window():
     anchor = 1000.0
     migration = _text_record("402", anchor - 5, "本群即将解散")
     new_group = _text_record("403", anchor, "新群二维码在群公告")
-    assert calculate_local_votes([migration, new_group], anchor).votes["G"] == 1
+    assert calculate_local_votes([migration, new_group], anchor).votes["G"] == 3
 
     card_hint = _text_record("407", anchor, "")
     card_hint["segments"] = [{"type": "share", "data": {"title": "新群二维码", "content": "请查看群公告"}}]
-    assert calculate_local_votes([migration, card_hint], anchor).votes["G"] == 1
+    assert calculate_local_votes([migration, card_hint], anchor).votes["G"] == 3
 
     outside_window = _text_record("404", anchor - 20.001, "本群即将解散")
     assert calculate_local_votes([outside_window, new_group], anchor).votes["G"] == 0
@@ -101,20 +103,20 @@ def test_group_invite_does_not_change_b_vote_or_review_threshold():
     local = calculate_local_votes([row], anchor)
     assert local.text_count >= 100
     assert local.votes["B"] == 0
-    assert local.votes["G"] == 1
+    assert local.votes["G"] == 3
 
     duplicate_id = _text_record("same", anchor - 1, long_text)
     duplicate = calculate_local_votes([duplicate_id, row], anchor)
     assert duplicate.votes["B"] == 0
 
     low_level = with_member_level(local, 1)
-    assert low_level.total == 2
-    assert low_level.needs_review is False
+    assert low_level.total == 4
+    assert low_level.needs_review is True
 
 
 def test_group_invite_uses_existing_visible_text_normalization():
     row = _text_record("406", 1000.0, "本群即将解散，请进入\u200b新群")
-    assert calculate_local_votes([row], 1000.0).votes["G"] == 1
+    assert calculate_local_votes([row], 1000.0).votes["G"] == 3
 
 
 def test_store_deduplicates_by_message_id_and_preserves_case_evidence(tmp_path):
