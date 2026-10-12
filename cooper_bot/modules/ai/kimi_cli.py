@@ -465,7 +465,30 @@ class KimiCliRunner:
         argv.extend(["--prompt", str(request.prompt or "")])
         result = tuple(argv)
         if os.name == "nt" and _windows_argv_units(result) > self._argv_budget:
-            raise KimiInputTooLargeError(request.request_id)
+            # 只裁剪 aichat 的旧历史，不截断当前请求，也不改变固定 agent/工具边界。
+            try:
+                payload = json.loads(request.prompt) if request.purpose == "qq_chat" else None
+            except (TypeError, ValueError):
+                payload = None
+            history = payload.get("conversation_history") if isinstance(payload, dict) else None
+            if not isinstance(history, list):
+                raise KimiInputTooLargeError(request.request_id)
+            low, high = 1, len(history)
+            fitting = None
+            while low <= high:
+                omitted = (low + high) // 2
+                payload["conversation_history"] = history[omitted:]
+                payload["omitted_older_messages"] = omitted
+                argv[-1] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                result = tuple(argv)
+                if _windows_argv_units(result) <= self._argv_budget:
+                    fitting = result
+                    high = omitted - 1
+                else:
+                    low = omitted + 1
+            if fitting is None:
+                raise KimiInputTooLargeError(request.request_id)
+            result = fitting
         return result
 
     async def _acquire_slot(self, request: KimiRunRequest) -> tuple[bool, bool]:

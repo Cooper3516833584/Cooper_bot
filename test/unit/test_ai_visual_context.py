@@ -198,10 +198,10 @@ def test_select_history_windows() -> None:
     ds = svc._select_history_for_backend(history, "deepseek")
     assert len(ds) == 300
     kimi = svc._select_history_for_backend(history, "kimi")
-    assert len(kimi) == 100
-    # 第 150 条：DeepSeek 任务窗口可见，Kimi 聊天窗口不可见。
+    assert len(kimi) == 300
+    # 两个后端均保留最近 300 条。
     assert "msg-150" in {m["content"] for m in ds}
-    assert "msg-150" not in {m["content"] for m in kimi}
+    assert "msg-150" in {m["content"] for m in kimi}
 
 
 def test_normalize_vision_slots_filters_invalid() -> None:
@@ -265,7 +265,7 @@ def test_materialize_history_removes_internal_fields() -> None:
 def test_collect_unresolved_by_backend_window() -> None:
     svc = _new_aisvc()
     # 构造 150 条历史，第 1 条（index 0）带 unresolved slot：
-    # 150 条里 index 0 在 DeepSeek 任务窗口内，但不在 Kimi 的最后 100 条窗口内。
+    # 150 条均在两个后端的 300 条窗口内。
     history = _make_history(150)
     history[0] = {
         "role": "user",
@@ -279,7 +279,7 @@ def test_collect_unresolved_by_backend_window() -> None:
     deepseek = svc.collect_unresolved_vision_slots("group:1", "deepseek")
     assert len(deepseek) == 1  # 300 窗口内可见
     kimi = svc.collect_unresolved_vision_slots("group:1", "kimi")
-    assert kimi == []  # 最后 100 条窗口内不可见（第 1 条）
+    assert len(kimi) == 1
 
 
 def test_apply_vision_resolutions_by_slot_id() -> None:

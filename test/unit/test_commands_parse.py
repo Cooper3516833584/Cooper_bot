@@ -100,6 +100,29 @@ def test_signin_eval_rejects_average_far_from_deadline() -> None:
     assert "截止时间" in (commands._evaluate_signin_ocr_result(res, deadline_ts=deadline_ts) or "")
 
 
+def test_signin_minute_time_uses_midpoint_for_average() -> None:
+    res = SimpleNamespace(visual_time_text="10:22", timestamp_time_text="10:22:50")
+    assert commands._signin_average_image_time_text(res) == "10:22:40"
+    deadline = time.mktime((2026, 9, 17, 10, 25, 0, 0, 0, -1))
+    assert commands._evaluate_signin_ocr_result(res, deadline_ts=deadline) is None
+    assert res.visual_time_text == "10:22"
+
+
+@pytest.mark.parametrize("minute,stamp,accepted", [
+    ("10:22", "10:25:59", True), ("10:22", "10:26:00", False),
+    ("10:22", "10:19:00", True), ("10:22", "10:18:59", False),
+    ("23:59", "00:02:59", True), ("23:59", "00:03:00", False),
+])
+def test_signin_minute_timestamp_interval_keeps_three_minute_limit(minute, stamp, accepted) -> None:
+    res = SimpleNamespace(visual_time_text=minute, timestamp_time_text=stamp)
+    hour, minute_number = map(int, minute.split(":"))
+    deadline = time.mktime((2026, 9, 17, hour, minute_number, 0, 0, 0, -1))
+    error = commands._evaluate_signin_ocr_result(res, deadline_ts=deadline)
+    assert (error is None) == accepted
+    if not accepted:
+        assert "时间戳" in error
+
+
 def test_extract_signin_image_items_accepts_message_string_cq() -> None:
     evt = {"message": "[CQ:image,file=abc.jpg,url=http://example.test/a.jpg]"}
     items = commands._extract_signin_image_items(evt)
@@ -109,7 +132,8 @@ def test_extract_signin_image_items_accepts_message_string_cq() -> None:
 
 
 @pytest.mark.asyncio
-async def test_private_signin_image_then_name_records_submission(monkeypatch) -> None:
+@pytest.mark.parametrize("precision", ["second", "minute"])
+async def test_private_signin_image_then_name_records_submission(monkeypatch, precision) -> None:
     replies: list[str] = []
 
     async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
@@ -120,6 +144,7 @@ async def test_private_signin_image_then_name_records_submission(monkeypatch) ->
     img_path.parent.mkdir(parents=True, exist_ok=True)
     img_path.write_bytes(b"fake")
     now_text = time.strftime("%H:%M:%S", time.localtime())
+    visual_text = now_text[:5] if precision == "minute" else now_text
 
     async def _fake_download(*_args, **_kwargs):
         return True, "", img_path
@@ -133,8 +158,8 @@ async def test_private_signin_image_then_name_records_submission(monkeypatch) ->
         signin_ocr,
         "recognize_led_time_from_path",
         lambda _path: SimpleNamespace(
-            time_text=now_text,
-            visual_time_text=now_text,
+            time_text=visual_text,
+            visual_time_text=visual_text,
             timestamp_time_text=now_text,
             source="visual",
         ),

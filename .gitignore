@@ -49,6 +49,7 @@ history*.json
 
 # local OCR/test images
 ocr/
+test/ocr/
 
 # wiki upload local artifacts
 config/private/url_and_token.txt

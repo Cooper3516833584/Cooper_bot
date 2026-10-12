@@ -892,6 +892,7 @@ async def reply(
     send_user_id = int(force_private_user_id) if force_private_user_id is not None else ctx.user_id
     send_scene = "private" if force_private_user_id is not None else ctx.scene
     send_group_id = None if force_private_user_id is not None else ctx.group_id
+    setattr(ctx, "_last_reply_message_id", "")
 
     async def _send_once():
         if send_scene == "group" and send_group_id is not None:
@@ -923,6 +924,8 @@ async def reply(
         resp = await _send_once()
 
     if _onebot_resp_ok(resp):
+        data = resp.get("data") if isinstance(resp, dict) else None
+        setattr(ctx, "_last_reply_message_id", str(data.get("message_id") or "") if isinstance(data, dict) else "")
         logsvc.log_out(ctx, text)
         if not skip_context_once:
             _remember_bot_reply_message(ctx, text, logsvc, send_scene, send_group_id, send_user_id)
@@ -1308,6 +1311,9 @@ def _signin_task_deadline_time_text(task_or_ts) -> str:
 def _signin_average_image_time_text(res) -> Optional[str]:
     visual_text = str(getattr(res, "visual_time_text", "") or "").strip()
     stamp_text = str(getattr(res, "timestamp_time_text", "") or "").strip()
+    if re.fullmatch(r"\d{2}:\d{2}", visual_text) and _time_text_to_seconds(visual_text) is not None:
+        # Minute-only OCR denotes an interval; use its midpoint for averaging.
+        visual_text += ":30"
     if visual_text and stamp_text:
         return _clock_average_time_text(visual_text, stamp_text)
     return None
@@ -1322,6 +1328,9 @@ def _evaluate_signin_ocr_result(res, deadline_ts: Optional[float] = None, now_ts
         return "未读取到图片时间戳，请重新拍摄或发送原图。"
 
     stamp_diff = _clock_delta_seconds(visual_text, stamp_text)
+    if stamp_diff is not None and re.fullmatch(r"\d{2}:\d{2}", visual_text):
+        offset = (_time_text_to_seconds(stamp_text) - _time_text_to_seconds(visual_text) + 43200) % 86400 - 43200
+        stamp_diff = float(max(0, -offset, offset - 59))
     if stamp_diff is None or stamp_diff > _SIGNIN_VISUAL_TIMESTAMP_TOLERANCE_SECONDS:
         return f"识别时间与图片时间戳相差超过3分钟（识别 {visual_text}，时间戳 {stamp_text}），请重新拍摄。"
 
@@ -2305,6 +2314,15 @@ def _augment_ai_input_with_sender(ctx, ai_input: str, *, has_visual: bool = Fals
     return _format_group_ai_user_message(ctx, msg, include_sender_for_empty=has_visual)
 
 
+def _ai_chat_speaker(ctx) -> dict:
+    return {
+        "user_id": int(getattr(ctx, "user_id", 0) or 0),
+        "nickname": _compact_ai_sender_text(getattr(ctx, "nickname", "")),
+        "card": _compact_ai_sender_text(getattr(ctx, "card", "")),
+        "is_bot": False,
+    }
+
+
 def _remember_non_ai_chat_message(
     ctx,
     text: str,
@@ -2329,6 +2347,9 @@ def _remember_non_ai_chat_message(
             msg_id=msg_id,
             vision_slots=vision_slots,
         )
+        annotate = getattr(aisvc, "annotate_chat_message", None)
+        if callable(annotate):
+            annotate(session_key, "user", _format_group_ai_user_message(ctx, text, include_sender_for_empty=bool(vision_slots)), msg_id=msg_id, speaker=_ai_chat_speaker(ctx))
     except Exception as e:
         logsvc.log.warning(f"AI chat context non-aichat write failed: session={session_key[:80]} err={e}")
 
@@ -2371,6 +2392,9 @@ def _remember_bot_reply_message(
         return
     try:
         remember_fn(session_key, text)
+        annotate = getattr(aisvc, "annotate_chat_message", None)
+        if callable(annotate):
+            annotate(session_key, "assistant", text, msg_id=getattr(ctx, "_last_reply_message_id", ""), speaker=_ai_chat_speaker(ctx))
     except Exception as e:
         logsvc.log.warning(f"AI chat context bot-reply write failed: session={session_key[:80]} err={e}")
 
@@ -4124,6 +4148,18 @@ async def _handle_ai_chat_trigger(
             await reply(api, ctx, msg, logsvc)
             return True
         chat_with_context_fn = getattr(aisvc, "chat_with_context", None)
+        commit_chat_turn = getattr(aisvc, "commit_chat_turn", None)
+        delivery_context = {"defer_history": True, "speaker": _ai_chat_speaker(ctx), "reply_to": _extract_reply_msg_id(evt) or ""} if callable(commit_chat_turn) else {}
+
+        def _commit_delivered_chat(sent, out):
+            if sent and callable(commit_chat_turn):
+                commit_chat_turn(
+                    session_key, ai_input, out, allow_computer=allow_computer, actor_user_id=ctx.user_id,
+                    msg_id=message_id, vision_slots=current_slots,
+                    assistant_msg_id=getattr(ctx, "_last_reply_message_id", ""),
+                    speaker=delivery_context["speaker"], reply_to=delivery_context["reply_to"],
+                )
+
         chat_fn = getattr(aisvc, "chat", None)
         if not callable(chat_fn):
             await reply(api, ctx, "AI 聊天暂时不可用（Kimi 配置未就绪）。", logsvc)
@@ -4153,6 +4189,7 @@ async def _handle_ai_chat_trigger(
                     if memory_turn.is_duplicate or memory_turn.is_stale_or_disabled:
                         return True
                     context_kwargs = {"msg_id": message_id, "vision_slots": current_slots, "memory_turn": memory_turn}
+                    context_kwargs.update(delivery_context)
                     if allow_computer:
                         context_kwargs.update(allow_computer=True, actor_user_id=ctx.user_id)
                     out = (await chat_with_context_fn(session_key, ai_input, **context_kwargs)).strip()
@@ -4168,12 +4205,14 @@ async def _handle_ai_chat_trigger(
                         pass
                     sent = await reply(api, ctx, out, logsvc, force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None)
                     await memory_turn.finish_delivery(bool(sent))
+                    _commit_delivered_chat(sent, out)
                     return True
             if session_key and callable(chat_with_context_fn):
                 context_kwargs = {
                     "msg_id": message_id,
                     "vision_slots": current_slots,
                 }
+                context_kwargs.update(delivery_context)
                 if allow_computer:
                     context_kwargs.update(
                         allow_computer=True,
@@ -4196,13 +4235,14 @@ async def _handle_ai_chat_trigger(
                     out = (await chat_fn(ai_input)).strip()
             if not out:
                 out = "我这边没收到有效回复，稍后再试一次。"
-            await reply(
+            sent = await reply(
                 api,
                 ctx,
                 out,
                 logsvc,
                 force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None,
             )
+            _commit_delivered_chat(sent, out)
         except Exception as e:
             try:
                 logsvc.log.warning(

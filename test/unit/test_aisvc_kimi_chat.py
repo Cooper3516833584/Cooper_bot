@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import sqlite3
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from cooper_bot.modules.ai.aisvc import AIService
 from cooper_bot.modules.memory.models import CapturedInput, MemoryIdentity
 from cooper_bot.modules.memory.service import MemoryService
+import cooper_bot.commands.commands as commands
 
 
 class _Log:
@@ -28,6 +30,82 @@ class _Runner:
     async def run(self, request):
         self.requests.append(request)
         return SimpleNamespace(text="kimi-reply", tool_call_observed=False, tool_names=())
+
+
+@pytest.mark.asyncio
+async def test_aichat_retains_300_full_messages_without_memory_budget(monkeypatch) -> None:
+    svc = AIService(_Log())
+    svc._kimi_runner = _Runner()
+    svc._public_runtime_safe = True
+    _patch_settings_validation(monkeypatch)
+    for index in range(305):
+        svc.remember_user_message("group:30303", f"{index}:" + "完整内容" * 30, msg_id=str(index))
+    await svc.kimi_chat_with_context("group:30303", "继续", defer_history=True)
+    payload = json.loads(svc._kimi_runner.requests[0].prompt)
+    assert len(payload["conversation_history"]) == 300
+    assert payload["conversation_history"][0]["content"] == "5:" + "完整内容" * 30
+    assert payload["conversation_history"][-1]["message_id"] == "304"
+    assert len(svc._kimi_runner.requests[0].prompt) > 7000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_aichat_commits_only_delivered_replies_and_preserves_quote_identity(monkeypatch, confirmed) -> None:
+    svc = AIService(_Log())
+    svc._kimi_runner = _Runner()
+    svc._public_runtime_safe = True
+    svc.memory = None
+    _patch_settings_validation(monkeypatch)
+    monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_args: False)
+    monkeypatch.setattr(commands, "_claim_recent_reply", lambda _key: True)
+    ctx = SimpleNamespace(scene="group", group_id=30303, user_id=3516833584, nickname="Cooper", card="Cooper", level=1, _ai_chat_context_aisvc=svc)
+    logsvc = SimpleNamespace(log=SimpleNamespace(info=lambda _text: None, warning=lambda _text: None), log_out=lambda *_args: None)
+    api = SimpleNamespace(send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 123}}))
+    commands._remember_non_ai_chat_message(ctx, "查一下通知", logsvc, svc, msg_id="122")
+    assert await commands.reply(api, ctx, "这是机器人自己的通知回复", logsvc)
+    bot_message = svc.find_chat_message_by_msg_id("group:30303", "123")
+    assert bot_message["role"] == "assistant"
+    api.send_group_msg.return_value = {"status": "ok", "retcode": 0, "data": {"message_id": 125}} if confirmed else None
+    evt = {"self_id": 1622236011, "message": [{"type": "reply", "data": {"id": "123"}}]}
+    assert await commands._handle_ai_chat_trigger(api, ctx, evt, "这是谁说的", logsvc, svc, forced_ai_input="这是谁说的", message_id="124")
+    payload = json.loads(svc._kimi_runner.requests[0].prompt)
+    assert payload["current_speaker"]["nickname"] == "Cooper"
+    assert payload["reply_to_message_id"] == "123"
+    assert payload["conversation_history"][0]["speaker"]["user_id"] == 3516833584
+    assert payload["conversation_history"][1]["speaker"] == {"name": "Cooper_bot", "is_bot": True}
+    history = svc._load_active_chat_history("group:30303")
+    assert len(history) == (4 if confirmed else 2)
+    if confirmed:
+        assert history[-1]["_msg_id"] == "125"
+        assert history[-2]["_reply_to"] == "123"
+        assert history[-2]["_speaker"]["nickname"] == "Cooper"
+
+
+@pytest.mark.asyncio
+async def test_short_term_history_respects_memory_epoch_and_member_opt_out(tmp_path, monkeypatch) -> None:
+    group = 30303
+    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {group})
+    svc = AIService(_Log())
+    svc._kimi_runner = _Runner()
+    svc._public_runtime_safe = True
+    _patch_settings_validation(monkeypatch)
+    svc.memory = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    operator = MemoryIdentity(10101, 90909, "group", group, "public", True, True)
+    member = MemoryIdentity(10101, 20201, "group", group, "public")
+    await svc.memory.set_group_enabled(operator, True, "all")
+    await svc.memory.set_member_enabled(member, False)
+    svc._save_chat_turn("group:30303", "OPTED_OUT_USER", "OPTED_OUT_REPLY", speaker={"user_id": member.actor_user_id})
+    first = await svc.memory.turn(operator, CapturedInput("first", "now"))
+    async with first:
+        await svc.kimi_chat_with_context("group:30303", "now", memory_turn=first)
+    assert "OPTED_OUT" not in svc._kimi_runner.requests[-1].prompt
+    assert svc._load_active_chat_history("group:30303")
+    await svc.memory.store.rotate_conversation(first.scope_id)
+    second = await svc.memory.turn(operator, CapturedInput("second", "after clear"))
+    async with second:
+        await svc.kimi_chat_with_context("group:30303", "after clear", memory_turn=second)
+    assert json.loads(svc._kimi_runner.requests[-1].prompt)["conversation_history"] == []
+    await svc.memory.aclose()
 
 
 def _patch_settings_validation(monkeypatch, *, public: bool = True, admin: bool = True) -> None:
@@ -161,7 +239,7 @@ def test_clear_admin_chat_history_only_resets_matching_actor_and_session() -> No
 
 
 @pytest.mark.asyncio
-async def test_public_group_memory_prompt_keeps_each_actor_id(monkeypatch) -> None:
+async def test_public_group_chat_history_independent_of_memory_snapshot(monkeypatch) -> None:
     svc = AIService(_Log())
     svc.system_prompt = "system"
     runner = _Runner()
@@ -182,12 +260,16 @@ async def test_public_group_memory_prompt_keeps_each_actor_id(monkeypatch) -> No
         )),
     )
 
+    svc._save_chat_turn("group:30303", "甲说的话", "上一轮回复", speaker={"user_id": 20201, "nickname": "Cooper"})
+    svc.remember_user_message("group:30303", "乙说的话", msg_id="other-user")
+    svc.annotate_chat_message("group:30303", "user", "乙说的话", msg_id="other-user", speaker={"user_id": 20202, "nickname": "乙"})
     await svc.kimi_chat_with_context("group:30303", "现在是谁在问？", memory_turn=memory_turn)
 
     history = json.loads(runner.requests[0].prompt)["conversation_history"]
-    assert "[发言人QQ:20201]" in history[0]["content"]
+    assert history[0]["speaker"]["user_id"] == 20201
     assert history[1]["content"] == "上一轮回复"
-    assert "[发言人QQ:20202]" in history[2]["content"]
+    assert history[1]["speaker"] == {"name": svc.bot_nick, "is_bot": True}
+    assert history[2]["speaker"]["user_id"] == 20202
 
 
 @pytest.mark.asyncio
