@@ -146,7 +146,7 @@ async def handle_kick_command(
             saved = await service.disable_scope(token)
         except Exception:
             saved = False
-        message = "本群自动反广告已关闭。" if saved else "已在本次运行停止，但保存失败，重启后请确认状态。"
+        message = "我不杀哩😭" if saved else "已在本次运行停止，但保存失败，重启后请确认状态。"
         await _send_command_reply(api, ctx, message)
         return True
 

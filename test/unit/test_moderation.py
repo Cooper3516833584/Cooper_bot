@@ -640,7 +640,11 @@ async def test_dispatch_handles_kick_before_regular_side_effects(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_kick_on_success_replies_with_requested_text(monkeypatch):
+@pytest.mark.parametrize(
+    ("action", "enabled", "reply"),
+    [("on", True, "开杀😋"), ("off", False, "我不杀哩😭")],
+)
+async def test_kick_control_success_replies_with_requested_text(monkeypatch, action, enabled, reply):
     sent = []
 
     class _API:
@@ -654,23 +658,27 @@ async def test_kick_on_success_replies_with_requested_text(monkeypatch):
 
     class _Service:
         def begin_control(self, _scope, *, enabled):
-            assert enabled is True
+            assert enabled is expected_enabled
             return {"token": "control"}
 
         async def enable_scope(self, **_kwargs):
             return True
 
+        async def disable_scope(self, _token):
+            return True
+
     monkeypatch.setattr(kick_commands, "ADMIN_USERS", {900})
     monkeypatch.setattr(kick_commands, "KICK_AUDIT_QQ", 900)
+    expected_enabled = enabled
     ctx = SimpleNamespace(scene="group", user_id=123, group_id=700)
     event = {
         "post_type": "message", "message_type": "group", "self_id": 500, "group_id": 700,
-        "message": [{"type": "text", "data": {"text": "/kick on"}}],
+        "message": [{"type": "text", "data": {"text": f"/kick {action}"}}],
     }
 
     handled = await kick_commands.handle_kick_command(
-        service=_Service(), api=_API(), ctx=ctx, evt=event, text="/kick on", perm=_Perm(),
+        service=_Service(), api=_API(), ctx=ctx, evt=event, text=f"/kick {action}", perm=_Perm(),
     )
 
     assert handled is True
-    assert sent == [(700, [{"type": "text", "data": {"text": "开杀😋"}}])]
+    assert sent == [(700, [{"type": "text", "data": {"text": reply}}])]
