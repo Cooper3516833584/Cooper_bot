@@ -511,7 +511,7 @@ async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monk
             assert api.writes[2] == ("kick", 700, 100, False)
             assert [item[1] for item in api.writes if item[0] == "delete"] == [104, 102, 101, 103]
             notice_text = api.writes[1][2][0]["data"]["text"]
-            assert "如认为踢出错误请找管理员申诉" in notice_text
+            assert notice_text == "已拿下"
             forward_node = next(
                 node for node in api.writes[0][2][1:]
                 if any("message_id=102" in segment.get("data", {}).get("text", "")

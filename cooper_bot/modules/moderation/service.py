@@ -780,13 +780,7 @@ class ModerationService:
 
     @staticmethod
     def _group_notice(user_id: int, category: str) -> str:
-        reasons = {
-            "unsolicited_ad": "发布广告推广信息",
-            "deceptive_group_redirect": "发布冒充管理通知的转群引导",
-            "suspected_fraud": "发布具有明确欺骗性引流特征的信息",
-        }
-        reason = reasons.get(category, "发布违反本群管理规则的信息")
-        return f"成员 QQ：{int(user_id)} 因{reason}，将被移出本群。\n如认为踢出错误请找管理员申诉"
+        return "已拿下"
 
     @staticmethod
     def _message_time(timestamp: float) -> str:
