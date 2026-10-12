@@ -26,6 +26,7 @@ QUEUE_CAPACITY = 64
 MEMBER_CACHE_SECONDS = 300.0
 CASE_DEADLINE_SECONDS = 180.0
 AUDIT_WINDOW_SECONDS = 1800.0
+RETRACTION_WINDOW_SECONDS = 300.0
 MAX_FORWARD_NODES = 20
 MAX_FORWARD_REQUEST_BYTES = 256 * 1024
 MAX_FORWARD_PART_BYTES = 220 * 1024
@@ -572,8 +573,8 @@ class ModerationService:
         )
         await self._enforce_confirmed(
             case_id=case_id, key=key, revision=revision, generation=generation,
-            category=outcome.category, evidence=list(outcome.evidence), review_messages=snapshot_messages,
-            deadline=deadline,
+            category=outcome.category, evidence=list(outcome.evidence),
+            trigger_message_at=float(anchor["occurred_at"]), deadline=deadline,
         )
 
     async def _finish_case(self, case_id: str, decision: str, reason: str) -> None:
@@ -598,7 +599,7 @@ class ModerationService:
 
     async def _enforce_confirmed(
         self, *, case_id: str, key: tuple[int, int, int], revision: int, generation: int,
-        category: str, evidence: list[dict], review_messages: list[dict], deadline: float,
+        category: str, evidence: list[dict], trigger_message_at: float, deadline: float,
     ) -> None:
         self_id, group_id, user_id = key
         scope = (self_id, group_id)
@@ -690,11 +691,34 @@ class ModerationService:
             await self._send_final_result(case_id, recipient, f"{phrase}；未撤回消息。", scope, revision, generation)
             return
 
-        snapshot_by_id = {str(row.get("message_id") or ""): row for row in audit_messages}
-        confirmed_ids = list(dict.fromkeys(str(item.get("message_id") or "") for item in evidence))
+        observe_lock = self._observe_locks.get(scope)
+        try:
+            if observe_lock is None:
+                delete_messages = await asyncio.to_thread(
+                    self.store.read_sender_window, self_id, group_id, user_id,
+                    trigger_message_at - RETRACTION_WINDOW_SECONDS,
+                    trigger_message_at + RETRACTION_WINDOW_SECONDS,
+                )
+            else:
+                async with observe_lock:
+                    delete_messages = await asyncio.to_thread(
+                        self.store.read_sender_window, self_id, group_id, user_id,
+                        trigger_message_at - RETRACTION_WINDOW_SECONDS,
+                        trigger_message_at + RETRACTION_WINDOW_SECONDS,
+                    )
+        except Exception:
+            await self._finish_case(case_id, "block", "confirmed_and_kick_succeeded_retraction_window_read_failed")
+            await self._send_final_result(
+                case_id, recipient, "已确认踢出成功；撤回窗口读取失败，未能执行撤回。",
+                scope, revision, generation,
+            )
+            return
+
+        delete_ids = list(dict.fromkeys(str(row.get("message_id") or "") for row in delete_messages))
         delete_counts = {"ok": 0, "failed": 0, "unknown": 0}
-        for message_id in reversed(confirmed_ids):
-            row = snapshot_by_id.get(message_id)
+        messages_by_id = {str(row.get("message_id") or ""): row for row in delete_messages}
+        for message_id in reversed(delete_ids):
+            row = messages_by_id.get(message_id)
             if not row or int(row.get("self_id") or 0) != self_id or int(row.get("group_id") or 0) != group_id or int(row.get("user_id") or 0) != user_id:
                 continue
             parsed = _message_id(message_id)

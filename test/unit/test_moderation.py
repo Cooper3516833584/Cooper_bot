@@ -436,6 +436,7 @@ async def test_on_requires_bot_admin_but_off_does_not(tmp_path):
 @pytest.mark.parametrize("decision", ["block", "uncertain", "image_failure", "malformed_at", "malformed_reply"])
 async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monkeypatch, decision):
     now = time.time()
+    trigger_at = now - 600.0 if decision == "block" else now - 2.0
     api = _FakeAPI()
     vision = _FakeVision(fail_slot="kick:500:700:102:21" if decision == "image_failure" else None)
 
@@ -457,8 +458,8 @@ async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monk
         token = service.begin_control((500, 700), enabled=True)
         assert await service.enable_scope(api=api, token=token, recipient=900)
 
-        first = _text_record("101", now - 8, "课程资料说明与作业安排。" * 6)
-        second = _text_record("102", now - 2, "有偿家教推广，添加微信了解详情 https://example.invalid/offer。" + ("报名说明。" * 5))
+        first = _text_record("101", trigger_at - 8, "课程资料说明与作业安排。" * 6)
+        second = _text_record("102", trigger_at, "有偿家教推广，添加微信了解详情 https://example.invalid/offer。" + ("报名说明。" * 5))
         if decision == "block":
             second["segments"].extend([
                 {"type": "at", "data": {"qq": "all"}},
@@ -474,11 +475,21 @@ async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monk
         assert store.append_message_if_enabled(first, token["revision"])[0]
         inserted, seq = store.append_message_if_enabled(second, token["revision"])
         assert inserted and seq
+        if decision == "block":
+            for message_id, occurred_at in (
+                ("103", trigger_at - 300.0),
+                ("104", trigger_at + 300.0),
+                ("105", trigger_at - 300.001),
+                ("106", trigger_at + 300.001),
+            ):
+                assert store.append_message_if_enabled(
+                    _text_record(message_id, occurred_at, "普通群聊内容"), token["revision"]
+                )[0]
         state = service._scope_state((500, 700))
         await service._process_candidate(
             (500, 700, 100),
             {"revision": token["revision"], "generation": state["generation"], "queued_at": now,
-             "latest_seq": seq, "latest_anchor_at": now - 2},
+             "latest_seq": seq, "latest_anchor_at": trigger_at},
         )
         cases = store.get_case(f"{int(now):x}-{int(seq):x}-{100:x}")
         assert cases is not None
@@ -492,9 +503,11 @@ async def test_candidate_fake_success_order_and_uncertain_silence(tmp_path, monk
             assert api.writes == []
         else:
             assert cases["decision"] == "block"
-            assert [item[0] for item in api.writes] == ["forward", "notice", "kick", "delete", "result"]
+            assert [item[0] for item in api.writes] == [
+                "forward", "notice", "kick", "delete", "delete", "delete", "delete", "result",
+            ]
             assert api.writes[2] == ("kick", 700, 100, False)
-            assert api.writes[3] == ("delete", 102)
+            assert [item[1] for item in api.writes if item[0] == "delete"] == [104, 102, 101, 103]
             notice_text = api.writes[1][2][0]["data"]["text"]
             assert "如认为踢出错误请找管理员申诉" in notice_text
             forward_node = next(
