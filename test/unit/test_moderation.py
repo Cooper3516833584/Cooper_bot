@@ -637,3 +637,40 @@ async def test_dispatch_handles_kick_before_regular_side_effects(monkeypatch):
     )
     assert len(sent) == 1
     assert "个人 Bot 权限 2 或 3 级" in sent[0][1][0]["data"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_kick_on_success_replies_with_requested_text(monkeypatch):
+    sent = []
+
+    class _API:
+        async def send_group_msg(self, group_id, message):
+            sent.append((group_id, message))
+            return {"status": "ok", "retcode": 0}
+
+    class _Perm:
+        def get_level(self, _user_id):
+            return 3
+
+    class _Service:
+        def begin_control(self, _scope, *, enabled):
+            assert enabled is True
+            return {"token": "control"}
+
+        async def enable_scope(self, **_kwargs):
+            return True
+
+    monkeypatch.setattr(kick_commands, "ADMIN_USERS", {900})
+    monkeypatch.setattr(kick_commands, "KICK_AUDIT_QQ", 900)
+    ctx = SimpleNamespace(scene="group", user_id=123, group_id=700)
+    event = {
+        "post_type": "message", "message_type": "group", "self_id": 500, "group_id": 700,
+        "message": [{"type": "text", "data": {"text": "/kick on"}}],
+    }
+
+    handled = await kick_commands.handle_kick_command(
+        service=_Service(), api=_API(), ctx=ctx, evt=event, text="/kick on", perm=_Perm(),
+    )
+
+    assert handled is True
+    assert sent == [(700, [{"type": "text", "data": {"text": "开杀😋"}}])]

@@ -162,7 +162,7 @@ async def handle_kick_command(
     except Exception:
         enabled = False
     if enabled:
-        await _send_command_reply(api, ctx, "本群自动反广告已开启。规则命中后模型复核，无法确认不处理。")
+        await _send_command_reply(api, ctx, "开杀😋")
     else:
         await _send_command_reply(api, ctx, "开启失败：请确认 Bot 群管理权限、文本/视觉模型就绪及本地存储可用。")
     return True
