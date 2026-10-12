@@ -33,6 +33,7 @@ from cooper_bot.modules.calendar.daily_calendar import parse_calendar_date
 from cooper_bot.modules.vision.vision_skill import VisionSlot
 from cooper_bot.modules.memory.models import CapturedInput, MemoryIdentity
 from cooper_bot.commands.memory_commands import handle_memory_command
+from cooper_bot.commands.kick_commands import handle_kick_command
 from cooper_bot.core.config import (
     ADMIN_USERS,
     DATA_DIR,
@@ -119,6 +120,7 @@ _EXPLICIT_COMMAND_NAMES = {
     "handinget",
     "handinstat",
     "help",
+    "kick",
     "level",
     "ls",
     "memory",
@@ -5107,7 +5109,19 @@ async def dispatch(
     aisvc: Optional["AIService"] = None,
     vision_skill=None,
     calendar_service=None,
+    moderation=None,
 ):
+    if await handle_kick_command(
+        service=moderation,
+        api=api,
+        ctx=ctx,
+        evt=evt,
+        text=text,
+        perm=perm,
+        aisvc=aisvc,
+        vision_skill=vision_skill,
+    ):
+        return
     try:
         setattr(ctx, "_ai_chat_context_aisvc", aisvc)
     except Exception:

@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Dict, Optional, Tuple
 
 
@@ -89,7 +90,7 @@ class OneBotAPI:
                 fut.set_result(data)
 
     async def _call_ws(self, action: str, params: dict, timeout: float) -> Optional[dict]:
-        echo = f"{action}_{int(time.time() * 1000)}"
+        echo = f"{action}_{uuid.uuid4().hex}"
         payload = {"action": action, "params": params, "echo": echo}
 
         fut = asyncio.get_running_loop().create_future()
@@ -185,6 +186,35 @@ class OneBotAPI:
             "send_private_msg",
             {"user_id": int(user_id), "message": text},
             timeout=6.0,
+        )
+
+    async def get_group_member_info(self, group_id: int, user_id: int, no_cache: bool = True):
+        return await self.call(
+            "get_group_member_info",
+            {"group_id": int(group_id), "user_id": int(user_id), "no_cache": bool(no_cache)},
+            timeout=6.0,
+        )
+
+    async def set_group_kick(self, group_id: int, user_id: int, reject_add_request: bool = False):
+        return await self._call_prefer_http_no_ws_fallback(
+            "set_group_kick",
+            {"group_id": int(group_id), "user_id": int(user_id), "reject_add_request": bool(reject_add_request)},
+            timeout=8.0,
+        )
+
+    async def delete_msg(self, message_id: int | str):
+        raw = str(message_id).strip()
+        if not raw.lstrip("-").isdigit() or raw in {"", "-"}:
+            raise ValueError("invalid OneBot message_id")
+        return await self._call_prefer_http_no_ws_fallback(
+            "delete_msg", {"message_id": int(raw)}, timeout=8.0
+        )
+
+    async def send_private_forward_msg(self, user_id: int, messages: list):
+        return await self._call_prefer_http_no_ws_fallback(
+            "send_private_forward_msg",
+            {"user_id": int(user_id), "messages": list(messages)},
+            timeout=20.0,
         )
 
     async def set_friend_add_request(self, flag: str, approve: bool = True, remark: str = ""):

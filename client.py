@@ -29,6 +29,8 @@ from cooper_bot.modules.ai.search_bridge import start_kimi_search_bridge
 from cooper_bot.modules.calendar.daily_calendar import DailyCalendarService
 from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
+from cooper_bot.modules.moderation.service import ModerationService
+from cooper_bot.commands.kick_commands import handle_kick_command, parse_kick_command, personal_level
 
 log = Logger("bot", "INFO")
 
@@ -93,6 +95,11 @@ async def run_forever():
     handin = HandinService(log)
     aisvc = AIService(log)
     vision_skill = VisionSkill(log)
+    try:
+        moderation_service = ModerationService(log=log)
+    except Exception as e:
+        moderation_service = None
+        log.warning(f"反广告审核服务初始化失败，将保持关闭: {e}")
     calendar_service = DailyCalendarService(log, aisvc)
     email_notify_service = EmailNotifyService(log, aisvc)
 
@@ -109,6 +116,7 @@ async def run_forever():
             handin=handin,
             calendar_service=calendar_service,
             email_notify_service=email_notify_service,
+            moderation_service=moderation_service,
         )
     finally:
         await _cleanup_runtime(log, search_bridge, aisvc)
@@ -124,6 +132,7 @@ async def _run_bot_loop(
     handin,
     calendar_service,
     email_notify_service,
+    moderation_service=None,
 ):
     global _POST_SYNC_TASK
 
@@ -220,6 +229,55 @@ async def _run_bot_loop(
                     last_conv_lock_sweep = now_ts
 
                 async def _handle_one_event(ctx, data: dict, text: str):
+                    kick_command = parse_kick_command(data, text, ctx)
+                    if kick_command is not None:
+                        control_token = None
+                        actor_level = personal_level(getattr(ctx, "user_id", 0), perm)
+                        if (
+                            moderation_service is not None
+                            and actor_level in (2, 3)
+                            and getattr(ctx, "scene", None) == "group"
+                            and kick_command.action in {"on", "off"}
+                            and not kick_command.arguments
+                        ):
+                            raw_self_id = data.get("self_id")
+                            raw_group_id = data.get("group_id")
+                            if (
+                                not isinstance(raw_self_id, bool)
+                                and not isinstance(raw_group_id, bool)
+                                and str(raw_self_id or "").isascii()
+                                and str(raw_self_id or "").isdigit()
+                                and str(raw_group_id or "").isascii()
+                                and str(raw_group_id or "").isdigit()
+                                and int(raw_self_id) > 0
+                                and int(raw_group_id) > 0
+                            ):
+                                control_token = moderation_service.begin_control(
+                                    (int(raw_self_id), int(raw_group_id)),
+                                    enabled=kick_command.action == "on",
+                                )
+                        try:
+                            await handle_kick_command(
+                                service=moderation_service,
+                                api=api,
+                                ctx=ctx,
+                                evt=data,
+                                text=text,
+                                perm=perm,
+                                aisvc=aisvc,
+                                vision_skill=vision_skill,
+                                control_token=control_token,
+                            )
+                        except Exception as e:
+                            log.exception(f"/kick 命令处理异常: {e}")
+                        return
+
+                    if moderation_service is not None:
+                        try:
+                            await moderation_service.observe_event(ctx, data)
+                        except Exception as e:
+                            log.warning(f"反广告消息记录失败: {type(e).__name__}")
+
                     now_ts = time.time()
                     _sweep_conv_locks(now_ts)
                     key = conv_key(ctx)
@@ -246,6 +304,7 @@ async def _run_bot_loop(
                                     aisvc=aisvc,
                                     vision_skill=vision_skill,
                                     calendar_service=calendar_service,
+                                    moderation=moderation_service,
                                 )
                             except Exception as e:
                                 log.exception(f"dispatch 异常: {e}")
@@ -254,6 +313,11 @@ async def _run_bot_loop(
                                 conv_lock_last_used[key] = time.time()
 
                 log.info("已连接至服务器")
+                if moderation_service is not None:
+                    try:
+                        await moderation_service.start(api, aisvc, vision_skill, perm)
+                    except Exception as e:
+                        log.warning(f"反广告审核服务未能绑定当前连接: {type(e).__name__}")
                 cleanup_task = asyncio.create_task(logsvc.cleanup_loop())
                 scheduler_task = asyncio.create_task(handin.scheduler_loop(api))
                 calendar_task = asyncio.create_task(calendar_service.scheduler_loop(api))
@@ -323,6 +387,8 @@ async def _run_bot_loop(
                             )
                             continue
                 finally:
+                    if moderation_service is not None:
+                        await moderation_service.close()
                     for t in (cleanup_task, scheduler_task, calendar_task, email_notify_task):
                         t.cancel()
                     await asyncio.gather(

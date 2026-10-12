@@ -137,6 +137,17 @@ IDLE_SPLIT_SECONDS = 1800
 # 权限等级：0游客 1临时 2好友 3管理员
 # 管理员 QQ 号（/whoami 里显示的 user_id）
 ADMIN_USERS = _parse_int_set(_get_env("ADMIN_USERS", ""))
+# 可选的已确认案件证据接收人；未设置时使用现有管理员QQ号中的最小值。
+_KICK_AUDIT_QQ_RAW = _get_env("KICK_AUDIT_QQ", "")
+KICK_AUDIT_QQ = (
+    0 if not _KICK_AUDIT_QQ_RAW else
+    int(_KICK_AUDIT_QQ_RAW)
+    if len(_KICK_AUDIT_QQ_RAW) <= 20
+    and _KICK_AUDIT_QQ_RAW.isascii()
+    and _KICK_AUDIT_QQ_RAW.isdigit()
+    and int(_KICK_AUDIT_QQ_RAW) > 0
+    else -1
+)
 ENABLE_OCR = _get_env_bool("ENABLE_OCR", False)
 
 # 群权限：可选的群级别“下限”（通常不需要；你也可以留空）
