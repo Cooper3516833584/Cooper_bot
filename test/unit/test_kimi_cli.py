@@ -81,6 +81,23 @@ async def test_runner_rejects_invalid_jsonl_without_raw_fallback(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["public", "admin"])
+async def test_full_permissions_and_skill_discovery_are_admin_only(tmp_path, profile) -> None:
+    runner = _runner(
+        tmp_path,
+        "import json, sys\nprint(json.dumps({'type': 'assistant', 'content': json.dumps(sys.argv[1:])}))\n",
+        admin_enabled=True,
+    )
+    result = await runner.run(KimiRunRequest("hello", profile, 2.0, "scope-test", "qq_chat"))
+    argv = json.loads(result.text)
+
+    assert "--auto" not in argv
+    assert "--yolo" not in argv
+    assert ("--skills-dir" in argv) is (profile == "public")
+    assert argv[-2:] == ["--prompt", "hello"]
+
+
+@pytest.mark.asyncio
 async def test_runner_requires_a_final_assistant_message(tmp_path) -> None:
     runner = _runner(tmp_path, "import json\nprint(json.dumps({'type': 'tool_result', 'name': 'WebSearch'}))\n")
 

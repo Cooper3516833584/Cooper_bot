@@ -15,17 +15,7 @@ from cooper_bot.core import config
 
 
 PUBLIC_TOOLS = ("WebSearch",)
-ADMIN_TOOLS = (
-    "Read",
-    "Write",
-    "Edit",
-    "Grep",
-    "Glob",
-    "ReadMediaFile",
-    "Bash",
-    "WebSearch",
-    "FetchURL",
-)
+ADMIN_TOOLS = ("*",)
 _PROCESS_ENV_KEYS = (
     "SystemRoot",
     "WINDIR",
@@ -221,10 +211,11 @@ def _validate_agent(profile: KimiProfile) -> Optional[str]:
         text = profile.agent_path.read_text(encoding="utf-8")
     except Exception:
         return f"{profile.name}_agent_missing"
-    if "subagents: []" not in text:
+    if profile.name == "public" and "subagents: []" not in text:
         return f"{profile.name}_agent_subagents_not_disabled"
     for tool in profile.tools:
-        if f"- {tool}" not in text:
+        marker = '- "*"' if tool == "*" else f"- {tool}"
+        if marker not in text:
             return f"{profile.name}_agent_missing_{tool.lower()}"
     return None
 
@@ -302,8 +293,6 @@ def validate_kimi_settings(
         errors.append("kimi_admin_home_missing")
     if not settings.public.skills_dir.is_dir():
         errors.append("kimi_public_skills_dir_missing")
-    if not settings.admin.skills_dir.is_dir():
-        errors.append("kimi_admin_skills_dir_missing")
 
     public_error = _validate_agent(settings.public)
     if public_error:
@@ -455,11 +444,12 @@ class KimiCliRunner:
             *prefix,
             "--agent-file",
             str(profile.agent_path),
-            "--skills-dir",
-            str(profile.skills_dir),
             "--output-format",
             "stream-json",
         ]
+        # Kimi 0.34 print mode already uses auto; --prompt rejects --auto/--yolo.
+        if request.profile == "public":
+            argv.extend(["--skills-dir", str(profile.skills_dir)])
         if self.settings.model:
             argv.extend(["--model", self.settings.model])
         argv.extend(["--prompt", str(request.prompt or "")])

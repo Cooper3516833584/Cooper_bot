@@ -16,7 +16,7 @@ from cooper_bot.modules.ai.kimi_cli import (
 
 
 def _write_agent(path: Path, tools: tuple[str, ...]) -> None:
-    path.write_text("---\n" + "\n".join(f"- {tool}" for tool in tools) + "\nsubagents: []\n---\n", encoding="utf-8")
+    path.write_text("---\n" + "\n".join('- "*"' if tool == "*" else f"- {tool}" for tool in tools) + "\nsubagents: []\n---\n", encoding="utf-8")
 
 
 def _settings(tmp_path: Path, *, public_workdir: Path | None = None) -> KimiSettings:
@@ -85,6 +85,29 @@ def test_public_agent_without_subagent_disable_is_rejected(tmp_path, monkeypatch
 
     assert readiness.public_profile_valid is False
     assert "public_agent_subagents_not_disabled" in readiness.errors
+
+
+def test_admin_full_tools_does_not_require_empty_skills_or_subagent_disable(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    settings.admin.agent_path.write_text('---\ntools:\n  - "*"\n---\n', encoding="utf-8")
+    settings.admin.skills_dir.rmdir()
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.PROJECT_ROOT", tmp_path / "project")
+
+    readiness = validate_kimi_settings(settings, executable_resolver=lambda _path: "C:/tools/kimi.exe")
+
+    assert readiness.admin_profile_valid is True
+    assert readiness.public_profile_valid is True
+
+
+def test_admin_full_tools_rejects_the_old_restricted_agent(tmp_path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    _write_agent(settings.admin.agent_path, ("Read", "Bash"))
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.PROJECT_ROOT", tmp_path / "project")
+
+    readiness = validate_kimi_settings(settings, executable_resolver=lambda _path: "C:/tools/kimi.exe")
+
+    assert readiness.admin_profile_valid is False
+    assert readiness.public_profile_valid is True
 
 
 def test_child_environment_keeps_only_explicit_system_values(tmp_path) -> None:

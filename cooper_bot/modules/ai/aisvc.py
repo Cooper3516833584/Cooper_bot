@@ -325,6 +325,9 @@ class AIService:
                 "version": runtime.version,
                 "public_agent_sha256": self._kimi_file_sha256(settings.public.agent_path),
                 "admin_agent_sha256": self._kimi_file_sha256(settings.admin.agent_path),
+                "admin_config_sha256": self._kimi_file_sha256(settings.admin.home / "config.toml"),
+                "admin_mcp_sha256": self._kimi_file_sha256(settings.admin.home / "mcp.json"),
+                "admin_permission_mode": "auto",
                 "public_config_sha256": self._kimi_file_sha256(settings.public.home / "config.toml"),
                 "public_mcp_sha256": self._kimi_file_sha256(settings.public.home / "mcp.json"),
             },
@@ -534,7 +537,7 @@ class AIService:
             raise RuntimeError("invalid admin chat context")
         return f"admin:{actor}:{key}"
 
-    def _build_kimi_prompt(self, base_key: str, history: List[Dict[str, str]], current: str, *, purpose: str, memory_context: Optional[dict] = None, speaker: Optional[dict] = None, reply_to: str = "") -> str:
+    def _build_kimi_prompt(self, base_key: str, history: List[Dict[str, str]], current: str, *, purpose: str, memory_context: Optional[dict] = None, speaker: Optional[dict] = None, reply_to: str = "", allow_computer: bool = False, actor_user_id: Optional[int] = None) -> str:
         messages = self._materialize_history_for_model(history)
         for source, message in zip(history, messages):
             message["speaker"] = {"name": self.bot_nick, "is_bot": True} if message["role"] == "assistant" else source.get("_speaker", {"is_bot": False})
@@ -544,7 +547,7 @@ class AIService:
                 message["reply_to_message_id"] = source["_reply_to"]
         payload = {
                 "purpose": purpose,
-                "system_instructions": self._select_chat_system_prompt(base_key) or self.system_prompt,
+                "system_instructions": "按 cooper-admin 完整权限配置执行管理员任务；QQ 是指令与结果的传输通道。" if allow_computer else self._select_chat_system_prompt(base_key) or self.system_prompt,
                 "conversation_rules": (
                     f"你是机器人 {self.bot_nick}，不是人类用户 Cooper。Cooper 和 Cooper_bot 是不同身份。"
                     "conversation_history 按时间从旧到新排列，每项是一条独立消息。"
@@ -556,6 +559,19 @@ class AIService:
                 "current_speaker": speaker or {"is_bot": False, "session": base_key},
                 "conversation_history": messages,
                 "latest_user_request": current,
+            }
+        if allow_computer:
+            payload["trusted_request_context"] = {
+                "source": "cooper_bot_qq",
+                "profile": "admin",
+                "permission_mode": "auto",
+                "personal_admin_verified": True,
+                "actor_user_id": int(actor_user_id or 0),
+                "reply_user_id": int(actor_user_id or 0),
+                "scene": "group" if base_key.startswith("group:") else "private",
+                "project_root": str(core_config.PROJECT_ROOT),
+                "onebot_http_base": core_config.HTTP_BASE,
+                "credentials_env_file": str(core_config.SECRETS_ENV_PATH),
             }
         if reply_to:
             payload["reply_to_message_id"] = str(reply_to)
@@ -609,7 +625,7 @@ class AIService:
             history = filtered
         memory_context = await self.memory.prompt_context(memory_turn.identity, content, summary=None if allow_computer else getattr(memory_turn.snapshot, "summary", None)) if memory_turn is not None else None
         request = KimiRunRequest(
-            prompt=self._build_kimi_prompt(base_key, history, current, purpose="qq_chat", memory_context=memory_context, speaker=speaker, reply_to=reply_to),
+            prompt=self._build_kimi_prompt(base_key, history, current, purpose="qq_chat", memory_context=memory_context, speaker=speaker, reply_to=reply_to, allow_computer=allow_computer, actor_user_id=actor_user_id),
             profile="admin" if allow_computer else "public",
             timeout_seconds=self._kimi_runner.settings.admin_timeout_seconds if allow_computer else self._kimi_runner.settings.timeout_seconds,
             request_id=str(msg_id or f"kimi-{time.time_ns()}"),
