@@ -26,3 +26,4 @@ services:
       # 强烈建议：持久化 QQ 数据和 NapCat 配置，否则你一 recreate 容器配置就丢
       - "./runtime/napcat/qq:/app/.config/QQ"
       - "./runtime/napcat/config:/app/napcat/config"
+      - "./deploy/napcat/cooper_friend.mjs:/app/napcat/plugins/cooper_friend.mjs:ro"

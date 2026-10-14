@@ -48,6 +48,35 @@ _INSTANCE_LOCK_HANDLE = None
 _POST_SYNC_TASK: "asyncio.Task | None" = None
 
 
+async def _handle_friend_request_message(api, ctx, data: dict, text: str, logsvc) -> bool:
+    if (
+        data.get("post_type") != "message"
+        or data.get("message_type") != "private"
+        or data.get("sub_type") == "group"
+        or text.strip() != "请求添加你为好友"
+    ):
+        return False
+
+    logsvc.log_in(ctx, text)
+    message = "已收到好友申请，当前自动通过已关闭，请等待管理员处理。"
+    if AUTO_APPROVE_FRIEND_REQUEST:
+        try:
+            resp = await api.complete_friend_request(ctx.user_id, AUTO_APPROVE_FRIEND_REMARK)
+            result = (resp or {}).get("data") or {}
+            if resp and resp.get("status") == "ok" and result.get("is_friend") is True:
+                message = "已添加你为好友，可以用 /find 搜索资料，再用 /get 获取文件。"
+            else:
+                message = "已收到好友申请，但尚未确认双向好友关系。请稍后重试；若仍无法发文件，请联系管理员处理。"
+                log.warning("好友关系补全未确认，请检查 NapCat 好友插件或 QQ 验证状态")
+        except Exception as e:
+            log.warning(f"好友关系补全失败: {type(e).__name__}")
+            message = "已收到好友申请，但自动添加未成功，请联系管理员处理后再获取文件。"
+    sent = await api.send_private_msg(ctx.user_id, message)
+    if isinstance(sent, dict) and sent.get("status") == "ok":
+        logsvc.log_out(ctx, message)
+    return True
+
+
 def _acquire_single_instance_lock() -> bool:
     global _INSTANCE_LOCK_HANDLE
     if _INSTANCE_LOCK_HANDLE is not None:
@@ -291,6 +320,8 @@ async def _run_bot_loop(
                         async with lock:
                             conv_lock_last_used[key] = time.time()
                             try:
+                                if await _handle_friend_request_message(api, ctx, data, text, logsvc):
+                                    return
                                 await dispatch(
                                     api=api,
                                     ctx=ctx,

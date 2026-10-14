@@ -227,6 +227,14 @@ class OneBotAPI:
             params["remark"] = str(remark)
         return await self.call("set_friend_add_request", params, timeout=6.0)
 
+    async def complete_friend_request(self, user_id: int, remark: str = ""):
+        # NapCat 插件按真实申请记录匹配；HTTP 超时不重复发送好友操作。
+        return await self._call_prefer_http_no_ws_fallback(
+            "cooper_complete_friend_request",
+            {"user_id": int(user_id), "remark": str(remark)},
+            timeout=10.0,
+        )
+
     async def upload_group_file(self, group_id: int, file: str, name: str, folder: Optional[str] = None):
         """上传群文件。file 必须是 NapCat 容器内可访问的本地路径。"""
         params = {"group_id": int(group_id), "file": self._file_uri(file), "name": str(name)}
