@@ -33,7 +33,6 @@ from cooper_bot.modules.ai.kimi_cli import (
 )
 from cooper_bot.modules.ai.model_gateway import (
     DEFAULT_CHAT_MODEL,
-    DEFAULT_SEARCH_MODEL,
     ModelGateway,
     ProviderConfig,
     build_providers,
@@ -60,7 +59,6 @@ from cooper_bot.core.config import (
     AI_SYSTEM_PROMPT,
     AI_VECTORS_PATH,
     AI_WEB_SEARCH_ENABLED,
-    AI_WEB_SEARCH_MODEL,
     AI_GROUP_CHAT_PROMPTS_PATH,
     AI_GROUP_NOTICE_PROMPTS_PATH,
     AI_PRIVATE_CHAT_PROMPTS_PATH,
@@ -178,7 +176,6 @@ class AIService:
         self.bot_nick = str(AI_BOT_NICK or "Cooper_bot")
         self.chat_model = str(AI_CHAT_MODEL or DEFAULT_CHAT_MODEL)
         self.web_search_enabled = bool(AI_WEB_SEARCH_ENABLED)
-        self.web_search_model = str(AI_WEB_SEARCH_MODEL or DEFAULT_SEARCH_MODEL)
         self.embed_model = str(AI_EMBED_MODEL or "BAAI/bge-m3")
         self.search_limit = max(1, int(AI_SEARCH_LIMIT))
         self.search_min_similarity = float(AI_SEARCH_MIN_SIMILARITY)
@@ -2856,7 +2853,6 @@ class AIService:
             embedding_base_url=self.embedding_base_url,
             embedding_api_key=self.embedding_api_key,
             chat_model=self.chat_model,
-            search_model=self.web_search_model,
             embed_model=self.embed_model,
         )
 

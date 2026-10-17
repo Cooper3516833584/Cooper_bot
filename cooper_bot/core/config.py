@@ -313,10 +313,9 @@ AUTO_REPLY_IMAGES_CONTAINER_DIR = "/bot_auto_replies"
 WIKI_CATEGORIES_PATH = WIKI_CONFIG_DIR / "1037wiki_categories.json"
 WIKI_STATE_DIR = STATE_DIR / "wiki"
 
-# 端点实测（GET /models）只公布 deepseek-flash 与 deepseek-v4-pro；联网检索同样用 flash。
+# 文本任务使用 deepseek-flash；联网检索单独使用 DeepSeek Search API（无需模型名）。
 AI_CHAT_MODEL = _get_env("AI_CHAT_MODEL", "deepseek-flash")
 AI_WEB_SEARCH_ENABLED = _get_env_bool("AI_WEB_SEARCH_ENABLED", True)
-AI_WEB_SEARCH_MODEL = _get_env("AI_WEB_SEARCH_MODEL", "deepseek-flash")
 AI_EMBED_MODEL = _get_env("AI_EMBED_MODEL", "BAAI/bge-m3")
 AI_BOT_NICK = _get_env("AI_BOT_NICK", "Cooper_bot")
 

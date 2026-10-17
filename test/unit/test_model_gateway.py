@@ -47,7 +47,7 @@ def test_load_providers_reads_six_lines_in_order(tmp_path: Path, monkeypatch) ->
     assert providers["deepseek"].ready is True
     assert providers["embedding"].ready is True
     assert providers["vision"].ready is True
-    # 检索复用 DeepSeek 凭据，但使用独立的检索模型配置。
+    # Search API 复用 DeepSeek 凭据，不需要单独指定搜索模型。
     assert providers["search"].base_url == providers["deepseek"].base_url
     assert providers["search"].api_key == providers["deepseek"].api_key
 
@@ -94,13 +94,14 @@ def test_vision_enabled_flag_follows_config(tmp_path: Path, monkeypatch) -> None
 def test_model_names_come_from_config(tmp_path: Path, monkeypatch) -> None:
     path = _write_api_key(tmp_path, ["https://ds.example", "k", "https://e.example", "e"])
     monkeypatch.setattr("cooper_bot.core.config.AI_CHAT_MODEL", "chat-model-x")
-    monkeypatch.setattr("cooper_bot.core.config.AI_WEB_SEARCH_MODEL", "search-model-y")
     monkeypatch.setattr("cooper_bot.core.config.AI_EMBED_MODEL", "embed-model-z")
 
     providers = model_gateway.load_providers(path)
 
     assert providers["deepseek"].model == "chat-model-x"
-    assert providers["search"].model == "search-model-y"
+    assert providers["search"].model == ""
+    assert providers["search"].kind == model_gateway.KIND_SEARCH
+    assert providers["search"].ready is True
     assert providers["embedding"].model == "embed-model-z"
 
 
@@ -108,7 +109,7 @@ def test_build_providers_falls_back_to_documented_defaults() -> None:
     providers = model_gateway.build_providers()
 
     assert providers["deepseek"].model == model_gateway.DEFAULT_CHAT_MODEL
-    assert providers["search"].model == model_gateway.DEFAULT_SEARCH_MODEL
+    assert providers["search"].model == ""
     assert providers["embedding"].model == model_gateway.DEFAULT_EMBED_MODEL
     assert providers["vision"].model == model_gateway.DEFAULT_VISION_MODEL
 
@@ -133,7 +134,6 @@ def _gateway_with_deepseek() -> ModelGateway:
             deepseek_base_url="https://ds.example/v1",
             deepseek_api_key="k",
             chat_model="chat-model",
-            search_model="search-model",
         )
     )
 
@@ -207,43 +207,90 @@ def test_unknown_provider_raises() -> None:
 
 def _search_payload() -> dict:
     return {
-        "content": [
-            {"type": "text", "text": "上海今天晴。"},
+        "results": [
             {
-                "type": "web_search_tool_result",
-                "content": [
-                    {"type": "web_search_result", "title": "气象台", "url": "https://weather.example/a", "page_age": "2026-09-12"},
-                    {"type": "web_search_result", "title": "和风天气", "url": "https://qweather.example/b", "page_age": ""},
-                ],
+                "title": "中央气象台",
+                "url": "https://weather.example/a",
+                "snippet": "上海晴。",
+                "summary": "上海今天晴，最高 25 度。",
+                "site_name": "中国天气网",
+                "date": "2026-10-17T02:30:00Z",
+                "rerank_score": 2.5,
+                "authority": 3,
+                "content": "",
+            },
+            {
+                "title": "和风天气",
+                "url": "https://qweather.example/b",
+                "snippet": "上海天气预报",
+                "summary": "",
+                "site_name": None,
+                "date": None,
+                "rerank_score": 1.7,
+                "authority": 2,
+                "content": "",
             },
         ]
     }
 
 
-def test_search_web_uses_anthropic_endpoint_and_maps_results(monkeypatch) -> None:
+def test_search_web_calls_deepseek_search_api_and_maps_results(monkeypatch) -> None:
     captured: dict = {}
 
-    def _fake_post(url: str, payload: dict, headers: dict, timeout: float = 60.0) -> dict:
-        captured.update(url=url, payload=payload, headers=headers, timeout=timeout)
-        return _search_payload()
+    class _Resp:
+        def __enter__(self):
+            return self
 
-    monkeypatch.setattr(model_gateway, "post_json_with_headers", _fake_post)
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(_search_payload(), ensure_ascii=False).encode("utf-8")
+
+    def _fake_urlopen(request, timeout=None):
+        captured.update(
+            url=request.full_url,
+            method=request.get_method(),
+            payload=json.loads(request.data.decode("utf-8")),
+            headers=dict(request.headers),
+            timeout=timeout,
+        )
+        return _Resp()
+
+    monkeypatch.setattr(model_gateway.urllib.request, "urlopen", _fake_urlopen)
 
     results = _gateway_with_deepseek().search_web("上海天气", timeout=30.0)
 
-    assert captured["url"] == "https://ds.example/anthropic/v1/messages"
-    assert captured["headers"]["x-api-key"] == "k"
-    assert captured["headers"]["anthropic-version"] == "2023-06-01"
-    assert "Authorization" not in captured["headers"]
+    assert captured["url"] == "https://ds.example/v1/tools/search"
+    assert captured["method"] == "POST"
+    assert captured["headers"]["Authorization"] == "Bearer k"
+    assert captured["headers"]["Content-type"] == "application/json"
     assert captured["timeout"] == 30.0
-    assert captured["payload"]["model"] == "search-model"
-    assert captured["payload"]["messages"] == [{"role": "user", "content": "上海天气"}]
-    assert captured["payload"]["tools"] == [
-        {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
-    ]
-    assert results[0]["snippet"] == "上海今天晴。"
-    assert results[0]["url"] == "https://weather.example/a"
+    assert captured["payload"] == {"query": "上海天气", "count": 5, "need_content": False}
+    assert results[0]["title"] == "中央气象台"
+    assert results[0]["snippet"] == "上海今天晴，最高 25 度。"
+    assert results[0]["date"] == "2026-10-17T02:30:00Z"
     assert results[1]["url"] == "https://qweather.example/b"
+    assert results[1]["snippet"] == "上海天气预报"
+    assert results[1]["site_name"] == "qweather.example"
+    assert "date" not in results[1]
+
+
+def test_search_web_truncates_overlong_query(monkeypatch) -> None:
+    captured: dict = {}
+
+    def _fake_post(url: str, payload: dict, api_key: str, timeout: float = 60.0) -> dict:
+        captured.update(payload)
+        return {"results": []}
+
+    monkeypatch.setattr(model_gateway, "http_post_json", _fake_post)
+    assert _gateway_with_deepseek().search_web("中" * 200) == []
+    assert len(captured["query"]) == 128
+
+
+def test_search_web_empty_results_are_valid(monkeypatch) -> None:
+    monkeypatch.setattr(model_gateway, "http_post_json", lambda *_a, **_k: {"results": []})
+    assert _gateway_with_deepseek().search_web("没有搜索结果") == []
 
 
 def test_search_web_rejects_empty_query() -> None:
@@ -253,25 +300,39 @@ def test_search_web_rejects_empty_query() -> None:
 
 def test_search_web_raises_when_provider_not_ready() -> None:
     gateway = ModelGateway(
-        provider_source=lambda: model_gateway.build_providers(search_model="search-model")
+        provider_source=lambda: model_gateway.build_providers()
     )
 
     with pytest.raises(RuntimeError):
         gateway.search_web("q")
 
 
-def test_map_search_payload_prefers_answer_then_sources() -> None:
+def test_map_search_payload_uses_each_real_source() -> None:
     results = model_gateway.map_search_payload(_search_payload(), "上海天气")
 
-    assert results[0]["title"].startswith("联网检索摘要")
-    assert results[0]["url"] == "https://weather.example/a"
-    assert [item["url"] for item in results[1:]] == ["https://qweather.example/b"]
+    assert [item["url"] for item in results] == [
+        "https://weather.example/a",
+        "https://qweather.example/b",
+    ]
+    assert results[0]["site_name"] == "中国天气网"
     assert results[1]["site_name"] == "qweather.example"
-    assert results[1]["date"] == ""
 
 
-@pytest.mark.parametrize("payload", [{"content": []}, {"unexpected": True}, {"content": "x"}])
-def test_map_search_payload_raises_without_usable_results(payload: dict) -> None:
+def test_map_search_payload_deduplicates_filters_and_limits_results() -> None:
+    payload = {"results": [
+        {"title": "T", "url": "javascript:alert(1)", "summary": "bad"},
+        {"title": "T", "url": "https://example.com/1", "summary": "a"},
+        {"title": "Duplicate", "url": "https://example.com/1", "summary": "duplicate"},
+        *({"title": "Another", "url": f"https://example.com/{i}", "summary": "b"} for i in range(2, 9)),
+    ]}
+    results = model_gateway.map_search_payload(payload, "q")
+    assert len(results) == model_gateway.MAX_SEARCH_RESULTS
+    assert results[0]["url"] == "https://example.com/1"
+    assert len({item["url"] for item in results}) == len(results)
+
+
+@pytest.mark.parametrize("payload", [{"content": []}, {"unexpected": True}, {"results": "x"}, {"results": [{"url": "javascript:alert(1)"}]}])
+def test_map_search_payload_raises_for_invalid_results(payload: dict) -> None:
     with pytest.raises(RuntimeError):
         model_gateway.map_search_payload(payload, "q")
 
@@ -485,9 +546,11 @@ def test_post_json_with_headers_serializes_utf8_payload(monkeypatch) -> None:
     assert captured["timeout"] == 10.0
 
 
-def test_anthropic_messages_url_normalizes_v1_suffix() -> None:
-    assert model_gateway.anthropic_messages_url("https://api.deepseek.com/v1") == "https://api.deepseek.com/anthropic/v1/messages"
-    assert model_gateway.anthropic_messages_url("https://api.deepseek.com") == "https://api.deepseek.com/anthropic/v1/messages"
+def test_deepseek_search_url_normalizes_v1_suffix() -> None:
+    assert model_gateway.deepseek_search_url("https://api.deepseek.com/v1") == "https://api.deepseek.com/v1/tools/search"
+    assert model_gateway.deepseek_search_url("https://api.deepseek.com/v1/") == "https://api.deepseek.com/v1/tools/search"
+    assert model_gateway.deepseek_search_url("https://api.deepseek.com") == "https://api.deepseek.com/v1/tools/search"
+    assert model_gateway.deepseek_search_url("https://proxy.example/deepseek") == "https://proxy.example/deepseek/v1/tools/search"
 
 
 # ============ 传输层异常语义 ============

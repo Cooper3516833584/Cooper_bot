@@ -8,7 +8,7 @@
 provider 一览：
 
     deepseek   文本任务（邮件分类、群通知判定/省流、日历文案、资料摘要、资料纠偏）
-    search     服务端联网检索（Anthropic messages 端点 + web_search 工具）
+    search     DeepSeek Search API（直接返回结构化网页检索结果）
     embedding  向量化（/find 语义检索与资料索引）
     vision     图片描述（qwen，与 DeepSeek 无关，集群聊图片解析）
 
@@ -45,35 +45,22 @@ EMBEDDING_PROVIDER = "embedding"
 VISION_PROVIDER = "vision"
 
 KIND_OPENAI_COMPAT = "openai_compat"
-KIND_ANTHROPIC = "anthropic"
+KIND_SEARCH = "search_api"
 KIND_VISION = "openai_compat_vision"
 
 # 端点实测（2026-09-12，/models）只公布 deepseek-flash 与 deepseek-v4-pro。
 DEFAULT_CHAT_MODEL = "deepseek-flash"
-# 服务端联网检索同样用 flash：Anthropic messages 端点 + web_search 工具实测可检索。
-DEFAULT_SEARCH_MODEL = "deepseek-flash"
 DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
 DEFAULT_VISION_MODEL = "qwen3.5-flash"
 
 REASONING_EFFORT_HIGH = "high"
 
-_WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
-_ANTHROPIC_VERSION = "2023-06-01"
-_MAX_SEARCH_USES = 3
 _MAX_SEARCH_RESULTS = 5
-_MAX_SEARCH_TOKENS = 1024
+_MAX_SEARCH_QUERY_CHARS = 128
 _MAX_SNIPPET_CHARS = 4000
-_MAX_ANSWER_CHARS = 3000
 
-# 供 search_bridge 等调用方读取的公开别名；结果条数与截断长度由本模块决定。
+# Kimi Search Bridge 与内部摘要共用的搜索结果上限。
 MAX_SEARCH_RESULTS = _MAX_SEARCH_RESULTS
-MAX_ANSWER_CHARS = _MAX_ANSWER_CHARS
-
-_SEARCH_SYSTEM_PROMPT = (
-    "你是联网检索执行器。用户会给你一个查询词，你必须调用 web_search 工具完成检索，"
-    "然后输出一段简洁的事实摘要：只写检索结果里明确出现的关键事实、数字、日期与来源，"
-    "不要客套话，不要输出思考过程，禁止编造检索结果中不存在的信息。"
-)
 
 
 @dataclass(frozen=True)
@@ -89,7 +76,7 @@ class ProviderConfig:
 
     @property
     def ready(self) -> bool:
-        return bool(self.enabled and self.base_url and self.api_key and self.model)
+        return bool(self.enabled and self.base_url and self.api_key and (self.kind == KIND_SEARCH or self.model))
 
 
 def read_api_key_lines(api_key_path: Optional[Path] = None, log=None) -> List[str]:
@@ -119,7 +106,6 @@ def build_providers(
     vision_api_key: str = "",
     vision_enabled: bool = True,
     chat_model: str = "",
-    search_model: str = "",
     embed_model: str = "",
     vision_model: str = "",
 ) -> Dict[str, ProviderConfig]:
@@ -136,10 +122,9 @@ def build_providers(
         ),
         SEARCH_PROVIDER: ProviderConfig(
             name=SEARCH_PROVIDER,
-            kind=KIND_ANTHROPIC,
+            kind=KIND_SEARCH,
             base_url=base,
             api_key=key,
-            model=str(search_model or DEFAULT_SEARCH_MODEL),
         ),
         EMBEDDING_PROVIDER: ProviderConfig(
             name=EMBEDDING_PROVIDER,
@@ -178,7 +163,6 @@ def load_providers(api_key_path: Optional[Path] = None) -> Dict[str, ProviderCon
         vision_api_key=str(core_config.VISION_API_KEY or lines[5]),
         vision_enabled=bool(core_config.VISION_ENABLED),
         chat_model=str(core_config.AI_CHAT_MODEL or ""),
-        search_model=str(core_config.AI_WEB_SEARCH_MODEL or ""),
         embed_model=str(core_config.AI_EMBED_MODEL or ""),
         vision_model=str(core_config.VISION_MODEL or ""),
     )
@@ -188,12 +172,10 @@ def join_url(base: str, endpoint: str) -> str:
     return f"{str(base or '').rstrip('/')}/{str(endpoint or '').lstrip('/')}"
 
 
-def anthropic_messages_url(base_url: str) -> str:
-    """把 OpenAI 风格的 base（通常带 /v1）归一化成 Anthropic 格式的 messages 端点。"""
+def deepseek_search_url(base_url: str) -> str:
+    """从已有 DeepSeek base URL 构造 /v1/tools/search 端点。"""
     root = str(base_url or "").strip().rstrip("/")
-    if root.endswith("/v1"):
-        root = root[: -len("/v1")]
-    return f"{root}/anthropic/v1/messages"
+    return f"{root}/tools/search" if root.endswith("/v1") else f"{root}/v1/tools/search"
 
 
 class ModelGatewayError(RuntimeError):
@@ -303,64 +285,40 @@ def _host_of(url: str) -> str:
 
 
 def map_search_payload(payload: dict, query: str) -> List[dict]:
-    """把 Anthropic 格式的检索响应翻译成 {title,url,snippet,date,site_name} 列表。"""
-    blocks = payload.get("content") if isinstance(payload, dict) else None
-    if not isinstance(blocks, list):
+    """将 DeepSeek Search API 的 results 转为 Kimi 与内部问答通用的搜索结果。"""
+    items = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
         raise RuntimeError("unexpected deepseek search payload")
-    answer = ""
-    sources: list[dict] = []
-    for block in blocks:
-        if not isinstance(block, dict):
-            continue
-        block_type = str(block.get("type") or "")
-        if block_type == "text" and not answer:
-            answer = str(block.get("text") or "").strip()
-        elif block_type == "web_search_tool_result":
-            content = block.get("content")
-            if not isinstance(content, list):
-                continue
-            for item in content:
-                if not isinstance(item, dict) or str(item.get("type") or "") != "web_search_result":
-                    continue
-                url = str(item.get("url") or "").strip()
-                if not url:
-                    continue
-                sources.append(
-                    {
-                        "title": str(item.get("title") or "").strip(),
-                        "url": url,
-                        "date": str(item.get("page_age") or "").strip(),
-                    }
-                )
+
     results: list[dict] = []
-    if answer:
-        results.append(
-            {
-                "title": f"联网检索摘要：{query[:60]}",
-                "url": sources[0]["url"] if sources else "",
-                "snippet": answer[:_MAX_ANSWER_CHARS],
-                "date": sources[0]["date"] if sources else "",
-            }
-        )
-    seen = {item["url"] for item in results if item.get("url")}
-    for source in sources:
+    seen_urls: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            continue
+        if parsed.scheme not in ("http", "https") or not parsed.hostname or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        mapped = {
+            "title": str(item.get("title") or "").strip(),
+            "url": url,
+            "snippet": str(item.get("summary") or item.get("snippet") or "").strip(),
+            "date": str(item.get("date") or "").strip(),
+            "site_name": str(item.get("site_name") or "").strip() or parsed.hostname,
+        }
+        out = _trim_result(mapped)
+        if out:
+            results.append(out)
         if len(results) >= _MAX_SEARCH_RESULTS:
             break
-        if source["url"] in seen:
-            continue
-        seen.add(source["url"])
-        results.append(
-            {
-                "title": source["title"] or source["url"],
-                "url": source["url"],
-                "snippet": "",
-                "date": source["date"],
-                "site_name": _host_of(source["url"]),
-            }
-        )
-    if not results:
+
+    if items and not results:
         raise RuntimeError("deepseek search returned no usable results")
-    return [item for item in results if _trim_result(item)]
+    return results
 
 
 def _trim_result(item: dict) -> dict:
@@ -480,36 +438,24 @@ class ModelGateway:
         provider: str = SEARCH_PROVIDER,
         timeout: float = 60.0,
     ) -> List[dict]:
-        """服务端联网检索，返回结构化检索结果。"""
+        """直接调用 DeepSeek Search API，返回可供 Kimi 和内部任务使用的搜索结果。"""
         cfg = self.provider(provider)
-        if cfg.kind != KIND_ANTHROPIC:
-            raise RuntimeError(f"provider {provider} is not search-capable")
+        if cfg.kind != KIND_SEARCH:
+            raise ModelGatewayError(f"provider {provider} is not search-capable")
         q = str(query or "").strip()
         if not q:
-            raise RuntimeError("empty web search query")
+            raise ModelGatewayError("empty web search query")
         if not cfg.ready:
-            raise RuntimeError("search provider not ready")
+            raise ModelGatewayError("search provider not ready")
         payload = {
-            "model": str(cfg.model),
-            "max_tokens": _MAX_SEARCH_TOKENS,
-            "system": _SEARCH_SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": q}],
-            "tools": [
-                {
-                    "type": _WEB_SEARCH_TOOL_TYPE,
-                    "name": "web_search",
-                    "max_uses": _MAX_SEARCH_USES,
-                }
-            ],
+            "query": q[:_MAX_SEARCH_QUERY_CHARS],
+            "count": _MAX_SEARCH_RESULTS,
+            "need_content": False,
         }
-        data = post_json_with_headers(
-            anthropic_messages_url(cfg.base_url),
+        data = http_post_json(
+            deepseek_search_url(cfg.base_url),
             payload,
-            {
-                "Content-Type": "application/json",
-                "x-api-key": cfg.api_key,
-                "anthropic-version": _ANTHROPIC_VERSION,
-            },
+            cfg.api_key,
             timeout=float(timeout),
         )
         return map_search_payload(data, q)
@@ -624,11 +570,10 @@ __all__ = [
     "SEARCH_PROVIDER",
     "EMBEDDING_PROVIDER",
     "VISION_PROVIDER",
-    "KIND_ANTHROPIC",
+    "KIND_SEARCH",
     "KIND_OPENAI_COMPAT",
     "KIND_VISION",
     "DEFAULT_CHAT_MODEL",
-    "DEFAULT_SEARCH_MODEL",
     "DEFAULT_EMBED_MODEL",
     "DEFAULT_VISION_MODEL",
     "ProviderConfig",
@@ -637,7 +582,7 @@ __all__ = [
     "load_providers",
     "read_api_key_lines",
     "join_url",
-    "anthropic_messages_url",
+    "deepseek_search_url",
     "http_post_json",
     "post_json_with_headers",
     "extract_chat_text",

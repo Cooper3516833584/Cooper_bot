@@ -8,8 +8,8 @@ kimi CLI 的 WebSearch 工具只认 Moonshot 的搜索服务协议：
     {"text_query": "<查询词>"}
     -> {"search_results": [{"title", "url", "snippet", "date", "site_name"}]}
 
-本模块在 127.0.0.1 上提供一个只服务该协议的本地端点，把请求转成 DeepSeek 的联网搜索
-（Anthropic messages 端点 + 服务端 web_search 工具），再把结果翻译回上面的结构。
+本模块在 127.0.0.1 上提供一个只服务该协议的本地端点，把请求转成 DeepSeek
+Search API（/v1/tools/search），再把结构化结果翻译回上面的协议。
 抓取与结果映射统一由 ``model_gateway`` 实现，本模块只负责协议翻译与端点安全边界。
 端点只绑回环地址，并要求 Bearer token 与 public home 配置里的
 ``[services.moonshot_search].api_key`` 完全一致。
@@ -29,12 +29,8 @@ from cooper_bot.core import config
 from cooper_bot.modules.ai import model_gateway
 from cooper_bot.modules.ai.model_gateway import ModelGateway
 
-# 检索模型、结果条数与截断长度统一由 model_gateway 决定（实测结论见该模块顶部说明）。
-# 这里保留同名常量，供既有调用方与测试读取。
+# 搜索结果上限由统一模型网关决定。
 _MAX_RESULTS = model_gateway.MAX_SEARCH_RESULTS
-_MAX_ANSWER_CHARS = model_gateway.MAX_ANSWER_CHARS
-# 兼容既有调用方：端点归一化实现已统一到 model_gateway。
-_anthropic_messages_url = model_gateway.anthropic_messages_url
 
 _MAX_CONCURRENCY = 4
 _MAX_BODY_BYTES = 64 * 1024
@@ -44,7 +40,7 @@ _QUEUE_WAIT_SECONDS = 5.0
 
 
 class KimiSearchBridge:
-    """把 Moonshot 搜索协议翻译成 DeepSeek 联网搜索的本地端点。"""
+    """把 Moonshot 搜索协议翻译成 DeepSeek Search API 的本地端点。"""
 
     def __init__(
         self,
@@ -65,7 +61,7 @@ class KimiSearchBridge:
         )
         self.public_home = Path(public_home if public_home is not None else config.AI_KIMI_PUBLIC_HOME)
         self.api_key_path = Path(api_key_path if api_key_path is not None else config.AI_API_KEY_PATH)
-        # 联网抓取统一走 gateway：它按 api_key_path 解析 deepseek 凭据与检索模型。
+        # 联网检索统一走 gateway：它按 api_key_path 解析 DeepSeek 凭据。
         self.gateway = ModelGateway(log, api_key_path=self.api_key_path)
         # 注入的测试 caller 保持单参数签名；默认 caller 走 gateway 以接收剩余预算。
         self._injected_deepseek_caller = deepseek_caller
@@ -94,7 +90,7 @@ class KimiSearchBridge:
         self.port = int(server.server_address[1])
         self._thread = threading.Thread(target=server.serve_forever, name="kimi-search-bridge", daemon=True)
         self._thread.start()
-        self.log.info(f"Kimi 搜索桥：已监听 http://127.0.0.1:{self.port}/search （后端 DeepSeek 联网搜索）")
+        self.log.info(f"Kimi 搜索桥：已监听 http://127.0.0.1:{self.port}/search （后端 DeepSeek Search API）")
         return True
 
     def stop(self) -> None:
@@ -140,10 +136,10 @@ class KimiSearchBridge:
             self._token_cache = (mtime, token)
         return token
 
-    # ---------- DeepSeek 联网搜索 ----------
+    # ---------- DeepSeek Search API ----------
 
     def _call_deepseek_search(self, query: str, *, timeout: Optional[float] = None) -> list:
-        """把查询交给 gateway；检索模型、端点与请求体由 gateway 的 search provider 决定。"""
+        """把查询交给 gateway；端点与请求体由 gateway 的 search provider 决定。"""
         return self.gateway.search_web(
             query,
             timeout=self.timeout_seconds if timeout is None else float(timeout),

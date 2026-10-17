@@ -142,86 +142,66 @@ def test_bridge_can_be_disabled(tmp_path) -> None:
     assert any(level == "info" for level, _ in log.messages)
 
 
-def test_map_search_payload_builds_summary_and_sources() -> None:
+def test_map_search_payload_uses_deepseek_search_results() -> None:
     payload = {
-        "content": [
-            {"type": "thinking", "thinking": "..."},
-            {"type": "server_tool_use", "name": "web_search", "input": {"query": "天气"}},
+        "results": [
             {
-                "type": "web_search_tool_result",
-                "content": [
-                    {"type": "web_search_result", "title": "中央气象台", "url": "https://weather.com.cn/a", "page_age": "2026-09-12"},
-                    {"type": "web_search_result", "title": "和风天气", "url": "https://qweather.com/b", "page_age": ""},
-                    {"type": "web_search_result", "title": "无链接", "url": ""},
-                ],
+                "title": "中央气象台",
+                "url": "https://weather.com.cn/a",
+                "snippet": "短摘要",
+                "summary": "上海今天晴，最高 30 度。",
+                "site_name": "中央气象台",
+                "date": "2026-10-17T00:00:00Z",
             },
-            {"type": "text", "text": "上海今天晴，最高 30 度。"},
+            {
+                "title": "和风天气",
+                "url": "https://qweather.com/b",
+                "snippet": "天气实况",
+                "summary": "",
+                "site_name": None,
+                "date": None,
+            },
         ]
     }
-
     results = KimiSearchBridge.map_search_payload(payload, "上海天气")
 
-    assert results[0]["title"].startswith("联网检索摘要")
+    assert results[0]["title"] == "中央气象台"
     assert results[0]["snippet"] == "上海今天晴，最高 30 度。"
     assert results[0]["url"] == "https://weather.com.cn/a"
     assert [item["url"] for item in results[1:]] == ["https://qweather.com/b"]
     assert results[1]["site_name"] == "qweather.com"
-    assert results[1]["date"] == ""
+    assert "date" not in results[1]
 
 
-def test_map_search_payload_truncates_long_answer_and_allows_sources_only() -> None:
-    long_answer = "字" * (search_bridge._MAX_ANSWER_CHARS + 500)
-    payload = {
-        "content": [
-            {"type": "text", "text": long_answer},
-            {
-                "type": "web_search_tool_result",
-                "content": [{"type": "web_search_result", "title": "T", "url": "https://e.com/1"}],
-            },
-        ]
-    }
-
+def test_map_search_payload_truncates_long_summary() -> None:
+    long_summary = "字" * (search_bridge.model_gateway._MAX_SNIPPET_CHARS + 500)
+    payload = {"results": [{"title": "T", "url": "https://e.com/1", "summary": long_summary}]}
     results = KimiSearchBridge.map_search_payload(payload, "q")
-    assert len(results[0]["snippet"]) == search_bridge._MAX_ANSWER_CHARS
-
-    sources_only = {
-        "content": [
-            {
-                "type": "web_search_tool_result",
-                "content": [{"type": "web_search_result", "title": "T", "url": "https://e.com/2"}],
-            }
-        ]
-    }
-    results = KimiSearchBridge.map_search_payload(sources_only, "q")
-    assert results == [
-        {"title": "T", "url": "https://e.com/2", "snippet": "", "date": "", "site_name": "e.com"}
-    ]
+    assert len(results[0]["snippet"]) == search_bridge.model_gateway._MAX_SNIPPET_CHARS
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        {"content": []},
-        {"content": [{"type": "web_search_tool_result", "content": [{"type": "web_search_tool_result_error"}]}]},
         {"unexpected": True},
+        {"results": "not-a-list"},
+        {"results": [{"url": "javascript:bad"}]},
     ],
 )
-def test_map_search_payload_raises_without_usable_results(payload) -> None:
+def test_map_search_payload_rejects_invalid_data(payload) -> None:
     with pytest.raises(RuntimeError):
         KimiSearchBridge.map_search_payload(payload, "q")
 
 
-@pytest.mark.parametrize(
-    ("base_url", "expected"),
-    [
-        ("https://api.deepseek.com/v1", "https://api.deepseek.com/anthropic/v1/messages"),
-        ("https://api.deepseek.com/v1/", "https://api.deepseek.com/anthropic/v1/messages"),
-        ("https://api.deepseek.com", "https://api.deepseek.com/anthropic/v1/messages"),
-        ("https://proxy.example/deepseek", "https://proxy.example/deepseek/anthropic/v1/messages"),
-    ],
-)
-def test_anthropic_messages_url_normalizes_base(base_url, expected) -> None:
-    assert search_bridge._anthropic_messages_url(base_url) == expected
+def test_map_search_payload_returns_empty_results() -> None:
+    assert KimiSearchBridge.map_search_payload({"results": []}, "q") == []
+
+
+def test_bridge_returns_empty_results_without_502(tmp_path) -> None:
+    bridge = _bridge(tmp_path, lambda _q: [])
+    status, data = _post(bridge, {"text_query": "无结果"})
+    assert status == 200
+    assert data == {"search_results": []}
 
 
 def test_expected_token_follows_config_file(tmp_path) -> None:
