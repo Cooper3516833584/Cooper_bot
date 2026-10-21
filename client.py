@@ -27,6 +27,7 @@ from cooper_bot.modules.handin.handinsvc import HandinService
 from cooper_bot.modules.ai.aisvc import AIService
 from cooper_bot.modules.ai.search_bridge import start_kimi_search_bridge
 from cooper_bot.modules.calendar.daily_calendar import DailyCalendarService
+from cooper_bot.modules.calendar.editor_duty import EditorDutyService
 from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
 from cooper_bot.modules.moderation.service import ModerationService
@@ -124,6 +125,11 @@ async def run_forever():
         log.warning(f"反广告审核服务初始化失败，将保持关闭: {e}")
     calendar_service = DailyCalendarService(log, aisvc)
     email_notify_service = EmailNotifyService(log, aisvc)
+    try:
+        editor_duty_service = EditorDutyService(log)
+    except Exception as e:
+        editor_duty_service = None
+        log.warning(f"编辑值班提醒初始化失败: {type(e).__name__}")
 
     search_bridge = None
     try:
@@ -139,6 +145,7 @@ async def run_forever():
             calendar_service=calendar_service,
             email_notify_service=email_notify_service,
             moderation_service=moderation_service,
+            editor_duty_service=editor_duty_service,
         )
     finally:
         await _cleanup_runtime(log, search_bridge, aisvc)
@@ -155,6 +162,7 @@ async def _run_bot_loop(
     calendar_service,
     email_notify_service,
     moderation_service=None,
+    editor_duty_service=None,
 ):
     global _POST_SYNC_TASK
 
@@ -250,6 +258,12 @@ async def _run_bot_loop(
                         conv_locks.pop(k, None)
                     last_conv_lock_sweep = now_ts
 
+                async def _observe_editor_duty(data: dict):
+                    try:
+                        await editor_duty_service.observe_event(api, data)
+                    except Exception as e:
+                        log.warning(f"编辑值班消息记录失败: {type(e).__name__}")
+
                 async def _handle_one_event(ctx, data: dict, text: str):
                     kick_command = parse_kick_command(data, text, ctx)
                     if kick_command is not None:
@@ -344,6 +358,10 @@ async def _run_bot_loop(
                 scheduler_task = asyncio.create_task(handin.scheduler_loop(api))
                 calendar_task = asyncio.create_task(calendar_service.scheduler_loop(api))
                 email_notify_task = asyncio.create_task(email_notify_service.scheduler_loop(api))
+                editor_duty_task = (
+                    asyncio.create_task(editor_duty_service.scheduler_loop(api))
+                    if editor_duty_service is not None else None
+                )
 
                 try:
                     async for message in ws:
@@ -392,6 +410,10 @@ async def _run_bot_loop(
                                 continue
 
                             text = get_text(data)
+                            if editor_duty_service is not None and str(data.get("group_id")) == "1087250737":
+                                duty_observation = asyncio.create_task(_observe_editor_duty(data))
+                                inflight.add(duty_observation)
+                                duty_observation.add_done_callback(lambda t: inflight.discard(t))
                             friend_task = _schedule_friend_completion(api, ctx, data, text)
                             if friend_task is not None:
                                 inflight.add(friend_task)
@@ -413,6 +435,9 @@ async def _run_bot_loop(
                             )
                             continue
                 finally:
+                    if editor_duty_task is not None:
+                        editor_duty_task.cancel()
+                        await asyncio.gather(editor_duty_task, return_exceptions=True)
                     if moderation_service is not None:
                         await moderation_service.close()
                     for t in (cleanup_task, scheduler_task, calendar_task, email_notify_task):

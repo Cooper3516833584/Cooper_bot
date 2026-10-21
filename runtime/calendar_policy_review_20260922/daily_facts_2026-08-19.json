@@ -1,0 +1,61 @@
+{
+  "cache_version": 3,
+  "date": "2026-08-19",
+  "snapshot": {
+    "date": "2026-08-19",
+    "weekday": "三",
+    "lunar": "农历七月初七",
+    "solar_terms": [],
+    "solar_festivals": [],
+    "lunar_festivals": [
+      "七夕节"
+    ],
+    "holiday_status": "",
+    "holiday_name": "",
+    "holiday_source_url": "",
+    "calendar_provider_ready": true
+  },
+  "events": [
+    {
+      "name": "中国医师节",
+      "canonical_name": "中国医师节",
+      "category": "official",
+      "fact": "国务院2017年批复同意，自2018年起每年8月19日设立为“中国医师节”，《医师法》予以确认，2026年为第九个。",
+      "tone": "light",
+      "source": "web",
+      "source_title": "国务院关于同意设立“中国医师节”的批复",
+      "source_url": "https://www.gov.cn/zhengce/zhengceku/2017-11/20/content_5241021.htm",
+      "importance": 3,
+      "campus_relevance": 1,
+      "selection_reason": "国家正式设立的行业性节日，体现广泛公共服务价值；2026年有明确活动主题“铸魂强基，德高技精”及卫健系统、医疗机构系列活动，具备可核验的报道由头，不因本校无医学专业而失去选题价值。",
+      "date_evidence": "国函〔2017〕136号批复明确同意自2018年起将每年8月19日设立为“中国医师节”；2021年通过、2022年施行的《医师法》再次确认该日期，2026年为第九个中国医师节。"
+    },
+    {
+      "name": "全国宣传思想工作会议召开（“8·19”重要讲话）",
+      "canonical_name": "全国宣传思想工作会议",
+      "category": "historical_anniversary",
+      "fact": "2013年8月19日至20日，全国宣传思想工作会议在北京召开，习近平出席并发表重要讲话，通称“8·19”重要讲话。",
+      "tone": "light",
+      "source": "web",
+      "source_title": "习近平强调：努力把宣传思想工作做得更好",
+      "source_url": "https://www.gov.cn/ldhd/2013-08/20/content_2470599.htm",
+      "importance": 2,
+      "campus_relevance": 2,
+      "selection_reason": "宣传思想工作领域的标志性历史节点，直接关系学生媒体与新闻传播专业的职责定位、正面宣传与舆论引导议题，校园媒体可做从业视角的回顾与自我梳理报道。",
+      "date_evidence": "中国政府网2013年8月20日发布新华社报道，会议于8月19日开幕、20日闭幕；2026年为讲话发表13周年。"
+    },
+    {
+      "name": "七夕节",
+      "category": "traditional",
+      "fact": "2026年8月19日为农历七月初七，是我国传统节日七夕节；七夕2006年列入首批国家级非物质文化遗产名录。",
+      "tone": "light",
+      "source": "web",
+      "source_title": "传承优良家风 倡导文明新风（我们的节日·七夕）",
+      "source_url": "http://society.people.com.cn/n1/2026/0820/c1008-40782734.html"
+    }
+  ],
+  "message": "📅 今日重要日｜2026年8月19日 星期三\n农历七月初七\n• 中国医师节：国务院2017年批复同意，自2018年起每年8月19日设立为“中国医师节”，《医师法》予以确认，2026年为第九个。\n• 全国宣传思想工作会议召开（“8·19”重要讲话）：2013年8月19日至20日，全国宣传思想工作会议在北京召开，习近平出席并发表重要讲话，通称“8·19”重要讲话。\n• 七夕节：2026年8月19日为农历七月初七，是我国传统节日七夕节；七夕2006年列入首批国家级非物质文化遗产名录。",
+  "special": true,
+  "web_used": true,
+  "generated_at": "2026-09-22T09:23:26+08:00"
+}
