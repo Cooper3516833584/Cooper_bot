@@ -130,6 +130,7 @@ async def test_runner_trims_only_old_chat_history_at_windows_boundary(tmp_path, 
     monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.os.name", "nt")
     history = [{"role": "user", "content": f"{i}:" + "😀" * 20} for i in range(300)]
     payload = {"conversation_history": history, "latest_user_request": "当前请求保持完整", "system_instructions": "fixed", "memory_context": {"facts": [{"text": "unchanged"}]}}
+    payload["quoted_message"] = {"available": True, "message_id": "101", "role": "user", "speaker": {"user_id": 10001}, "content": "引用原文保持完整"}
     result = await runner.run(_request(json.dumps(payload, ensure_ascii=False)))
     sent = json.loads(result.text)
     assert 0 < len(sent["conversation_history"]) < 300
@@ -138,6 +139,7 @@ async def test_runner_trims_only_old_chat_history_at_windows_boundary(tmp_path, 
     assert sent["latest_user_request"] == payload["latest_user_request"]
     assert sent["memory_context"] == payload["memory_context"]
     assert sent["system_instructions"] == "fixed"
+    assert sent["quoted_message"] == payload["quoted_message"]
 
 
 @pytest.mark.asyncio

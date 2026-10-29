@@ -30,6 +30,8 @@ def test_group_persistent_history_keeps_actor_id_and_context_fields() -> None:
 def test_current_quote_and_ready_visual_sources_ignore_unresolved_slots() -> None:
     aisvc = SimpleNamespace(find_chat_message_by_msg_id=lambda _session, _msg_id: {"content": "被引用的安全文本"})
     evt = {"message": [{"type": "reply", "data": {"id": "77"}}]}
+    assert commands._memory_quoted_text(aisvc, "private:20202", evt) == ""
+    evt["_aichat_quote"] = {"available": True, "content": aisvc.find_chat_message_by_msg_id("private:20202", "77")["content"]}
     slots = [
         {"status": "ready", "description": "图片里是一只猫"},
         {"status": "unresolved", "description": "不应保存"},

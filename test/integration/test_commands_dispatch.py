@@ -787,60 +787,36 @@ async def test_aichat_does_not_automatically_repeat_kimi_request(dispatch_harnes
 
 @pytest.mark.asyncio
 async def test_non_aichat_message_is_remembered_for_context(dispatch_harness) -> None:
-    filesvc = _make_filesvc_stub()
-    aisvc = _FakeAIService()
+    from test.unit.test_onebot_message_context import _service, event
+    service = _service();service.memory = None
     ctx = _make_ctx(scene="group", group_id=20001, level=1, user_id=10002)
-
-    await commands.dispatch(
-        api=SimpleNamespace(),
-        ctx=ctx,
-        evt={"post_type": "message", "message_type": "group"},
-        text="/find calculus",
-        filesvc=filesvc,
-        logsvc=_DummyLogService(),
-        state=commands.BotState(),
-        handin=Mock(),
-        perm=Mock(),
-        aisvc=aisvc,
-    )
-
-    aisvc.remember_user_message.assert_called_once_with(
-        f"group:{ctx.group_id}",
-        "发言人QQ:10002\n发言人昵称:tester\n群号:20001\n/find calculus",
-        msg_id="",
-        vision_slots=[],
-    )
+    evt = event(mid="find", user=ctx.user_id, message="/find calculus")
+    evt["_chat_ingest_seq"] = service.observe_onebot_event(evt)
+    await commands.dispatch(api=SimpleNamespace(), ctx=ctx, evt=evt, text="/find calculus", filesvc=_make_filesvc_stub(), logsvc=_DummyLogService(), state=commands.BotState(), handin=Mock(), perm=Mock(), aisvc=service)
+    history = service._load_active_chat_history("group:20001")
+    assert len(history) == 1 and history[0]["content"] == "/find calculus"
+    assert history[0]["_speaker"]["user_id"] == ctx.user_id
 
 
 @pytest.mark.asyncio
 async def test_non_aichat_auto_reply_is_remembered_for_context(monkeypatch) -> None:
-    async def _noop_group_context(*_args, **_kwargs):
-        return None
-
-    async def _noop_pre_state(*_args, **_kwargs):
-        return False
-
-    monkeypatch.setattr(commands, "_ensure_group_context_and_schedule_digest", _noop_group_context)
-    monkeypatch.setattr(commands, "_handle_pre_dispatch_state", _noop_pre_state)
-
-    filesvc = _make_filesvc_stub()
-    aisvc = _FakeAIService()
+    from test.unit.test_onebot_message_context import _service, event
+    from cooper_bot.core.onebot import OneBotAPI
+    async def noop(*_args, **_kwargs): return False
+    monkeypatch.setattr(commands, "_ensure_group_context_and_schedule_digest", noop)
+    monkeypatch.setattr(commands, "_handle_pre_dispatch_state", noop)
+    monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
+    service = _service();service.memory = None
     ctx = _make_ctx(scene="group", group_id=20001, level=1, user_id=10002)
-
-    await commands.dispatch(
-        api=SimpleNamespace(send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0})),
-        ctx=ctx,
-        evt={"post_type": "message", "message_type": "group"},
-        text="/ping",
-        filesvc=filesvc,
-        logsvc=_DummyLogService(),
-        state=commands.BotState(),
-        handin=Mock(),
-        perm=Mock(),
-        aisvc=aisvc,
-    )
-
-    aisvc.remember_assistant_message.assert_called_with(f"group:{ctx.group_id}", "pong")
+    evt = event(mid="ping", user=ctx.user_id, message="/ping")
+    evt["_chat_ingest_seq"] = service.observe_onebot_event(evt)
+    api = OneBotAPI(None, _DummyLogger(), http_base="http://localhost", on_send_confirmed=service.observe_send_ack)
+    api._call_http = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 501}})
+    await commands.dispatch(api=api, ctx=ctx, evt=evt, text="/ping", filesvc=_make_filesvc_stub(), logsvc=_DummyLogService(), state=commands.BotState(), handin=Mock(), perm=Mock(), aisvc=service)
+    history = service._load_active_chat_history("group:20001")
+    assert [row["role"] for row in history] == ["user", "assistant"]
+    assert history[-1]["content"] == "pong" and history[-1]["_msg_id"] == "501"
+    assert history[-1]["_owner_user_id"] == ctx.user_id
 
 
 @pytest.mark.asyncio
@@ -969,50 +945,36 @@ async def test_private_file_duplicate_content_stays_single_file_mode(dispatch_ha
 
 
 @pytest.mark.asyncio
-async def test_link_digest_reply_is_remembered_in_aichat_context(monkeypatch) -> None:
-    async def _noop_pre_state(*_args, **_kwargs):
-        return False
-
-    monkeypatch.setattr(commands, "_handle_pre_dispatch_state", _noop_pre_state)
-
-    filesvc = _make_filesvc_stub()
-    aisvc = _FakeAIService()
-    aisvc.extract_notice_url_head = AsyncMock(return_value="preview text")
-    aisvc.classify_notice = AsyncMock(return_value=True)
-    aisvc.reason_notice = AsyncMock(return_value="digest-reply")
-    aisvc.sanitize_reasoner_output = lambda text: str(text)
-    aisvc.is_notice_silent = lambda _text: False
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_link_digest_reply_is_remembered_in_aichat_context(monkeypatch, confirmed) -> None:
+    from test.unit.test_onebot_message_context import _service, event
+    from cooper_bot.core.onebot import OneBotAPI
+    async def noop(*_args, **_kwargs): return False
+    monkeypatch.setattr(commands, "_handle_pre_dispatch_state", noop)
+    monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
+    service = _service();service.memory = None
+    service.extract_notice_url_head = AsyncMock(return_value="preview text")
+    service.classify_notice = AsyncMock(return_value=True)
+    service.reason_notice = AsyncMock(return_value="digest-reply")
+    service.sanitize_reasoner_output = lambda text: str(text)
+    service.is_notice_silent = lambda _: False
+    service.deepseek_api_key = "test-only"
+    service.deepseek_base_url = "https://model.example.invalid"
     ctx = _make_ctx(scene="group", group_id=20001, level=1, user_id=10002)
-
-    await commands.dispatch(
-        api=SimpleNamespace(send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0})),
-        ctx=ctx,
-        evt={
-            "post_type": "message",
-            "message_type": "group",
-            "message": [{"type": "text", "data": {"text": "https://example.com/notice"}}],
-            "raw_message": "https://example.com/notice",
-        },
-        text="https://example.com/notice",
-        filesvc=filesvc,
-        logsvc=_DummyLogService(),
-        state=commands.BotState(),
-        handin=Mock(),
-        perm=Mock(),
-        aisvc=aisvc,
-    )
-
+    text = "https://example.com/notice"
+    evt = event(mid="link", user=ctx.user_id, message=text)
+    evt["_chat_ingest_seq"] = service.observe_onebot_event(evt)
+    api = OneBotAPI(None, _DummyLogger(), http_base="http://localhost", on_send_confirmed=service.observe_send_ack)
+    api._call_http = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 502}} if confirmed else None)
+    await commands.dispatch(api=api, ctx=ctx, evt=evt, text=text, filesvc=_make_filesvc_stub(), logsvc=_DummyLogService(), state=commands.BotState(), handin=Mock(), perm=Mock(), aisvc=service)
     await asyncio.sleep(0.05)
-
-    assert any(
-        call.args
-        == (
-            f"group:{ctx.group_id}",
-            "发言人QQ:10002\n发言人昵称:tester\n群号:20001\n群链接：https://example.com/notice",
-        )
-        for call in aisvc.remember_user_message.call_args_list
-    )
-    aisvc.remember_assistant_message.assert_called_once_with(f"group:{ctx.group_id}", "digest-reply")
+    history = service._load_active_chat_history("group:20001")
+    assert len(history) == (2 if confirmed else 1)
+    assert history[0]["content"] == text and history[0]["_msg_id"] == "link"
+    if confirmed:
+        assert history[1]["role"] == "assistant" and history[1]["_msg_id"] == "502"
+        assert history[1]["content"] == "digest-reply"
+    api._call_http.assert_awaited_once()
 
 
 @pytest.mark.asyncio

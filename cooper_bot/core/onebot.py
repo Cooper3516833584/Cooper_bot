@@ -27,14 +27,16 @@ import urllib.parse
 import urllib.request
 import uuid
 from typing import Dict, Optional, Tuple
+from cooper_bot.modules.ai.message_context import message_id as context_message_id
 
 
 class OneBotAPI:
-    def __init__(self, ws, log, http_base: Optional[str] = None, http_token: Optional[str] = None):
+    def __init__(self, ws, log, http_base: Optional[str] = None, http_token: Optional[str] = None, on_send_confirmed=None):
         self.ws = ws
         self.log = log
         self.http_base = http_base.rstrip("/") if http_base else None
         self.http_token = (http_token or "").strip() or None
+        self._on_send_confirmed = on_send_confirmed
 
         # WS action 回包（兜底用）
         self._pending: Dict[str, asyncio.Future] = {}
@@ -174,19 +176,35 @@ class OneBotAPI:
         return await self._call_ws(action, params, timeout=min(timeout, 8.0))
 
     # ========= 业务封装 =========
+    def _notify_send_confirmed(self, scene, target_id, message, response):
+        if not isinstance(response, dict) or response.get("status") != "ok" or type(response.get("retcode")) is not int or response["retcode"] != 0:
+            return
+        data = response.get("data")
+        mid = context_message_id(data.get("message_id")) if isinstance(data, dict) else ""
+        if not mid or not callable(self._on_send_confirmed):
+            return
+        try:
+            self._on_send_confirmed(scene=scene, target_id=target_id, message=message, message_id=mid)
+        except Exception as exc:
+            self._warn_throttle("context_ack", f"OneBot context callback failed: {type(exc).__name__}")
+
     async def send_group_msg(self, group_id: int, text: str):
-        return await self._call_prefer_http_no_ws_fallback(
+        response = await self._call_prefer_http_no_ws_fallback(
             "send_group_msg",
             {"group_id": int(group_id), "message": text},
             timeout=6.0,
         )
+        self._notify_send_confirmed("group", int(group_id), text, response)
+        return response
 
     async def send_private_msg(self, user_id: int, text: str):
-        return await self._call_prefer_http_no_ws_fallback(
+        response = await self._call_prefer_http_no_ws_fallback(
             "send_private_msg",
             {"user_id": int(user_id), "message": text},
             timeout=6.0,
         )
+        self._notify_send_confirmed("private", int(user_id), text, response)
+        return response
 
     async def get_group_member_info(self, group_id: int, user_id: int, no_cache: bool = True):
         return await self.call(
@@ -211,11 +229,13 @@ class OneBotAPI:
         )
 
     async def send_private_forward_msg(self, user_id: int, messages: list):
-        return await self._call_prefer_http_no_ws_fallback(
+        response = await self._call_prefer_http_no_ws_fallback(
             "send_private_forward_msg",
             {"user_id": int(user_id), "messages": list(messages)},
             timeout=20.0,
         )
+        self._notify_send_confirmed("private", int(user_id), [{"type": "forward", "data": {}}], response)
+        return response
 
     async def set_friend_add_request(self, flag: str, approve: bool = True, remark: str = ""):
         """处理加好友请求（自动同意/拒绝）。

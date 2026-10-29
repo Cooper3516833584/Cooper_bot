@@ -37,6 +37,8 @@ def _patch_module_attr(
 def _apply_path_patches(monkeypatch: pytest.MonkeyPatch, cfg: dict[str, Any]) -> None:
     config_map = {
         "BASE_DIR": cfg["project_root"],
+        "DATABASES_DIR": cfg["project_root"] / "runtime/databases",
+        "AI_MEMORY_DB_PATH": cfg["project_root"] / "runtime/databases/ai/chat_memory.sqlite3",
         "DATA_DIR": cfg["data_dir"],
         "FIND_INDEX_PATH": cfg["find_index_path"],
         "AI_SEMANTIC_STORE_PATH": cfg["ai_semantic_store_path"],

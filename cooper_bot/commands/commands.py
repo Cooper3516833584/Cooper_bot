@@ -34,6 +34,8 @@ from cooper_bot.modules.vision.vision_skill import VisionSlot
 from cooper_bot.modules.memory.models import CapturedInput, MemoryIdentity
 from cooper_bot.commands.memory_commands import handle_memory_command
 from cooper_bot.commands.kick_commands import handle_kick_command
+from cooper_bot.modules.ai.message_context import extract_reply_message_id, has_reply_segment, message_id as context_message_id
+from cooper_bot.modules.ai.quote_context import message_allowed, resolve_quote_for_aichat
 from cooper_bot.core.config import (
     ADMIN_USERS,
     DATA_DIR,
@@ -902,19 +904,20 @@ async def reply(
             return await api.send_group_msg(send_group_id, text)
         return await api.send_private_msg(send_user_id, text)
 
-    skip_context_once = False
-    try:
-        skip_context_once = bool(getattr(ctx, "_skip_reply_context_once", False))
-        if skip_context_once:
-            setattr(ctx, "_skip_reply_context_once", False)
-    except Exception:
-        skip_context_once = False
-
     target = f"g:{send_group_id}" if send_scene == "group" and send_group_id is not None else f"u:{send_user_id}"
     reply_key = f"{send_scene}:{target}:{text.strip()}"
     if not _claim_recent_reply(reply_key):
         logsvc.log.info(f"消息发送去重：已拦截重复回复 target={target}")
         return False
+    context_service = getattr(ctx, "_ai_chat_context_aisvc", None)
+    context_key = _ai_chat_session_key_for_target(send_scene, send_group_id, send_user_id)
+    owner_token = None
+    register_owner = getattr(context_service, "register_send_owner", None)
+    if context_key and callable(register_owner):
+        try:
+            owner_token = register_owner(context_key, text, ctx.user_id)
+        except Exception:
+            pass
     resp = await _send_once()
     if resp is None:
         logsvc.log.info(
@@ -928,12 +931,17 @@ async def reply(
 
     if _onebot_resp_ok(resp):
         data = resp.get("data") if isinstance(resp, dict) else None
-        setattr(ctx, "_last_reply_message_id", str(data.get("message_id") or "") if isinstance(data, dict) else "")
+        setattr(ctx, "_last_reply_message_id", context_message_id(data.get("message_id")) if isinstance(data, dict) else "")
         logsvc.log_out(ctx, text)
-        if not skip_context_once:
-            _remember_bot_reply_message(ctx, text, logsvc, send_scene, send_group_id, send_user_id)
+        _remember_bot_reply_message(ctx, text, logsvc, send_scene, send_group_id, send_user_id, owner_token=owner_token)
         return True
     else:
+        cancel_owner = getattr(context_service, "cancel_send_owner", None)
+        if owner_token and callable(cancel_owner):
+            try:
+                cancel_owner(context_key, owner_token)
+            except Exception:
+                pass
         logsvc.log.warning(
             f"reply send failed: scene={send_scene}, group={send_group_id}, user={send_user_id}, detail={_onebot_resp_detail(resp)}"
         )
@@ -2037,25 +2045,7 @@ def _render_group_ai_chat_message(evt: dict) -> Optional[str]:
 
 
 def _extract_reply_msg_id(evt: dict) -> Optional[str]:
-    """提取消息中的引用（reply）段对应的被引用消息 id；无引用返回 None。"""
-    msg = evt.get("message")
-    if isinstance(msg, list):
-        for seg in msg:
-            if not isinstance(seg, dict):
-                continue
-            if str(seg.get("type") or "").strip().lower() != "reply":
-                continue
-            data = seg.get("data") or {}
-            if not isinstance(data, dict):
-                data = {}
-            rid = str(data.get("id") or data.get("message_id") or "").strip()
-            if rid:
-                return rid
-    raw = str(evt.get("raw_message") or "")
-    m = re.search(r"\[CQ:reply,id=(\d+)\]", raw, flags=re.IGNORECASE)
-    if m:
-        return m.group(1)
-    return None
+    return extract_reply_message_id(evt)
 
 
 def _evt_mentions_me(evt: dict) -> bool:
@@ -2202,15 +2192,8 @@ def _memory_identity(ctx, evt: dict, *, allow_computer: bool, perm=None) -> Opti
 
 
 def _memory_quoted_text(aisvc, session_key: Optional[str], evt: dict) -> str:
-    reply_id = _extract_reply_msg_id(evt)
-    find_message = getattr(aisvc, "find_chat_message_by_msg_id", None)
-    if not reply_id or not session_key or not callable(find_message):
-        return ""
-    try:
-        message = find_message(session_key, reply_id)
-    except Exception:
-        return ""
-    return str((message or {}).get("content") or "").strip() if isinstance(message, dict) else ""
+    quote = evt.get("_aichat_quote") if isinstance(evt, dict) else None
+    return str(quote.get("content") or "") if isinstance(quote, dict) and quote.get("available") and not quote.get("_from_get_msg") else ""
 
 
 def _memory_visual_text(slots: list) -> str:
@@ -2242,6 +2225,7 @@ async def _capture_passive_memory(ctx, evt: dict, text: str, aisvc, logsvc, curr
     if identity is None or not callable(capture):
         return
     try:
+        evt["_aichat_quote"] = await resolve_quote_for_aichat(api=None, aisvc=aisvc, session_key=_ai_chat_session_key(ctx), event=evt, identity=identity)
         await capture(identity, CapturedInput(
             source_event_id=message_id,
             own_text=text,
@@ -2335,26 +2319,10 @@ def _remember_non_ai_chat_message(
     msg_id: str = "",
     vision_slots: Optional[list] = None,
 ) -> None:
-    if aisvc is None:
-        return
-    remember_fn = getattr(aisvc, "remember_user_message", None)
-    if not callable(remember_fn):
-        return
-    session_key = _ai_chat_session_key(ctx)
-    if not session_key:
-        return
-    try:
-        remember_fn(
-            session_key,
-            _format_group_ai_user_message(ctx, text, include_sender_for_empty=bool(vision_slots)),
-            msg_id=msg_id,
-            vision_slots=vision_slots,
-        )
-        annotate = getattr(aisvc, "annotate_chat_message", None)
-        if callable(annotate):
-            annotate(session_key, "user", _format_group_ai_user_message(ctx, text, include_sender_for_empty=bool(vision_slots)), msg_id=msg_id, speaker=_ai_chat_speaker(ctx))
-    except Exception as e:
-        logsvc.log.warning(f"AI chat context non-aichat write failed: session={session_key[:80]} err={e}")
+    """Compatibility hook: only enrich an already observed message, never append."""
+    attach = getattr(aisvc, "attach_chat_vision", None)
+    if msg_id and vision_slots and callable(attach):
+        attach(_ai_chat_session_key(ctx), msg_id, vision_slots)
 
 
 def _ai_chat_session_key_for_target(scene: str, group_id: Optional[int], user_id: Optional[int]) -> Optional[str]:
@@ -2383,23 +2351,17 @@ def _remember_bot_reply_message(
     send_scene: str,
     send_group_id: Optional[int],
     send_user_id: Optional[int],
+    *, owner_token=None,
 ) -> None:
+    """Annotate ownership only; delivery is recorded by OneBot ACK/self events."""
     aisvc = getattr(ctx, "_ai_chat_context_aisvc", None)
-    if aisvc is None:
-        return
-    remember_fn = getattr(aisvc, "remember_assistant_message", None)
-    if not callable(remember_fn):
-        return
-    session_key = _ai_chat_session_key_for_target(send_scene, send_group_id, send_user_id)
-    if not session_key:
-        return
-    try:
-        remember_fn(session_key, text)
-        annotate = getattr(aisvc, "annotate_chat_message", None)
-        if callable(annotate):
-            annotate(session_key, "assistant", text, msg_id=getattr(ctx, "_last_reply_message_id", ""), speaker=_ai_chat_speaker(ctx))
-    except Exception as e:
-        logsvc.log.warning(f"AI chat context bot-reply write failed: session={session_key[:80]} err={e}")
+    annotate = getattr(aisvc, "annotate_chat_owner", None)
+    key = _ai_chat_session_key_for_target(send_scene, send_group_id, send_user_id)
+    if key and getattr(ctx, "_last_reply_message_id", "") and callable(annotate):
+        try:
+            annotate(key, getattr(ctx, "_last_reply_message_id", ""), ctx.user_id, token=owner_token)
+        except Exception as exc:
+            logsvc.log.warning(f"Context owner annotation failed: {type(exc).__name__}")
 
 
 def _remember_notice_digest_context(
@@ -2408,29 +2370,19 @@ def _remember_notice_digest_context(
     out: str,
     logsvc: LogService,
     aisvc: Optional["AIService"] = None,
+    *, event=None,
 ) -> bool:
-    if aisvc is None:
-        return False
-    session_key = _ai_chat_session_key(ctx)
-    if not session_key:
-        return False
-
-    try:
-        remember_user_fn = getattr(aisvc, "remember_user_message", None)
-        if callable(remember_user_fn):
-            remember_user_fn(session_key, _format_group_ai_user_message(ctx, str(source or "")))
-    except Exception as e:
-        logsvc.log.warning(f"AI chat context notice-source write failed: session={session_key[:80]} err={e}")
-
-    assistant_saved = False
-    try:
-        remember_assistant_fn = getattr(aisvc, "remember_assistant_message", None)
-        if callable(remember_assistant_fn):
-            remember_assistant_fn(session_key, str(out or ""))
-            assistant_saved = True
-    except Exception as e:
-        logsvc.log.warning(f"AI chat context notice-reply write failed: session={session_key[:80]} err={e}")
-    return assistant_saved
+    """Only group-upload notices without a message event need a synthetic source."""
+    if event and event.get("post_type") == "notice" and event.get("notice_type") == "group_upload" and aisvc is not None:
+        remember = getattr(aisvc, "remember_user_message", None)
+        if callable(remember):
+            key = _ai_chat_session_key(ctx)
+            text = "[群文件上传通知] " + str(source or "")
+            remember(key, text)
+            annotate = getattr(aisvc, "annotate_chat_message", None)
+            if callable(annotate):
+                annotate(key, "user", text, speaker=_ai_chat_speaker(ctx))
+    return False
 
 
 def _is_notice_file_name(name: str) -> bool:
@@ -2766,12 +2718,7 @@ async def _run_group_notice_digest(
                 logsvc.log.info(f"群通知解析：生成结果为静默或空内容 kind={kind} target={debug_target[:160]}")
                 continue
 
-            notice_ctx_saved = _remember_notice_digest_context(ctx, source, out, logsvc, aisvc)
-            if notice_ctx_saved:
-                try:
-                    setattr(ctx, "_skip_reply_context_once", True)
-                except Exception:
-                    pass
+            _remember_notice_digest_context(ctx, source, out, logsvc, aisvc, event=evt)
             await reply(api, ctx, out, logsvc)
             logsvc.log.info(f"群通知解析：已发送回复 kind={kind} target={debug_target[:160]}")
             return
@@ -4087,7 +4034,8 @@ async def _handle_ai_chat_trigger(
     perm=None,
 ):
     current_slots = list(current_slots or [])
-    has_visual = bool(current_slots)
+    has_quote = has_reply_segment(evt)
+    has_visual = bool(current_slots) or has_quote
     trigger_text = forced_ai_input
     if trigger_text is None:
         trigger_text = extract_ai_chat_trigger_text(
@@ -4102,6 +4050,12 @@ async def _handle_ai_chat_trigger(
     backend, clean_trigger_text = _split_ai_chat_backend(trigger_text)
     backend_key = "kimi"
     session_key = _ai_chat_session_key(ctx)
+    reply_id = _extract_reply_msg_id(evt)
+    if has_quote:
+        clean_trigger_text = re.sub(r"\[CQ:reply,[^\]]*\]", "", clean_trigger_text, flags=re.I).strip()
+    history_cutoff = evt.get("_chat_ingest_seq") or getattr(ctx, "_chat_ingest_seq", None)
+    if type(history_cutoff) is not int:
+        history_cutoff = None
 
     # 视觉：历史补解析（按当前后端窗口）+ 当前消息图片统一解析
     current_slots = list(current_slots or [])
@@ -4109,9 +4063,18 @@ async def _handle_ai_chat_trigger(
     if vision_skill is not None and getattr(vision_skill, "ready", False):
         try:
             if session_key and aisvc is not None and callable(getattr(aisvc, "collect_unresolved_vision_slots", None)):
-                history_slots = aisvc.collect_unresolved_vision_slots(session_key, backend_key)
+                history_slots = aisvc.collect_unresolved_vision_slots(session_key, backend_key, before_seq=history_cutoff, exclude_msg_id=message_id)
         except Exception:
             history_slots = []
+        current_ids = {str(slot.get("slot_id") if isinstance(slot, dict) else slot.slot_id) for slot in current_slots}
+        history_slots = [slot for slot in history_slots if str(slot.get("slot_id")) not in current_ids]
+        visible_slots = []
+        public_identity = _memory_identity(ctx, evt, allow_computer=False, perm=perm)
+        for slot in history_slots:
+            ownership = {"_owner_user_id": slot.get("_context_owner_user_id"), "_owner_unverified": slot.get("_context_owner_unverified")}
+            if await message_allowed(aisvc, ownership, identity=public_identity):
+                visible_slots.append(slot)
+        history_slots = visible_slots
         all_targets = history_slots + current_slots
         if all_targets:
             try:
@@ -4122,14 +4085,17 @@ async def _handle_ai_chat_trigger(
                     except Exception:
                         pass
                 current_slots = vision_skill.apply_resolutions_to_slots(current_slots, resolutions)
+                attach = getattr(aisvc, "attach_chat_vision", None)
+                if message_id and session_key and callable(attach):
+                    attach(session_key, message_id, current_slots)
             except Exception as e:
                 try:
                     logsvc.log.warning(f"vision resolve failed: {type(e).__name__}: {e}")
                 except Exception:
                     pass
-    ai_input = _augment_ai_input_with_sender(ctx, clean_trigger_text, has_visual=bool(current_slots))
+    ai_input = _augment_ai_input_with_sender(ctx, clean_trigger_text, has_visual=bool(current_slots) or has_quote)
     if ai_input is not None:
-        if not ai_input and not current_slots:
+        if not ai_input and not current_slots and not has_quote:
             await reply(api, ctx, "想聊点啥？群里@我后直接说，私聊直接发送文本就行。", logsvc)
             return True
         if aisvc is None:
@@ -4153,9 +4119,16 @@ async def _handle_ai_chat_trigger(
         chat_with_context_fn = getattr(aisvc, "chat_with_context", None)
         commit_chat_turn = getattr(aisvc, "commit_chat_turn", None)
         delivery_context = {"defer_history": True, "speaker": _ai_chat_speaker(ctx), "reply_to": _extract_reply_msg_id(evt) or ""} if callable(commit_chat_turn) else {}
+        identity = _memory_identity(ctx, evt, allow_computer=allow_computer, perm=perm)
+        quoted_message = await resolve_quote_for_aichat(api=api, aisvc=aisvc, session_key=session_key, event=evt, vision_skill=vision_skill, identity=identity)
+        evt["_aichat_quote"] = quoted_message
+        if quoted_message is not None:
+            delivery_context["quoted_message"] = quoted_message
+        if history_cutoff is not None:
+            delivery_context["history_cutoff"] = history_cutoff
 
         def _commit_delivered_chat(sent, out):
-            if sent and callable(commit_chat_turn):
+            if sent and allow_computer and callable(commit_chat_turn):
                 commit_chat_turn(
                     session_key, ai_input, out, allow_computer=allow_computer, actor_user_id=ctx.user_id,
                     msg_id=message_id, vision_slots=current_slots,
@@ -4202,10 +4175,6 @@ async def _handle_ai_chat_trigger(
                     if not await memory_turn.acquire_send_permit():
                         await memory_turn.abort("scope_changed")
                         return True
-                    try:
-                        setattr(ctx, "_skip_reply_context_once", True)
-                    except Exception:
-                        pass
                     sent = await reply(api, ctx, out, logsvc, force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None)
                     await memory_turn.finish_delivery(bool(sent))
                     _commit_delivered_chat(sent, out)
@@ -4227,10 +4196,6 @@ async def _handle_ai_chat_trigger(
                         **context_kwargs,
                     )
                 ).strip()
-                try:
-                    setattr(ctx, "_skip_reply_context_once", True)
-                except Exception:
-                    pass
             else:
                 if allow_computer:
                     out = (await chat_fn(ai_input, allow_computer=True, actor_user_id=ctx.user_id)).strip()
@@ -5139,37 +5104,11 @@ async def dispatch(
     vision_skill_ready = vision_skill is not None and getattr(vision_skill, "ready", False)
     if vision_skill_ready:
         current_slots = vision_skill.create_slots_from_event(evt, message_id=message_id)
-        # 引用（reply）：被引用消息在历史内 → 直接依赖历史 _vision；历史外 → get_msg 建 reference slot
-        reply_id = _extract_reply_msg_id(evt)
-        if reply_id:
-            sess = _ai_chat_session_key(ctx)
-            found = None
-            if sess and aisvc is not None and callable(getattr(aisvc, "find_chat_message_by_msg_id", None)):
-                try:
-                    found = aisvc.find_chat_message_by_msg_id(sess, reply_id)
-                except Exception:
-                    found = None
-            if not (found and found.get("_vision")):
-                reply_slots: list = []
-                if api is not None and callable(getattr(api, "call", None)):
-                    try:
-                        resp = await api.call("get_msg", {"message_id": int(reply_id)}, timeout=15.0)
-                        data = (resp or {}).get("data") or {}
-                        ref_msg = data.get("message")
-                        if isinstance(ref_msg, list):
-                            reply_slots = vision_skill.create_slots_from_event(
-                                {"message": ref_msg},
-                                message_id=f"ref-{reply_id}",
-                                source_kind="reply_reference",
-                            )
-                    except Exception:
-                        reply_slots = []
-                current_slots = list(current_slots) + list(reply_slots)
     has_visual = bool(current_slots)
     # 注意：不要在此处因 capture=false 清空 current_slots——
     # slash fallback 等 AI 路径仍可能使用当前图片。capture 只在 remember 时判断。
     enriched_text = raw_text
-    if not enriched_text and not has_visual:
+    if not enriched_text and not has_visual and not has_reply_segment(evt):
         return
     # 记录 IN（只有最终 log_out 才会落盘）
     logsvc.log_in(ctx, raw_text or "[image]")
@@ -5240,7 +5179,7 @@ async def dispatch(
         state,
         business_only=True,
         before_handle=_remember_non_ai_once,
-        has_visual=has_visual,
+        has_visual=has_visual or has_reply_segment(evt),
     ):
         return
     if await _handle_ai_chat_trigger(

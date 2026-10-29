@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -49,8 +49,11 @@ async def test_aichat_retains_300_full_messages_without_memory_budget(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("confirmed", [True, False])
-async def test_aichat_commits_only_delivered_replies_and_preserves_quote_identity(monkeypatch, confirmed) -> None:
+@pytest.mark.parametrize("delivery", ["ack", "event", "missing"])
+async def test_aichat_commits_only_delivered_replies_and_preserves_quote_identity(monkeypatch, delivery) -> None:
+    import client
+    from cooper_bot.core.onebot import OneBotAPI
+
     svc = AIService(_Log())
     svc._kimi_runner = _Runner()
     svc._public_runtime_safe = True
@@ -60,25 +63,35 @@ async def test_aichat_commits_only_delivered_replies_and_preserves_quote_identit
     monkeypatch.setattr(commands, "_claim_recent_reply", lambda _key: True)
     ctx = SimpleNamespace(scene="group", group_id=30303, user_id=61013, nickname="Cooper", card="Cooper", level=1, _ai_chat_context_aisvc=svc)
     logsvc = SimpleNamespace(log=SimpleNamespace(info=lambda _text: None, warning=lambda _text: None), log_out=lambda *_args: None)
-    api = SimpleNamespace(send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 123}}))
-    commands._remember_non_ai_chat_message(ctx, "查一下通知", logsvc, svc, msg_id="122")
-    assert await commands.reply(api, ctx, "这是机器人自己的通知回复", logsvc)
-    bot_message = svc.find_chat_message_by_msg_id("group:30303", "123")
-    assert bot_message["role"] == "assistant"
-    api.send_group_msg.return_value = {"status": "ok", "retcode": 0, "data": {"message_id": 125}} if confirmed else None
-    evt = {"self_id": 61007, "message": [{"type": "reply", "data": {"id": "123"}}]}
-    assert await commands._handle_ai_chat_trigger(api, ctx, evt, "这是谁说的", logsvc, svc, forced_ai_input="这是谁说的", message_id="124")
+    api = OneBotAPI(None, _Log(), http_base="http://localhost", on_send_confirmed=svc.observe_send_ack)
+    api._call_http = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 123}})
+    original = {"post_type": "message", "message_type": "group", "group_id": 30303, "user_id": 61013, "self_id": 61007, "message_id": 122, "sender": {"user_id": 61013, "nickname": "Cooper"}, "message": "check notice"}
+    client._observe_chat_stream(svc, None, original)
+    assert await commands.reply(api, ctx, "actual bot notice", logsvc)
+    assert svc.find_chat_message_by_msg_id("group:30303", "123")["role"] == "assistant"
+    api._call_http.return_value = {"status": "ok", "retcode": 0, "data": {"message_id": 125}} if delivery == "ack" else None
+    evt = dict(original, message_id=124, message=[{"type": "reply", "data": {"id": "123"}}, {"type": "text", "data": {"text": "who said this?"}}])
+    client._observe_chat_stream(svc, None, evt)
+    commit = Mock(wraps=svc.commit_chat_turn)
+    monkeypatch.setattr(svc, "commit_chat_turn", commit)
+    assert await commands._handle_ai_chat_trigger(api, ctx, evt, "who said this?", logsvc, svc, forced_ai_input="who said this?", message_id="124")
     payload = json.loads(svc._kimi_runner.requests[0].prompt)
     assert payload["current_speaker"]["nickname"] == "Cooper"
     assert payload["reply_to_message_id"] == "123"
+    assert payload["quoted_message"]["role"] == "assistant"
+    assert payload["quoted_message"]["content"] == "actual bot notice"
     assert payload["conversation_history"][0]["speaker"]["user_id"] == 61013
     assert payload["conversation_history"][1]["speaker"] == {"name": "Cooper_bot", "is_bot": True}
+    assert all(row["message_id"] != "124" for row in payload["conversation_history"])
+    if delivery == "event":
+        svc.observe_onebot_event(dict(original, post_type="message_sent", user_id=61007, sender={"user_id": 61007}, message_id=125, message="kimi-reply"))
     history = svc._load_active_chat_history("group:30303")
-    assert len(history) == (4 if confirmed else 2)
-    if confirmed:
-        assert history[-1]["_msg_id"] == "125"
-        assert history[-2]["_reply_to"] == "123"
-        assert history[-2]["_speaker"]["nickname"] == "Cooper"
+    assert len(history) == (3 if delivery == "missing" else 4)
+    assert svc.find_chat_message_by_msg_id("group:30303", "124")["_reply_to"] == "123"
+    if delivery != "missing":
+        assert history[-1]["_msg_id"] == "125" and history[-1]["_owner_user_id"] == ctx.user_id
+    commit.assert_not_called()
+
 
 
 @pytest.mark.asyncio
@@ -113,6 +126,52 @@ def _patch_settings_validation(monkeypatch, *, public: bool = True, admin: bool 
         "cooper_bot.modules.ai.aisvc.validate_kimi_settings",
         lambda _settings: SimpleNamespace(public_profile_valid=public, admin_profile_valid=admin),
     )
+
+
+@pytest.mark.asyncio
+async def test_admin_group_response_uses_private_ack_and_independent_commit(monkeypatch):
+    from cooper_bot.core.onebot import OneBotAPI
+    from test.unit.test_onebot_message_context import event
+    svc = AIService(_Log());svc.memory = None;svc._kimi_runner = _Runner()
+    svc._kimi_runner.settings.admin_enabled = True
+    svc._computer_verified = True
+    _patch_settings_validation(monkeypatch)
+    monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_: True)
+    monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
+    ctx = SimpleNamespace(scene="group", group_id=20001, user_id=10001, nickname="admin", card="", level=3, _ai_chat_context_aisvc=svc)
+    evt = event(mid="admin-request", message="perform admin task")
+    evt["_chat_ingest_seq"] = svc.observe_onebot_event(evt)
+    api = OneBotAPI(None, _Log(), http_base="http://localhost", on_send_confirmed=svc.observe_send_ack)
+    api._call_http = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 501}})
+    logsvc = SimpleNamespace(log=Mock(), log_out=Mock())
+    assert await commands._handle_ai_chat_trigger(api, ctx, evt, "perform admin task", logsvc, svc, forced_ai_input="perform admin task", message_id="admin-request")
+    api._call_http.assert_awaited_once_with("send_private_msg", {"user_id": 10001, "message": "kimi-reply"}, timeout=6.0)
+    assert [row["role"] for row in svc._load_active_chat_history("group:20001")] == ["user"]
+    assert svc.find_chat_message_by_msg_id("private:10001", "501")["content"] == "kimi-reply"
+    assert [row["role"] for row in svc._load_active_chat_history("admin:10001:group:20001")] == ["user", "assistant"]
+    assert svc._load_active_chat_history("admin:10002:group:20001") == []
+
+
+@pytest.mark.asyncio
+async def test_kimi_failure_records_only_actual_fallback_ack(monkeypatch):
+    from cooper_bot.core.onebot import OneBotAPI
+    from test.unit.test_onebot_message_context import event
+    svc = AIService(_Log());svc.memory = None;svc._kimi_runner = _Runner();svc._public_runtime_safe = True
+    svc._kimi_runner.run = AsyncMock(side_effect=RuntimeError("test backend failure"))
+    _patch_settings_validation(monkeypatch)
+    monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_: False)
+    monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
+    monkeypatch.setattr(commands, "notify_admin_error", AsyncMock())
+    ctx = SimpleNamespace(scene="group", group_id=20001, user_id=10001, nickname="user", card="", level=1, _ai_chat_context_aisvc=svc)
+    evt = event(message="ask")
+    evt["_chat_ingest_seq"] = svc.observe_onebot_event(evt)
+    api = OneBotAPI(None, _Log(), http_base="http://localhost", on_send_confirmed=svc.observe_send_ack)
+    api._call_http = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 501}})
+    assert await commands._handle_ai_chat_trigger(api, ctx, evt, "ask", SimpleNamespace(log=Mock(), log_out=Mock()), svc, forced_ai_input="ask", message_id="m1")
+    history = svc._load_active_chat_history("group:20001")
+    assert [row["role"] for row in history] == ["user", "assistant"]
+    assert history[-1]["_msg_id"] == "501" and history[-1]["content"] == svc.fallback_error_reply
+    api._call_http.assert_awaited_once()
 
 
 @pytest.mark.asyncio

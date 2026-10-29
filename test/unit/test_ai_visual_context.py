@@ -428,13 +428,19 @@ async def test_dispatch_private_pure_image_triggers_ai(dispatch_harness) -> None
 @pytest.mark.asyncio
 async def test_dispatch_group_image_without_mention_saves_unresolved_slot(dispatch_harness) -> None:
     ctx = _make_ctx(scene="group")
-    aisvc = _FakeAIService()
+    aisvc = _new_aisvc()
+    aisvc.memory = None
+    aisvc.chat_with_context = AsyncMock()
     vision = _FakeVisionSkill()
+    evt = _image_evt(group=True, mention=False)
+    evt.update(user_id=ctx.user_id, group_id=ctx.group_id, sender={"user_id": ctx.user_id, "nickname": ctx.nickname, "card": ctx.card})
+    import client
+    client._observe_chat_stream(aisvc, vision, evt)
 
     await commands.dispatch(
         api=SimpleNamespace(),
         ctx=ctx,
-        evt=_image_evt(group=True, mention=False),
+        evt=evt,
         text="",
         filesvc=_make_filesvc_stub(),
         logsvc=_DummyLogService(),
@@ -446,11 +452,9 @@ async def test_dispatch_group_image_without_mention_saves_unresolved_slot(dispat
     )
 
     aisvc.chat_with_context.assert_not_awaited()
-    aisvc.remember_user_message.assert_called_once()
-    kwargs = aisvc.remember_user_message.call_args.kwargs
-    assert kwargs["msg_id"] == "100"
-    assert kwargs["vision_slots"]
-    assert kwargs["vision_slots"][0].status == "unresolved"
+    history = aisvc._load_active_chat_history("group:20001")
+    assert len(history) == 1 and history[0]["_msg_id"] == "100"
+    assert history[0]["_vision"][0]["status"] == "unresolved"
     assert vision.resolve_calls == []  # 未触发 AI，不解析
 
 
@@ -540,6 +544,7 @@ async def test_dispatch_reply_in_history_uses_existing_vision(dispatch_harness) 
             "role": "user",
             "content": "图",
             "_msg_id": "111",
+            "_speaker": {"user_id": ctx.user_id, "is_bot": False},
             "_vision": [{"slot_id": "111:1", "index": 1, "segment_type": "image", "status": "ready", "description": "类型：表情包；画面：狗"}],
         }
     )
@@ -576,17 +581,18 @@ async def test_dispatch_reply_in_history_uses_existing_vision(dispatch_harness) 
 
 
 @pytest.mark.asyncio
-async def test_dispatch_reply_outside_history_uses_get_msg(dispatch_harness) -> None:
+@pytest.mark.parametrize("own_image", [False, True])
+async def test_dispatch_reply_outside_history_uses_get_msg(dispatch_harness, own_image) -> None:
     ctx = _make_ctx(scene="private_friend", group_id=None)
     aisvc = _FakeAIService()  # find 返回 None（历史外）
     vision = _FakeVisionSkill()
 
     async def _fake_call(action: str, params: dict, timeout: float = 8.0):
         if action == "get_msg":
-            return {"data": {"message": [{"type": "image", "data": {"url": "https://ref/2.png", "file_id": "rf2"}}]}}
+            return {"status": "ok", "retcode": 0, "data": {"message_id": 999, "message_type": "private", "sender": {"user_id": ctx.user_id}, "message": [{"type": "image", "data": {"url": "https://ref/2.png", "file_id": "rf2"}}]}}
         return None
 
-    api = SimpleNamespace(call=_fake_call)
+    api = SimpleNamespace(call=AsyncMock(side_effect=_fake_call))
     evt = {
         "post_type": "message",
         "message_type": "private",
@@ -596,6 +602,8 @@ async def test_dispatch_reply_outside_history_uses_get_msg(dispatch_harness) -> 
         "message": [{"type": "reply", "data": {"id": "999"}}, {"type": "text", "data": {"text": "看看"}}],
         "raw_message": "",
     }
+    if own_image:
+        evt["message"].append({"type": "image", "data": {"url": "https://current/own.png"}})
 
     await commands.dispatch(
         api=api,
@@ -613,8 +621,32 @@ async def test_dispatch_reply_outside_history_uses_get_msg(dispatch_harness) -> 
 
     aisvc.chat_with_context.assert_awaited_once()
     kwargs = aisvc.chat_with_context.await_args.kwargs
-    assert kwargs["vision_slots"]
-    assert kwargs["vision_slots"][0].source_kind == "reply_reference"
+    assert bool(kwargs["vision_slots"]) is own_image
+    if own_image:
+        assert kwargs["vision_slots"][0].source_kind == "message"
+        assert kwargs["vision_slots"][0].slot_id.startswith("300:")
+    assert kwargs["quoted_message"]["available"]
+    assert "猫" in kwargs["quoted_message"]["content"]
+    assert vision.resolve_calls[-1][0].source_kind == "reply_reference"
+    assert vision.resolve_calls[-1][0].slot_id.startswith("ref-999:")
+    api.call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group,mention,expected", [(False, False, True), (True, True, True), (True, False, False)])
+async def test_quote_only_message_reaches_ai_without_invented_own_text(dispatch_harness, group, mention, expected):
+    ctx = _make_ctx(scene="group" if group else "private_friend", group_id=20001 if group else None)
+    aisvc = _FakeAIService()
+    aisvc.find_chat_message_by_msg_id.return_value = {"role": "user", "content": "original", "_speaker": {"user_id": 10001, "is_bot": False}}
+    evt = {"post_type": "message", "message_type": "group" if group else "private", "self_id": 90001, "message_id": "300", "message": [{"type": "reply", "data": {"id": "101"}}]}
+    if mention:
+        evt["message"].append({"type": "at", "data": {"qq": "90001"}})
+    await commands.dispatch(api=SimpleNamespace(), ctx=ctx, evt=evt, text="", filesvc=_make_filesvc_stub(), logsvc=_DummyLogService(), state=commands.BotState(), handin=Mock(), aisvc=aisvc)
+    assert bool(aisvc.chat_with_context.await_count) is expected
+    if expected:
+        call = aisvc.chat_with_context.await_args
+        assert "original" not in call.args[1]
+        assert call.kwargs["quoted_message"]["content"] == "original"
 
 
 @pytest.mark.asyncio
@@ -731,17 +763,18 @@ async def test_capture_false_slash_fallback_keeps_current_image(dispatch_harness
 
 def test_group_pure_image_context_keeps_sender_metadata() -> None:
     ctx = _make_ctx(scene="group")
-    aisvc = _FakeAIService()
+    aisvc = _new_aisvc()
     slot = VisionSlot(slot_id="1:1", index=1, segment_type="image", url="https://a/1.png")
+    evt = {"post_type": "message", "message_type": "group", "group_id": ctx.group_id, "user_id": ctx.user_id, "message_id": "1", "message": [{"type": "image", "data": {}}], "sender": {"user_id": ctx.user_id, "nickname": ctx.nickname, "card": ctx.card}}
+    aisvc.observe_onebot_event(evt)
     commands._remember_non_ai_chat_message(
         ctx, "", _DummyLogService(), aisvc, msg_id="1", vision_slots=[slot]
     )
-    aisvc.remember_user_message.assert_called_once()
-    content = aisvc.remember_user_message.call_args.args[1]
-    assert "发言人QQ:10001" in content
-    assert "发言人昵称:tester" in content
-    assert "群号:20001" in content
-    assert aisvc.remember_user_message.call_args.kwargs["vision_slots"]
+    history = aisvc._load_active_chat_history("group:20001")
+    assert len(history) == 1
+    assert history[0]["_speaker"]["user_id"] == 10001
+    assert history[0]["_speaker"]["nickname"] == "tester"
+    assert history[0]["_vision"][0]["slot_id"] == "1:1"
 
 
 @pytest.mark.asyncio

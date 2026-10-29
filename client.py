@@ -32,6 +32,7 @@ from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
 from cooper_bot.modules.moderation.service import ModerationService
 from cooper_bot.commands.kick_commands import handle_kick_command, parse_kick_command, personal_level
+from cooper_bot.modules.ai.message_context import is_self_message
 
 log = Logger("bot", "INFO")
 
@@ -47,6 +48,25 @@ REBUILD_MATERIAL_SCAN_MARKS_ON_STARTUP = False
 _INSTANCE_LOCK_HANDLE = None
 # 启动后后台同步任务；由 run_forever() 在退出时统一取消并 await。
 _POST_SYNC_TASK: "asyncio.Task | None" = None
+
+
+def _observe_chat_stream(aisvc, vision_skill, data):
+    if data.get("post_type") in ("message", "message_sent") and data.get("message_type") in ("group", "private"):
+        slots = []
+        if vision_skill is not None and getattr(vision_skill, "ready", False) and getattr(vision_skill, "capture_context_images", False):
+            try:
+                slots = vision_skill.create_slots_from_event(data, message_id=str(data.get("message_id") or ""))
+            except Exception as exc:
+                log.warning(f"Context slots unavailable: {type(exc).__name__}")
+        observer = getattr(aisvc, "observe_onebot_event", None)
+        if callable(observer):
+            try:
+                sequence = observer(data, vision_slots=slots)
+                if type(sequence) is int:
+                    data["_chat_ingest_seq"] = sequence
+            except Exception as exc:
+                log.warning(f"Context observation failed: {type(exc).__name__}")
+    return is_self_message(data)
 
 
 def _schedule_friend_completion(api, ctx, data: dict, text: str):
@@ -231,7 +251,7 @@ async def _run_bot_loop(
                 max_size=2 ** 22,
             ) as ws:
                 # action 走 HTTP，WS 仅收事件（可显著减少超时/卡顿/误报失败）
-                api = OneBotAPI(ws, log, http_base=HTTP_BASE, http_token=HTTP_TOKEN)
+                api = OneBotAPI(ws, log, http_base=HTTP_BASE, http_token=HTTP_TOKEN, on_send_confirmed=getattr(aisvc, "observe_send_ack", None))
                 logsvc = LogService(LOG_DIR, log)
                 dispatch_sem = asyncio.Semaphore(MAX_DISPATCH_CONCURRENCY)
                 conv_locks: Dict[str, asyncio.Lock] = {}
@@ -380,6 +400,13 @@ async def _run_bot_loop(
                                 log.warning(f"WS message ignored: expected JSON object, got {type(data).__name__}")
                                 continue
 
+                            if "echo" in data:
+                                api.feed_response(data)
+                                if "post_type" not in data:
+                                    continue
+                            if _observe_chat_stream(aisvc, vision_skill, data):
+                                continue
+
                             # ===== 自动通过好友申请（post_type=request）=====
                             if data.get("post_type") == "request" and data.get("request_type") == "friend":
                                 if AUTO_APPROVE_FRIEND_REQUEST:
@@ -400,14 +427,11 @@ async def _run_bot_loop(
                                 continue
 
                             # action 回包
-                            if "echo" in data:
-                                api.feed_response(data)
-                                if "post_type" not in data:
-                                    continue
-
                             ctx = build_ctx(data, perm=perm)
                             if not ctx:
                                 continue
+                            setattr(ctx, "_ai_chat_context_aisvc", aisvc)
+                            setattr(ctx, "_chat_ingest_seq", data.get("_chat_ingest_seq"))
 
                             text = get_text(data)
                             if editor_duty_service is not None and str(data.get("group_id")) == str(editor_duty_service.group_id):
