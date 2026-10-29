@@ -47,7 +47,7 @@ def test_env_priority_and_private_paths(tmp_path):
     assert loaded["AI_CHAT_MODEL"] == "system-model"
     assert loaded["TOKEN"] == "secret-token"
     assert loaded["CALENDAR_TEST_GROUP_ID"] == "30303"
-    assert Path(loaded["AI_GROUP_CHAT_PROMPTS_PATH"]) == tmp_path / "config/private/ai/group_chat_prompts.json"
+    assert Path(loaded["AI_GROUP_CHAT_PROMPTS_PATH"]) == tmp_path / "config/private/ai/prompts/chat/group_overrides.json"
     assert Path(loaded["EDITOR_DUTY_CONFIG_PATH"]) == tmp_path / "config/private/calendar/editor_duty_config.json"
 
 

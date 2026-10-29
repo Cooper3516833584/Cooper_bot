@@ -289,6 +289,26 @@ def test_invalid_unhashable_model_enum_is_uncertain():
     assert result == ReviewResult("uncertain", stop_reason="invalid_model_enum")
 
 
+@pytest.mark.asyncio
+async def test_missing_review_prompt_cannot_issue_block_or_call_model(tmp_path, monkeypatch):
+    from cooper_bot.core import config
+
+    monkeypatch.setattr(config, "AI_PROMPTS_DIR", tmp_path / "empty_prompts")
+    gateway = _FakeGateway()
+    vision = _FakeVision()
+    message = _text_record("prompt-missing", time.time(), "待审核文本")
+    message["segments"].append({"type": "image", "data": {"file_id": "image", "url": "https://media.invalid/image"}})
+    result = await review_snapshot(
+        api=None, gateway=gateway, vision_skill=vision, self_id=500, group_id=700, user_id=100,
+        messages=[message],
+        trigger_message_ids={"prompt-missing"}, votes={"total": 3},
+        deadline=time.time() + 60, still_current=lambda: True,
+    )
+    assert result == ReviewResult("uncertain", stop_reason="review_prompt_unavailable")
+    assert gateway.payload is None
+    assert vision.resolve_calls == 0
+
+
 class _FakePerm:
     def get_level(self, user_id):
         return 3 if int(user_id) == 900 else 0

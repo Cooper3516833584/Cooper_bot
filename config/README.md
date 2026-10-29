@@ -4,7 +4,7 @@
 公开仓库只保存 `config/examples/` 下的示例。示例不会自动作为运行配置加载。
 
 首次部署时，将所需的示例复制到 `config/private/` 的相同相对位置，去掉文件名末尾的 `.example`，再填写实际值。
-例如 `examples/ai/group_chat_prompts.json.example` 对应 `private/ai/group_chat_prompts.json`。
+例如 `examples/ai/prompts/chat/group_overrides.json.example` 对应 `private/ai/prompts/chat/group_overrides.json`。
 Kimi 的 `public_home_security.example.toml` 是独立安全配置参考，应按已有 profile 部署说明使用。
 
 | 文件或目录 | 用途 | 修改后生效方式 |
@@ -13,11 +13,13 @@ Kimi 的 `public_home_security.example.toml` 是独立安全配置参考，应�
 | `secrets.env` | NapCat 账号、token、管理员、邮箱账号及凭据 | 重启；NapCat 账号设置另需按原方式重建容器 |
 | `permissions.json` | `group_levels` 群权限下限映射，级别为整数 0 到 3 | 重启 |
 | `api_key.txt` | 既有六行模型凭据格式，空行必须保留 | 按模型服务原有加载方式 |
-| `ai/system_prompt.txt` | 默认系统角色提示词 | 重启 |
-| `ai/group_chat_prompts.json` | 群聊角色覆盖 | 自动重读 |
-| `ai/private_chat_prompts.json` | 私聊角色覆盖 | 自动重读 |
-| `ai/group_notice_prompts.json` | 群通知分类和省流提示词 | 自动重读 |
-| `ai/kimi/` | 公共和管理员 agent 提示词及部署参考 | 提示词修改后建议重启 |
+| `ai/prompts/chat/persona.txt` | 默认系统角色提示词 | 重启 |
+| `ai/prompts/chat/group_overrides.json` | 群聊角色覆盖 | 自动重读 |
+| `ai/prompts/chat/private_overrides.json` | 私聊角色覆盖 | 自动重读 |
+| `ai/prompts/notice/prompts.json` | 群通知分类和省流提示词覆盖 | 自动重读 |
+| `ai/prompts/kimi/` | 公共和管理员 agent 提示词 | 修改后重启 |
+| `ai/prompts/` 其余文件 | 邮件、资料、日历、记忆、视觉、审核、联网等业务提示词 | 修改后重启 |
+| `ai/kimi/` | Kimi 环境与安全配置参考，非提示词 | 按部署说明 |
 | `calendar/daily_calendar_config.json` | 按群设置的每日提醒 | 自动重读 |
 | `calendar/editor_duty_config.json` | 值班群、发布账号、排除名单、日期与策略 | `group_id`、`publisher_id` 修改后重启；其余设置自动重读 |
 | `replies/` | 精确、关键词、连续文本回复 | 自动重读 |
@@ -27,6 +29,8 @@ Kimi 的 `public_home_security.example.toml` 是独立安全配置参考，应�
 环境变量优先级：**已有系统环境变量 > `secrets.env` > `settings.env` > 代码中的通用默认值**。
 保留 `secrets.env` 中旧功能键的兼容性，但维护新设置时请放进 `settings.env`，避免重复定义。
 文件中的空值按原有解析规则回退到默认值。示例中的空群列表、零值目标不会启用定向提醒。
+
+AI 提示词的完整目录、变量和生效范围见 [PROMPTS.md](PROMPTS.md)。提示词文件不使用环境变量的空值回退规则。
 
 `CALENDAR_TEST_GROUP_ID` 指定 `/calendartest` 使用的群级配置；未设置时使用通用日历参数，不发送到目标群。
 `MEMORY_PROBE_SCOPE` 和 `MEMORY_PROBE_ACTOR` 仅供手动诊断脚本使用，也可用命令行参数覆盖。

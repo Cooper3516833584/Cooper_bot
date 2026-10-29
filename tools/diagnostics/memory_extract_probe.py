@@ -34,11 +34,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from cooper_bot.core import config  # noqa: E402
 from cooper_bot.modules.ai import model_gateway as gateway_module  # noqa: E402
 from cooper_bot.modules.memory.llm import MemoryLLM  # noqa: E402
-from cooper_bot.modules.memory.service import _MEMORY_EXTRACT_SYSTEM  # noqa: E402
+from cooper_bot.modules.ai.prompt_store import get_prompt  # noqa: E402
 
 EVENT_TEXT_CHARS = 200
 # 直接引用生产 prompt，避免探针自己维护一份漂移的副本。
-EXTRACT_SYSTEM = _MEMORY_EXTRACT_SYSTEM
+EXTRACT_SYSTEM = get_prompt("memory.extract")
 
 USAGE_LOG: list[dict] = []
 

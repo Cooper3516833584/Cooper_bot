@@ -62,9 +62,10 @@ def _apply_path_patches(monkeypatch: pytest.MonkeyPatch, cfg: dict[str, Any]) ->
         "GROUP_LEVEL": {},
         "DEFAULT_LEVEL": 0,
         "AI_SYSTEM_PROMPT": "Test assistant. Use /help for commands.",
-        "AI_GROUP_CHAT_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/group_chat_prompts.json",
-        "AI_PRIVATE_CHAT_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/private_chat_prompts.json",
-        "AI_GROUP_NOTICE_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/group_notice_prompts.json",
+        "AI_PROMPTS_DIR": cfg["prompt_root"],
+        "AI_GROUP_CHAT_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/prompts/chat/group_overrides.json",
+        "AI_PRIVATE_CHAT_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/prompts/chat/private_overrides.json",
+        "AI_GROUP_NOTICE_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/prompts/notice/prompts.json",
         "ANSWER_FILE_PATH": cfg["project_root"] / "config/private/replies/answer.txt",
         "KEYWORD_ANSWER_FILE_PATH": cfg["project_root"] / "config/private/replies/keyword_answer.txt",
         "CONSECUTIVE_REPLY_CONFIG_PATH": cfg["project_root"] / "config/private/replies/consecutive_reply.json",
@@ -186,11 +187,23 @@ def tmp_data_dirs(tmp_project_root: Path) -> dict[str, Path]:
     }
 
 
+@pytest.fixture(scope="session")
+def prompt_examples_root(tmp_path_factory) -> Path:
+    root = tmp_path_factory.mktemp("prompt_examples")
+    examples = Path(__file__).resolve().parents[1] / "config/examples/ai/prompts"
+    for source in examples.rglob("*.example"):
+        target = root / source.relative_to(examples).with_suffix("")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    return root
+
+
 @pytest.fixture
 def test_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_project_root: Path,
     tmp_data_dirs: dict[str, Path],
+    prompt_examples_root: Path,
 ) -> dict[str, Any]:
     admin_user_id = 900001
     default_user_id = 10001
@@ -198,6 +211,7 @@ def test_config(
 
     cfg: dict[str, Any] = {
         "project_root": tmp_project_root,
+        "prompt_root": prompt_examples_root,
         "data_dir": tmp_data_dirs["data_dir"],
         "log_dir": tmp_data_dirs["log_dir"],
         "public_dir": tmp_data_dirs["public_dir"],

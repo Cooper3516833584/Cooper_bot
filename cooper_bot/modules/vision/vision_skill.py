@@ -31,6 +31,7 @@ from PIL import Image, ImageDraw, UnidentifiedImageError
 
 import cooper_bot.core.config as config
 from cooper_bot.modules.ai.model_gateway import ModelGateway, VISION_PROVIDER
+from cooper_bot.modules.ai.prompt_store import optional_prompt
 from cooper_bot.core.config import (
     TEMP_DIR,
     PROJECT_ROOT,
@@ -157,29 +158,6 @@ QQ_FACE_NAMES = {
 _VISION_PROMPT_VERSION = "v1"
 _VISION_MAX_OUTPUT_TOKENS = 1600
 
-_VISION_SYSTEM_PROMPT = """你是聊天图片描述器。
-
-请分析输入图片，生成供另一个纯文本聊天模型理解的描述。
-
-要求：
-1. 判断类型：照片、截图、聊天截图、表情包、漫画、动图帧或其他。
-2. 描述主要人物、物体、动作和场景。
-3. 提取清晰可见的文字。
-4. 如果是表情包，说明情绪、语气和通常表达的聊天含义。
-5. 不要猜测无法确认的人物身份。
-6. 不要编造模糊或不可见文字。
-7. 不要对图片外的上下文作推断。
-8. 输出必须是 JSON。
-9. 描述应简洁，适合放入聊天历史。
-
-JSON 格式：
-{
-  "kind": "图片类型",
-  "scene": "主要画面",
-  "visible_text": "可见文字，没有则为空字符串",
-  "emotion": "情绪或语气，没有则为空字符串",
-  "intent": "可能表达的聊天含义，没有则为空字符串"
-}"""
 
 MAX_IMAGE_PIXELS = 20_000_000
 _ANIMATED_SAMPLE_FRAMES = 3
@@ -278,6 +256,7 @@ class VisionSkill:
         gateway=None,
     ):
         self.log = log
+        self._vision_system_prompt = optional_prompt("vision.describe")
         # 视觉 provider 的凭据与模型名统一由 model_gateway 解析；下面这些属性保持
         # 原有名字供外部读取，实际请求也经 gateway 发出。
         self.gateway = gateway or ModelGateway(log)
@@ -916,9 +895,11 @@ class VisionSkill:
     # ---------- API 调用 ----------
 
     async def _call_vision_api(self, data_url: str) -> str:
+        if not self._vision_system_prompt:
+            raise _PermanentVisionError("vision prompt unavailable")
         return await self.gateway.vision_describe(
             data_url,
-            system_prompt=_VISION_SYSTEM_PROMPT,
+            system_prompt=self._vision_system_prompt,
             max_tokens=_VISION_MAX_OUTPUT_TOKENS,
             timeout=self.timeout_seconds,
             client=self._client,
@@ -956,6 +937,7 @@ class VisionSkill:
         h.update(self.model.encode("utf-8", errors="ignore"))
         h.update(b"|")
         h.update(_VISION_PROMPT_VERSION.encode("utf-8", errors="ignore"))
+        h.update(self._vision_system_prompt.encode("utf-8"))
         return h.hexdigest()
 
     def _get_cache(self, key: str) -> Optional[str]:

@@ -1,0 +1,7 @@
+{
+  "_help": [
+    "复制到 config/private/ai/prompts/chat/group_overrides.json；groups 用自己的群号作为键。"
+  ],
+  "default": "",
+  "groups": {}
+}

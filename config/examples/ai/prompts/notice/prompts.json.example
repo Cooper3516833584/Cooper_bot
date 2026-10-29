@@ -1,6 +1,6 @@
 {
   "_help": [
-    "复制到 config/private/ai/group_notice_prompts.json；按需添加 groups 覆盖。"
+    "复制到 config/private/ai/prompts/notice/prompts.json；按需添加 groups 覆盖。"
   ],
   "default": {
     "classify_prompt_lines": [

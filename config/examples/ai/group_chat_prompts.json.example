@@ -1,7 +1,0 @@
-{
-  "_help": [
-    "复制到 config/private/ai/group_chat_prompts.json；groups 用自己的群号作为键。"
-  ],
-  "default": "",
-  "groups": {}
-}

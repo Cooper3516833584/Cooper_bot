@@ -26,6 +26,7 @@ NAPCAT_DIR = RUNTIME_DIR / "napcat"
 
 PRIVATE_CONFIG_DIR = CONFIG_DIR / "private"
 AI_CONFIG_DIR = PRIVATE_CONFIG_DIR / "ai"
+AI_PROMPTS_DIR = AI_CONFIG_DIR / "prompts"
 REPLIES_DIR = PRIVATE_CONFIG_DIR / "replies"
 AUTO_REPLY_IMAGES_DIR = STORAGE_DIR / "auto_replies" / "images"
 WIKI_CONFIG_DIR = PRIVATE_CONFIG_DIR / "wiki"
@@ -325,9 +326,9 @@ AI_STATE_DIR = STATE_DIR / "ai"
 AI_MATERIAL_SCAN_MARKS_PATH = AI_STATE_DIR / "material_scan_marks.json"
 AI_MATERIAL_STATE_CACHE_PATH = AI_STATE_DIR / "material_state_cache.json"
 
-AI_GROUP_CHAT_PROMPTS_PATH = AI_CONFIG_DIR / "group_chat_prompts.json"
-AI_GROUP_NOTICE_PROMPTS_PATH = AI_CONFIG_DIR / "group_notice_prompts.json"
-AI_PRIVATE_CHAT_PROMPTS_PATH = AI_CONFIG_DIR / "private_chat_prompts.json"
+AI_GROUP_CHAT_PROMPTS_PATH = AI_PROMPTS_DIR / "chat" / "group_overrides.json"
+AI_GROUP_NOTICE_PROMPTS_PATH = AI_PROMPTS_DIR / "notice" / "prompts.json"
+AI_PRIVATE_CHAT_PROMPTS_PATH = AI_PROMPTS_DIR / "chat" / "private_overrides.json"
 ANSWER_FILE_PATH = REPLIES_DIR / "answer.txt"
 KEYWORD_ANSWER_FILE_PATH = REPLIES_DIR / "keyword_answer.txt"
 CONSECUTIVE_REPLY_CONFIG_PATH = REPLIES_DIR / "consecutive_reply.json"
@@ -352,8 +353,8 @@ AI_KIMI_PUBLIC_HOME = _get_env_path("AI_KIMI_PUBLIC_HOME", RUNTIME_DIR / "kimi" 
 AI_KIMI_ADMIN_HOME = _get_env_path("AI_KIMI_ADMIN_HOME", RUNTIME_DIR / "kimi" / "admin")
 AI_KIMI_PUBLIC_WORKDIR = _get_env_path("AI_KIMI_PUBLIC_WORKDIR", _KIMI_PUBLIC_WORKDIR_DEFAULT)
 AI_KIMI_ADMIN_WORKDIR = _get_env_path("AI_KIMI_ADMIN_WORKDIR", WORKSPACES_DIR / "kimi_admin")
-AI_KIMI_PUBLIC_AGENT_PATH = _get_env_path("AI_KIMI_PUBLIC_AGENT_PATH", AI_CONFIG_DIR / "kimi" / "public.md")
-AI_KIMI_ADMIN_AGENT_PATH = _get_env_path("AI_KIMI_ADMIN_AGENT_PATH", AI_CONFIG_DIR / "kimi" / "admin.md")
+AI_KIMI_PUBLIC_AGENT_PATH = _get_env_path("AI_KIMI_PUBLIC_AGENT_PATH", AI_PROMPTS_DIR / "kimi" / "public.md")
+AI_KIMI_ADMIN_AGENT_PATH = _get_env_path("AI_KIMI_ADMIN_AGENT_PATH", AI_PROMPTS_DIR / "kimi" / "admin.md")
 AI_KIMI_TIMEOUT_SECONDS = _get_env_float("AI_KIMI_TIMEOUT_SECONDS", 120.0, 10.0, 600.0)
 AI_KIMI_ADMIN_TIMEOUT_SECONDS = _get_env_float("AI_KIMI_ADMIN_TIMEOUT_SECONDS", 480.0, 10.0, 600.0)
 AI_KIMI_MAX_CONCURRENCY = _get_env_int("AI_KIMI_MAX_CONCURRENCY", 3, 1, 16)
@@ -370,7 +371,7 @@ AI_FALLBACK_ERROR_REPLY = (
     "哎呀，我的脑子好像卡壳了（API报错/网络波动），请稍后重试，或者@Cooper 检查一下我的后台服务器吧！🔌"
 )
 
-AI_SYSTEM_PROMPT_PATH = AI_CONFIG_DIR / "system_prompt.txt"
+AI_SYSTEM_PROMPT_PATH = AI_PROMPTS_DIR / "chat" / "persona.txt"
 try:
     AI_SYSTEM_PROMPT = AI_SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
 except FileNotFoundError:
