@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -24,10 +25,10 @@ LOG_DIR = RUNTIME_DIR / "logs"
 NAPCAT_DIR = RUNTIME_DIR / "napcat"
 
 PRIVATE_CONFIG_DIR = CONFIG_DIR / "private"
-AI_CONFIG_DIR = CONFIG_DIR / "ai"
-REPLIES_DIR = CONFIG_DIR / "replies"
+AI_CONFIG_DIR = PRIVATE_CONFIG_DIR / "ai"
+REPLIES_DIR = PRIVATE_CONFIG_DIR / "replies"
 AUTO_REPLY_IMAGES_DIR = STORAGE_DIR / "auto_replies" / "images"
-WIKI_CONFIG_DIR = CONFIG_DIR / "wiki"
+WIKI_CONFIG_DIR = PRIVATE_CONFIG_DIR / "wiki"
 
 # ========== 读取敏感配置（secrets.env） ==========
 # 目标：把 TOKEN / ACCOUNT / ADMIN_USERS 等敏感信息从代码里剥离出去
@@ -56,6 +57,8 @@ def _load_env_file(path: Path):
             os.environ[k] = v
 
 _load_env_file(SECRETS_ENV_PATH)
+SETTINGS_ENV_PATH = PRIVATE_CONFIG_DIR / "settings.env"
+_load_env_file(SETTINGS_ENV_PATH)
 
 def _get_env(name: str, default: str = "") -> str:
     v = os.getenv(name)
@@ -117,11 +120,11 @@ CLIENT_LOCK_PATH = STATE_DIR / "client" / "client.lock"
 
 # NapCat / OneBot v11
 TOKEN = _get_env("TOKEN", "CHANGE_ME_TOKEN")
-WS_URI = f"ws://127.0.0.1:13001/?access_token={TOKEN}"
+WS_URI = _get_env("WS_URI", f"ws://127.0.0.1:13001/?access_token={TOKEN}")
 
 # 你已经配好的 HTTP Server（可选；目前阶段不依赖它）
-HTTP_PORT = 13010
-HTTP_BASE = f"http://127.0.0.1:{HTTP_PORT}"
+HTTP_PORT = _get_env_int("HTTP_PORT", 13010, 1, 65535)
+HTTP_BASE = _get_env("HTTP_BASE", f"http://127.0.0.1:{HTTP_PORT}")
 
 # 如果 NapCat 的 HTTP Server 也配置了 access_token，这里会自动带上（同时放在 query + Authorization）
 HTTP_TOKEN = _get_env("HTTP_TOKEN", TOKEN)
@@ -132,7 +135,7 @@ AUTO_APPROVE_FRIEND_REQUEST = _get_env_bool("AUTO_APPROVE_FRIEND_REQUEST", True)
 AUTO_APPROVE_FRIEND_REMARK = _get_env("AUTO_APPROVE_FRIEND_REMARK", "")
 
 # 会话多久没说话就切一份日志
-IDLE_SPLIT_SECONDS = 1800
+IDLE_SPLIT_SECONDS = _get_env_int("IDLE_SPLIT_SECONDS", 1800, 1, 86400)
 
 # 权限等级：0游客 1临时 2好友 3管理员
 # 管理员 QQ 号（/whoami 里显示的 user_id）
@@ -151,9 +154,25 @@ KICK_AUDIT_QQ = (
 ENABLE_OCR = _get_env_bool("ENABLE_OCR", False)
 
 # 群权限：可选的群级别“下限”（通常不需要；你也可以留空）
-GROUP_LEVEL = {
-    # 1076684416: 2,
-}
+PERMISSIONS_CONFIG_PATH = PRIVATE_CONFIG_DIR / "permissions.json"
+
+def _load_group_levels(path: Path) -> dict[int, int]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8")).get("group_levels", {})
+    except FileNotFoundError:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("group_levels must be an object")
+    levels = {}
+    for key, level in raw.items():
+        if not str(key).isascii() or not str(key).isdigit() or len(str(key)) > 20 or int(key) <= 0:
+            raise ValueError("invalid group_levels key")
+        if type(level) is not int or level not in (0, 1, 2, 3):
+            raise ValueError("invalid group permission level")
+        levels[int(key)] = level
+    return levels
+
+GROUP_LEVEL = _load_group_levels(PERMISSIONS_CONFIG_PATH)
 
 # 未见过的 QQ 默认 0（游客，不能访问资料库）
 DEFAULT_LEVEL = 0
@@ -189,11 +208,15 @@ HANDIN_ROOT_DIR = SUBMISSIONS_DIR / "handin"
 # 班级名册（放在 storage/documents/friend/ 下）
 ROSTER_XLSX_PATH = DATA_DIR / "friend" / "班级名册.xlsx"
 # 时区（用于解析提醒/截止时间）
-TIMEZONE = "Asia/Shanghai"
+TIMEZONE = _get_env("TIMEZONE", "Asia/Shanghai")
 
 # ===== 每日重要日提醒 =====
 # 配置与运行状态分离：配置可由管理员编辑，联网事实、年度放假安排和发送记录都写入 runtime/。
-DAILY_CALENDAR_CONFIG_PATH = CONFIG_DIR / "calendar" / "daily_calendar_config.json"
+DAILY_CALENDAR_CONFIG_PATH = PRIVATE_CONFIG_DIR / "calendar" / "daily_calendar_config.json"
+EDITOR_DUTY_CONFIG_PATH = PRIVATE_CONFIG_DIR / "calendar" / "editor_duty_config.json"
+CALENDAR_TEST_GROUP_ID = _get_env_int("CALENDAR_TEST_GROUP_ID", 0, 0, 9_999_999_999)
+MEMORY_PROBE_SCOPE = _get_env("MEMORY_PROBE_SCOPE", "")
+MEMORY_PROBE_ACTOR = _get_env_int("MEMORY_PROBE_ACTOR", 0, 0, 9_999_999_999)
 DAILY_CALENDAR_DATA_DIR = STATE_DIR / "calendar"
 
 # ===== 管理员邮箱新邮件提醒 =====
@@ -226,35 +249,35 @@ UPLOAD_PRIVATE_CONTAINER_DIR = "/data/upload_private_file"
 
 # 是否在发送时把文件名转为 ASCII（可规避部分 NapCat/QQNT 对中文文件名的兼容问题）
 # 建议默认 False：优先保留原文件名；若发送失败会在代码里自动回退到 ASCII 名重试。
-SEND_FILENAME_ASCII_SAFE = False
+SEND_FILENAME_ASCII_SAFE = _get_env_bool("SEND_FILENAME_ASCII_SAFE", False)
 
 # 发送文件遇到 "rich media transfer failed" 时，自动重试的等待时间（秒）
 # Docker Desktop (Windows) 的 bind mount 有时存在同步延迟，大文件更容易触发。
 SEND_RETRY_DELAYS = [0.8, 1.8]
 
 # 若原文件发送失败（尤其是 doc/docx/pdf 等），可自动打包为 zip 再发一次作为兜底。
-AUTO_ZIP_FALLBACK = True
+AUTO_ZIP_FALLBACK = _get_env_bool("AUTO_ZIP_FALLBACK", True)
 
 # 大文件提示阈值（MB）：发送/接收超过该大小的文件时提示“请耐心等待”
-LARGE_FILE_WARN_MB = 50
+LARGE_FILE_WARN_MB = _get_env_int("LARGE_FILE_WARN_MB", 50, 1, 100000)
 
 # 展示/搜索限制
-LS_LIMIT = 100
-FIND_DIR_LIMIT = 100
-FIND_FILE_LIMIT = 100
+LS_LIMIT = _get_env_int("LS_LIMIT", 100, 1, 10000)
+FIND_DIR_LIMIT = _get_env_int("FIND_DIR_LIMIT", 100, 1, 10000)
+FIND_FILE_LIMIT = _get_env_int("FIND_FILE_LIMIT", 100, 1, 10000)
 FIND_LIMIT = max(FIND_DIR_LIMIT, FIND_FILE_LIMIT)  # 兼容旧代码
 FIND_MAX_SCAN = 100000   # 最多扫描多少个文件/目录项，避免卡死
 
 # ===== 新增：/get 多文件默认打包 =====
 # /get 选择文件数 > 该阈值时，默认打包成一个 zip 发送
-GET_ZIP_THRESHOLD = 4
+GET_ZIP_THRESHOLD = _get_env_int("GET_ZIP_THRESHOLD", 4, 1, 10000)
 
 # ===== 新增：Handin 归档保留策略 =====
 # 在任务创建者最后一次 /handinget 后，保留 N 天再清理归档（/handinstatus /handincheck 仅展示仍可 /handinget 的任务）
-HANDIN_KEEP_DAYS_AFTER_LAST_GET = 30
+HANDIN_KEEP_DAYS_AFTER_LAST_GET = _get_env_int("HANDIN_KEEP_DAYS_AFTER_LAST_GET", 30, 1, 3650)
 
 # 手动/定时清理 inbox：收件箱内临时文件保留 N 天（避免长期运行堆积）
-HANDIN_INBOX_KEEP_DAYS = 30
+HANDIN_INBOX_KEEP_DAYS = _get_env_int("HANDIN_INBOX_KEEP_DAYS", 30, 1, 3650)
 
 
 # ===== AI（DeepSeek + Embedding）=====
@@ -347,47 +370,11 @@ AI_FALLBACK_ERROR_REPLY = (
     "哎呀，我的脑子好像卡壳了（API报错/网络波动），请稍后重试，或者@Cooper 检查一下我的后台服务器吧！🔌"
 )
 
-AI_SYSTEM_PROMPT = """# 核心角色与身份设定
-
-你是 Cooper_bot，一个由校内同学 Cooper（qq号：3516833584）开发的 QQ 聊天机器人。
-
-你是一个基于 AI 的智能助手，你的目标是服务于校内同学，解决学习资料获取、群内协作和文件提交中的痛点，帮助同学们更高效地获取学习资料和信息。
-
-只要后台服务正常运行，你就会一直在线陪伴大家。
-
-
-
-# 目标受众与对话基调
-
-1. 你的受众是校内同学。
-
-2. 语气要求：热情、真诚、接地气、带有工科生的干练。像一个同级好友，不要端着架子，也不要像刻板的客服。
-
-3. 坦诚你的 AI 身份：如果遇到不懂的情感问题或纯人类的线下体验，大方承认自己是 Cooper 写的 AI 机器人，不要伪装成人类去共情，但可以提供符合逻辑的建议或安慰。
-
-# 机器人业务指令提示
-
-你需要知道机器人对 1 级用户开放的常用指令：
-
-- /help 或 /h：查看命令速览。
-- /ping：检查机器人是否在线。
-- /whoami：查看当前用户、群聊和权限信息。
-- /count：开始临时收集名单；进入模式后发送 end 结束并清空。
-- /countlist：查看已提交名单和未交名单。
-- /countremove 序号：从已提交名单中移除指定人名。
-- /ls [root/子目录]：查看资料库目录。
-- /find 搜索内容 [可选: root/子目录]：搜索资料，支持关键词或直接描述需求。
-- /get 序号：获取 /find 结果中的文件或文件夹；可以填写多个序号，例如 /get 1 2 3 4。
-- /find 返回结果后，可以直接回复序号进入下级目录。
-
-如果用户的消息看起来是在尝试使用机器人业务指令，但存在漏写 /、指令拼写错误、参数缺失或格式错误，你应该指出可能的问题，并给出最可能的正确写法。不要声称已经替用户执行指令，也不要编造不存在的指令；如果无法判断用户想做什么，提醒用户发送 /help 查看命令速览。
-
-# 兜底与边界条件
-
-- 遇到敏感、涉政、引战或违反 QQ 社区规则的话题，巧妙且生硬地转移话题，或幽默地表示“这个话题超纲啦，我只是个专注学习的机器人”。
-
-- 遇到你确实无法解决的技术故障，请回复：“哎呀，我的脑子好像卡壳了（API报错/网络波动），请稍后重试，或者@Cooper 检查一下我的后台服务器吧！🔌”
-"""
+AI_SYSTEM_PROMPT_PATH = AI_CONFIG_DIR / "system_prompt.txt"
+try:
+    AI_SYSTEM_PROMPT = AI_SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+except FileNotFoundError:
+    AI_SYSTEM_PROMPT = "You are a QQ assistant. Refer to /help for supported commands."
 
 
 # ===== 视觉描述 Skill（VISION_*）=====

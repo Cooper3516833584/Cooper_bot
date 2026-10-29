@@ -1,0 +1,7 @@
+{
+  "_help": [
+    "复制到 config/private/ai/private_chat_prompts.json；users 用自己的用户号作为键。"
+  ],
+  "default": {},
+  "users": {}
+}

@@ -15,7 +15,7 @@
 
 用法：
     python tools/diagnostics/memory_extract_probe.py
-    python tools/diagnostics/memory_extract_probe.py --scope qq:1622236011:public:group:1087250737 --actor 1797884474 --target 3747
+    python tools/diagnostics/memory_extract_probe.py --scope qq:10101:public:group:30303 --actor 20202 --target 3747
 """
 from __future__ import annotations
 
@@ -120,11 +120,13 @@ def build_gateway():
 
 async def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scope", default="qq:1622236011:public:group:1087250737")
-    parser.add_argument("--actor", type=int, default=1797884474)
+    parser.add_argument("--scope", default=config.MEMORY_PROBE_SCOPE)
+    parser.add_argument("--actor", type=int, default=config.MEMORY_PROBE_ACTOR)
     parser.add_argument("--cursor", type=int, default=0)
     parser.add_argument("--target", type=int, default=3747)
     args = parser.parse_args()
+    if not args.scope or args.actor <= 0:
+        parser.error("set --scope and --actor, or configure MEMORY_PROBE_SCOPE/MEMORY_PROBE_ACTOR")
 
     events = load_events(Path(config.AI_MEMORY_DB_PATH), args.scope, args.actor, args.cursor, args.target)
     payload = build_payload(events)

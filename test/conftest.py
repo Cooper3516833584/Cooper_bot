@@ -61,9 +61,21 @@ def _apply_path_patches(monkeypatch: pytest.MonkeyPatch, cfg: dict[str, Any]) ->
         "ADMIN_USERS": cfg["admin_users"],
         "GROUP_LEVEL": {},
         "DEFAULT_LEVEL": 0,
+        "AI_SYSTEM_PROMPT": "Test assistant. Use /help for commands.",
+        "AI_GROUP_CHAT_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/group_chat_prompts.json",
+        "AI_PRIVATE_CHAT_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/private_chat_prompts.json",
+        "AI_GROUP_NOTICE_PROMPTS_PATH": cfg["project_root"] / "config/private/ai/group_notice_prompts.json",
+        "ANSWER_FILE_PATH": cfg["project_root"] / "config/private/replies/answer.txt",
+        "KEYWORD_ANSWER_FILE_PATH": cfg["project_root"] / "config/private/replies/keyword_answer.txt",
+        "CONSECUTIVE_REPLY_CONFIG_PATH": cfg["project_root"] / "config/private/replies/consecutive_reply.json",
+        "CALENDAR_TEST_GROUP_ID": cfg["default_group_id"],
     }
     for attr, value in config_map.items():
         _patch_module_attr(monkeypatch, "cooper_bot.core.config", attr, value, import_if_missing=True)
+    for name in ("AI_SYSTEM_PROMPT", "AI_GROUP_CHAT_PROMPTS_PATH", "AI_PRIVATE_CHAT_PROMPTS_PATH", "AI_GROUP_NOTICE_PROMPTS_PATH"):
+        _patch_module_attr(monkeypatch, "cooper_bot.modules.ai.aisvc", name, config_map[name])
+    for name in ("ANSWER_FILE_PATH", "KEYWORD_ANSWER_FILE_PATH", "CONSECUTIVE_REPLY_CONFIG_PATH", "CALENDAR_TEST_GROUP_ID"):
+        _patch_module_attr(monkeypatch, "cooper_bot.commands.commands", name, config_map[name])
 
     module_patch_map: dict[str, dict[str, Any]] = {
         "cooper_bot.modules.files.filesvc": {

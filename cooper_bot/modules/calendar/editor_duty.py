@@ -11,11 +11,9 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from cooper_bot.core.config import CONFIG_DIR, STATE_DIR, TIMEZONE
+from cooper_bot.core.config import EDITOR_DUTY_CONFIG_PATH, STATE_DIR, TIMEZONE
 
 
-GROUP_ID = 1087250737
-PUBLISHER_ID = 1428941369
 _TZ = ZoneInfo(TIMEZONE)
 _SLOTS = {"morning": (9, 0, "早安"), "evening": (22, 55, "晚安")}
 _CARD = re.compile(r"(?:周|星期)\s*([一二三四五六日天])\s*([SD]+)(?![A-Za-z])", re.I)
@@ -64,13 +62,17 @@ def _data(response):
 class EditorDutyService:
     def __init__(self, log, *, config_path=None, state_path=None):
         self.log = log
-        self.config_path = Path(config_path or CONFIG_DIR / "calendar" / "editor_duty_config.json")
+        self.config_path = Path(config_path or EDITOR_DUTY_CONFIG_PATH)
+        cfg = self._config()
+        self.group_id = self._positive_id(cfg.get("group_id"))
+        self.publisher_id = self._positive_id(cfg.get("publisher_id"))
         self.state_path = Path(state_path or STATE_DIR / "editor_duty" / "state.json")
         self._state = self._load_json(self.state_path, {"days": {}})
         if not isinstance(self._state.get("days"), dict):
             raise ValueError("invalid editor duty state")
         self._lock = asyncio.Lock()
         self._forwards = {}
+        self._check_retries = {}
 
     @staticmethod
     def _load_json(path, default):
@@ -84,6 +86,11 @@ class EditorDutyService:
 
     def _config(self):
         return self._load_json(self.config_path, {})
+
+    @staticmethod
+    def _positive_id(value):
+        raw = str(value or "")
+        return int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 20 and int(raw) > 0 else 0
 
     def _day(self, day):
         return self._state["days"].setdefault(day.isoformat(), {})
@@ -117,13 +124,33 @@ class EditorDutyService:
                     continue
                 result = set()
                 node_complete = True
-                for node in nodes:
-                    if isinstance(node, dict):
+                pending = [(nodes, 0)]
+                node_count = 0
+                while pending:
+                    batch, depth = pending.pop()
+                    if depth > 3:
+                        node_complete = False
+                        continue
+                    for node in batch:
+                        node_count += 1
+                        if node_count > 1000:
+                            node_complete = False
+                            pending.clear()
+                            break
+                        if not isinstance(node, dict):
+                            node_complete = False
+                            continue
                         content = node.get("content", node.get("message", []))
                         result.update(greeting_kind(_text(content)))
                         if isinstance(content, list):
-                            if any(isinstance(seg, dict) and seg.get("type") == "forward" for seg in content):
-                                node_complete = False
+                            for seg in content:
+                                if not isinstance(seg, dict) or seg.get("type") != "forward":
+                                    continue
+                                nested = (seg.get("data") or {}).get("content")
+                                if isinstance(nested, list) and nested:
+                                    pending.append((nested, depth + 1))
+                                else:
+                                    node_complete = False
                 if len(self._forwards) >= 500:
                     self._forwards.clear()
                 if node_complete:
@@ -147,7 +174,7 @@ class EditorDutyService:
             if stamp >= previous.get("time", 0) and uid > 0:
                 entry[slot] = {"user_id": uid, "time": stamp}
                 changed = True
-            if slot == "morning" and uid > 0 and uid != PUBLISHER_ID:
+            if slot == "morning" and uid > 0 and uid != self.publisher_id:
                 editor = entry.get("morning_editor", {})
                 if stamp >= editor.get("time", 0):
                     entry["morning_editor"] = {"user_id": uid, "time": stamp}
@@ -158,7 +185,8 @@ class EditorDutyService:
 
     async def observe_event(self, api, evt):
         if (evt.get("post_type") != "message" or evt.get("message_type") != "group"
-                or str(evt.get("group_id")) != str(GROUP_ID) or not self._config().get("enabled", False)):
+                or not self.group_id or not self.publisher_id
+                or str(evt.get("group_id")) != str(self.group_id) or not self._config().get("enabled", False)):
             return
         day = datetime.fromtimestamp(int(evt.get("time") or 0), _TZ).date()
         if day != datetime.now(_TZ).date():
@@ -170,7 +198,7 @@ class EditorDutyService:
         cursor = 0
         seen = set()
         for _ in range(20):
-            params = {"group_id": GROUP_ID, "count": 100, "reverseOrder": True}
+            params = {"group_id": self.group_id, "count": 100, "reverseOrder": True}
             if cursor:
                 params["message_seq"] = cursor
             payload = _data(await api.call("get_group_msg_history", params))
@@ -202,7 +230,7 @@ class EditorDutyService:
         return False
 
     @staticmethod
-    def _fetch_qzone(cookie, day, slot):
+    def _fetch_qzone(cookie, day, slot, publisher_id):
         jar = SimpleCookie()
         jar.load(cookie)
         key = jar.get("p_skey") or jar.get("skey")
@@ -211,11 +239,11 @@ class EditorDutyService:
         token = 5381
         for char in key.value:
             token += (token << 5) + ord(char)
-        params = {"uin": PUBLISHER_ID, "ftype": 0, "sort": 0, "pos": 0, "num": 20,
+        params = {"uin": publisher_id, "ftype": 0, "sort": 0, "pos": 0, "num": 20,
                   "replynum": 0, "g_tk": token & 0x7fffffff, "format": "json"}
         url = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6?"
         req = urllib.request.Request(url + urllib.parse.urlencode(params), headers={
-            "Cookie": cookie, "Referer": f"https://user.qzone.qq.com/{PUBLISHER_ID}",
+            "Cookie": cookie, "Referer": f"https://user.qzone.qq.com/{publisher_id}",
             "User-Agent": "Mozilla/5.0",
         })
         with urllib.request.urlopen(req, timeout=12) as response:
@@ -249,13 +277,13 @@ class EditorDutyService:
             cookie = payload.get("cookies") if isinstance(payload, dict) else None
             if not cookie:
                 return None
-            return await asyncio.to_thread(self._fetch_qzone, cookie, day, slot)
+            return await asyncio.to_thread(self._fetch_qzone, cookie, day, slot, self.publisher_id)
         except Exception:
             return None
 
     async def check_once(self, api, now):
         cfg = self._config()
-        if not cfg.get("enabled", False):
+        if not cfg.get("enabled", False) or not self.group_id or not self.publisher_id:
             return
         now = now.astimezone(_TZ)
         slots = [slot for slot, (hour, minute, _) in _SLOTS.items() if (now.hour, now.minute) == (hour, minute)]
@@ -266,8 +294,14 @@ class EditorDutyService:
             entry = self._day(day)
             for slot in slots:
                 checks = entry.setdefault("checks", {})
-                if slot in checks:
+                if slot in checks and checks[slot] != "unknown":
                     continue
+                retry_key = (day.isoformat(), slot)
+                attempts, retry_after = self._check_retries.get(retry_key, (0, 0))
+                if attempts >= 3 or now.timestamp() < retry_after:
+                    continue
+                self._check_retries = {key: value for key, value in self._check_retries.items() if key[0] == day.isoformat()}
+                self._check_retries[retry_key] = (attempts + 1, now.timestamp() + 10)
                 history_ok = await self._history(api, day)
                 if entry.get(slot):
                     checks[slot] = "detected_in_group"
@@ -278,14 +312,20 @@ class EditorDutyService:
                     checks[slot] = "detected_in_qzone"
                     self._save()
                     continue
-                if not history_ok or (published is None and cfg.get("qzone_unavailable_policy") != "group_only"):
+                if not history_ok:
                     checks[slot] = "unknown"
                     self._save()
-                    self.log.warning("编辑值班检查未完成：群记录或空间读取失败，本次未提醒")
+                    qzone_result = "未检测到对应栏目" if published is False else "读取未确认"
+                    self.log.warning(f"编辑值班检查未完成：群历史读取或转发解析不完整；空间{qzone_result}（尝试 {attempts + 1}/3）")
+                    continue
+                if published is None and cfg.get("qzone_unavailable_policy") != "group_only":
+                    checks[slot] = "unknown"
+                    self._save()
+                    self.log.warning(f"编辑值班检查未完成：空间读取未确认，群内未检测到对应稿件（尝试 {attempts + 1}/3）")
                     continue
                 if published is None:
                     self.log.warning("编辑值班检查：空间暂不可读，本次按群内稿件判断")
-                members = _data(await api.get_group_member_list(GROUP_ID))
+                members = _data(await api.get_group_member_list(self.group_id))
                 if not isinstance(members, list):
                     checks[slot] = "unknown"
                     self._save()
@@ -297,7 +337,7 @@ class EditorDutyService:
                     substitute = None
                 ids = {int(member["user_id"]) for member in members if member.get("user_id")
                        and int(member["user_id"]) not in excluded
-                       and (int(member["user_id"]) == substitute if substitute and substitute != PUBLISHER_ID
+                       and (int(member["user_id"]) == substitute if substitute and substitute != self.publisher_id
                             else editor_on_duty(str(member.get("card") or ""), day,
                                                 date.fromisoformat(cfg["odd_week_monday"])))}
                 if not ids:
@@ -308,7 +348,7 @@ class EditorDutyService:
                 checks[slot] = "sending"
                 self._save()
                 mentions = " ".join(f"[CQ:at,qq={uid}]" for uid in sorted(ids))
-                response = await api.send_group_msg(GROUP_ID, f"未检测到{_SLOTS[slot][2]}，请{mentions}注意值班")
+                response = await api.send_group_msg(self.group_id, f"未检测到{_SLOTS[slot][2]}，请{mentions}注意值班")
                 checks[slot] = "sent" if _data(response) is not None else "uncertain"
                 self._save()
 

@@ -410,7 +410,7 @@ async def _run_bot_loop(
                                 continue
 
                             text = get_text(data)
-                            if editor_duty_service is not None and str(data.get("group_id")) == "1087250737":
+                            if editor_duty_service is not None and str(data.get("group_id")) == str(editor_duty_service.group_id):
                                 duty_observation = asyncio.create_task(_observe_editor_duty(data))
                                 inflight.add(duty_observation)
                                 duty_observation.add_done_callback(lambda t: inflight.discard(t))

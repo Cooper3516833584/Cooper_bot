@@ -1,0 +1,12 @@
+{
+  "enabled": false,
+  "group_id": 0,
+  "publisher_id": 0,
+  "odd_week_monday": "2026-10-12",
+  "excluded_editor_ids": [],
+  "qzone_unavailable_policy": "group_only",
+  "_help": [
+    "填写自己的 group_id 和 publisher_id 后再启用。",
+    "目标账号变更需要重启；其余设置沿用原有重读行为。"
+  ]
+}

@@ -41,7 +41,7 @@ def _service(tmp_path, ai=None) -> DailyCalendarService:
         json.dumps(
             {
                 "groups": {
-                    "1087250737": {
+                    "30303": {
                         "enabled": True,
                         "web_timeout_seconds": 20,
                     }
@@ -107,7 +107,7 @@ async def test_generate_accepts_official_web_event_and_uses_deepseek_fallback_te
     )
     service = _service(tmp_path, ai)
 
-    result = await service.generate_for_date(date(2026, 6, 26), cfg=service.get_group_config(1087250737), force_refresh=True)
+    result = await service.generate_for_date(date(2026, 6, 26), cfg=service.get_group_config(30303), force_refresh=True)
 
     assert result.special is True
     assert "国家级纪念日示例" in result.message
@@ -139,7 +139,7 @@ async def test_generate_rejects_untrusted_official_web_event(tmp_path) -> None:
     )
     service = _service(tmp_path, ai)
 
-    result = await service.generate_for_date(date(2026, 6, 26), cfg=service.get_group_config(1087250737), force_refresh=True)
+    result = await service.generate_for_date(date(2026, 6, 26), cfg=service.get_group_config(30303), force_refresh=True)
 
     assert result.special is False
     assert result.events == []
@@ -299,7 +299,7 @@ async def test_generate_july_first_deduplicates_web_aliases_and_keeps_hong_kong(
     )
     service = _service(tmp_path, ai)
 
-    result = await service.generate_for_date(date(2026, 7, 1), cfg=service.get_group_config(1087250737), force_refresh=True)
+    result = await service.generate_for_date(date(2026, 7, 1), cfg=service.get_group_config(30303), force_refresh=True)
 
     names = [str(event.get("name") or "") for event in result.events]
     assert len([name for name in names if "建党" in name or "中国共产党" in name]) == 1
@@ -480,9 +480,11 @@ async def test_calendartest_returns_exact_non_special_text(monkeypatch) -> None:
             return_value=CalendarResult(target_date, {}, [], "", False, False)
         ),
     )
-    ctx = SimpleNamespace(level=3, scene="group", group_id=1087250737, user_id=1, nickname="tester", card="tester")
+    ctx = SimpleNamespace(level=3, scene="group", group_id=30303, user_id=1, nickname="tester", card="tester")
     logsvc = SimpleNamespace(log=SimpleNamespace(warning=lambda _msg: None))
     monkeypatch.setattr(commands, "reply", _reply)
+
+    monkeypatch.setattr(commands, "CALENDAR_TEST_GROUP_ID", 30303)
 
     await commands._handle_explicit_command(
         SimpleNamespace(),
@@ -498,6 +500,7 @@ async def test_calendartest_returns_exact_non_special_text(monkeypatch) -> None:
     )
 
     assert replies == ["非特殊日期"]
+    fake_service.get_group_config.assert_called_once_with(30303)
     fake_service.generate_for_date.assert_awaited_once_with(
         target_date,
         cfg={},
@@ -509,7 +512,7 @@ async def test_calendartest_returns_exact_non_special_text(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_calendartest_requires_admin(monkeypatch) -> None:
     reply = AsyncMock()
-    ctx = SimpleNamespace(level=2, scene="group", group_id=1087250737, user_id=1, nickname="tester", card="tester")
+    ctx = SimpleNamespace(level=2, scene="group", group_id=30303, user_id=1, nickname="tester", card="tester")
     monkeypatch.setattr(commands, "reply", reply)
 
     await commands._handle_explicit_command(

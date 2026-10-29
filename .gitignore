@@ -6,6 +6,17 @@ api_key.txt
 # runtime folders (不上传这些目录)
 __pycache__/
 config/private/
+config/ai/
+config/calendar/
+config/replies/
+config/wiki/
+runtime/
+docs/wiki/1037wiki_inventory_2026-07-01/
+docs/wiki/textbook_material_reorg_2026-07-01/
+docs/wiki/1037wiki_inventory_latest.md
+docs/wiki/1037wiki_upload_plan.md
+docs/wiki/1037wiki_upload_summary.md
+docs/git_log.txt
 runtime/databases/
 runtime/state/
 runtime/workspaces/

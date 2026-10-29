@@ -4,7 +4,7 @@
 
 | 项目 | 结果 |
 | --- | --- |
-| 可执行文件 | `C:\Users\Cooper\.kimi-code\bin\kimi.exe`（原生 `.exe`，非 `.cmd` 包装器） |
+| 可执行文件 | `%USERPROFILE%\.kimi-code\bin\kimi.exe`（原生 `.exe`，非 `.cmd` 包装器） |
 | 版本 | `0.34.0` |
 | SHA-256 | `36BD5659FB5D310EDC06AC6196DAC6E7F7528BFDF04D41F3BED9B29CAAF4D206` |
 | 配置诊断 | `kimi doctor` 通过 `config.toml` 与 `tui.toml` 校验。 |

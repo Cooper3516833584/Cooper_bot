@@ -1,0 +1,1017 @@
+[
+  {
+    "id": "69957144e01ad802e5336f5c",
+    "name": "信号与线性系统",
+    "parent": "课程",
+    "aliases": [
+      "信号"
+    ]
+  },
+  {
+    "id": "69d3b37dd40f2133774f9b9c",
+    "name": "大数据算法综合实践",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d3b151d40f2133774f9b98",
+    "name": "大数据处理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d3aed4d40f2133774f9b8f",
+    "name": "博弈论",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d3a0cfd40f2133774f9b79",
+    "name": "微积分 (B)",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69c8dc5118bb3af86d7b7d1f",
+    "name": "马克思主义基本原理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69a4f79a5c98dfb12b88c2b2",
+    "name": "编译原理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "699572fee01ad802e5336fae",
+    "name": "军事理论",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "699572bee01ad802e5336fa7",
+    "name": "信息论",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "6995729ae01ad802e5336f9c",
+    "name": "信息安全数学基础",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "6995551493657d3dba13bbcf",
+    "name": "C++程序设计",
+    "parent": "课程",
+    "aliases": [
+      "C++",
+      "CPP"
+    ]
+  },
+  {
+    "id": "6995710ee01ad802e5336f5a",
+    "name": "传播心理学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "699570c1e01ad802e5336f3c",
+    "name": "传播学研究方法",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69957096e01ad802e5336f37",
+    "name": "企业战略管理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69957025e01ad802e5336f34",
+    "name": "乡镇规划原理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69956dade01ad802e5336f1d",
+    "name": "习近平新时代社会主义思想概论",
+    "parent": "课程",
+    "aliases": [
+      "习概"
+    ]
+  },
+  {
+    "id": "69956d40e01ad802e5336f18",
+    "name": "中国语文",
+    "parent": "课程",
+    "aliases": [
+      "语文"
+    ]
+  },
+  {
+    "id": "69956ae3e01ad802e5336f12",
+    "name": "Verilog设计",
+    "parent": "课程",
+    "aliases": [
+      "Verilog"
+    ]
+  },
+  {
+    "id": "69956908e01ad802e5336f03",
+    "name": "Java程序设计",
+    "parent": "课程",
+    "aliases": [
+      "Java"
+    ]
+  },
+  {
+    "id": "6995650d93657d3dba13bc6c",
+    "name": "C程序设计",
+    "parent": "课程",
+    "aliases": [
+      "C"
+    ]
+  },
+  {
+    "id": "69d4df260ade361580f16ad1",
+    "name": "电路理论",
+    "parent": "课程",
+    "aliases": [
+      "电路"
+    ]
+  },
+  {
+    "id": "69d4ea076bad0622e6cc99c8",
+    "name": "机器学习",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4e9976bad0622e6cc99c3",
+    "name": "汇编语言程序设计",
+    "parent": "课程",
+    "aliases": [
+      "汇编"
+    ]
+  },
+  {
+    "id": "69d4e84f6bad0622e6cc99bd",
+    "name": "化学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4e7ade97c3e20fbc59bc0",
+    "name": "宏观经济学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4e733e97c3e20fbc59baf",
+    "name": "函数式编程原理",
+    "parent": "课程",
+    "aliases": [
+      "函数式"
+    ]
+  },
+  {
+    "id": "69d4e673e97c3e20fbc59bab",
+    "name": "国土空间总体规划原理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4e60fe97c3e20fbc59ba5",
+    "name": "管理信息系统",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4e2c4e97c3e20fbc59b69",
+    "name": "概率论与数理统计",
+    "parent": "课程",
+    "aliases": [
+      "概率论"
+    ]
+  },
+  {
+    "id": "69d4e177e97c3e20fbc59b57",
+    "name": "复变函数与积分变换",
+    "parent": "课程",
+    "aliases": [
+      "复变"
+    ]
+  },
+  {
+    "id": "69d3b3e7d40f2133774f9ba4",
+    "name": "大数据系统综合实践",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4d6448dcd7ed69ef303fd",
+    "name": "财务管理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4cd0769b93dbcf66e977e",
+    "name": "财务报表",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4c72069a8e39588242407",
+    "name": "材料力学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d3bf98e847b61cbf71c4ec",
+    "name": "数据库系统原理",
+    "parent": "课程",
+    "aliases": [
+      "数据库"
+    ]
+  },
+  {
+    "id": "69d3bd23e847b61cbf71c4b0",
+    "name": "逻辑与计算机设计",
+    "parent": "课程",
+    "aliases": [
+      "逻辑"
+    ]
+  },
+  {
+    "id": "69d3bb0ae847b61cbf71c4a0",
+    "name": "计算机系统结构",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d3b8c5d40f2133774f9bc3",
+    "name": "计算机系统基础",
+    "parent": "课程",
+    "aliases": [
+      "计基"
+    ]
+  },
+  {
+    "id": "69d3b7a3d40f2133774f9bb1",
+    "name": "计算机图形学",
+    "parent": "课程",
+    "aliases": [
+      "图形学"
+    ]
+  },
+  {
+    "id": "69d3b44cd40f2133774f9ba9",
+    "name": "大数据分析",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4f5356bad0622e6cc9a4f",
+    "name": "计算机与程序设计基础",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d5b5d26bad0622e6cc9ac8",
+    "name": "程序设计",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d51e6b6bad0622e6cc9abc",
+    "name": "城乡生态与环境规划",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d51cd66bad0622e6cc9ab3",
+    "name": "城市绿地规划",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d51a016bad0622e6cc9aa0",
+    "name": "哲学导论",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4fa5c6bad0622e6cc9a9c",
+    "name": "城市地理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4f6b16bad0622e6cc9a85",
+    "name": "建筑设计",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4f6786bad0622e6cc9a82",
+    "name": "操作系统设计原理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4f6356bad0622e6cc9a74",
+    "name": "计算思维",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4f5df6bad0622e6cc9a59",
+    "name": "计算机组成原理",
+    "parent": "课程",
+    "aliases": [
+      "计组",
+      "组原"
+    ]
+  },
+  {
+    "id": "69d4eac16bad0622e6cc99cc",
+    "name": "计算机视觉",
+    "parent": "课程",
+    "aliases": [
+      "CV"
+    ]
+  },
+  {
+    "id": "69d4f4ef6bad0622e6cc9a48",
+    "name": "数据库",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4f3976bad0622e6cc9a3c",
+    "name": "数字图像处理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4f2fc6bad0622e6cc9a2a",
+    "name": "数字逻辑电路",
+    "parent": "课程",
+    "aliases": [
+      "数电"
+    ]
+  },
+  {
+    "id": "69d4f23d6bad0622e6cc9a26",
+    "name": "数值分析",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4f1d86bad0622e6cc9a21",
+    "name": "数据可视化技术",
+    "parent": "课程",
+    "aliases": [
+      "可视化"
+    ]
+  },
+  {
+    "id": "69d4f10d6bad0622e6cc9a0a",
+    "name": "数据结构",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69d4ecb0dc56c620300928e1",
+    "name": "道路交通",
+    "parent": "课程",
+    "aliases": null
+  },
+  {
+    "id": "69d4eb756bad0622e6cc99e7",
+    "name": "计算机网络与通信",
+    "parent": "课程",
+    "aliases": [
+      "计网"
+    ]
+  },
+  {
+    "id": "69d4eb046bad0622e6cc99da",
+    "name": "计算机网络",
+    "parent": "课程",
+    "aliases": [
+      "计网"
+    ]
+  },
+  {
+    "id": "69e35dff620074080627cfa9",
+    "name": "无机化学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e37be360eea1e5305c5d93",
+    "name": "薪酬管理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e37b0560eea1e5305c5d8f",
+    "name": "硬件综合课程设计",
+    "parent": "课程",
+    "aliases": [
+      "硬件课设"
+    ]
+  },
+  {
+    "id": "69e3759660eea1e5305c5d61",
+    "name": "算法设计与分析",
+    "parent": "课程",
+    "aliases": [
+      "算法设计",
+      "ALG",
+      "alg"
+    ]
+  },
+  {
+    "id": "69e3726360eea1e5305c5d38",
+    "name": "思想政治",
+    "parent": "课程",
+    "aliases": [
+      "思政"
+    ]
+  },
+  {
+    "id": "69e3713b60eea1e5305c5d32",
+    "name": "软件学院软件工程资料",
+    "parent": "课程",
+    "aliases": [
+      "软工"
+    ]
+  },
+  {
+    "id": "69e36f8460eea1e5305c5d2e",
+    "name": "嵌入式系统",
+    "parent": "课程",
+    "aliases": [
+      "嵌入式"
+    ]
+  },
+  {
+    "id": "69e36c06620074080627cfcb",
+    "name": "毛泽东思想和中国特色社会主义理论体系概论",
+    "parent": "课程",
+    "aliases": [
+      "毛概"
+    ]
+  },
+  {
+    "id": "69e35fc4620074080627cfb3",
+    "name": "中国近现代史纲要",
+    "parent": "课程",
+    "aliases": [
+      "近代史",
+      "史纲"
+    ]
+  },
+  {
+    "id": "69e35e9d620074080627cfaf",
+    "name": "生物化学",
+    "parent": "课程",
+    "aliases": [
+      "生化"
+    ]
+  },
+  {
+    "id": "69da32c2bdc30a449663e97d",
+    "name": "大学物理",
+    "parent": "课程",
+    "aliases": [
+      "大物"
+    ]
+  },
+  {
+    "id": "69e35de2620074080627cfa7",
+    "name": "有机化学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e350cab3aaeba504a42e8c",
+    "name": "一元分析学（计卓）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e34f92b3aaeba504a42e89",
+    "name": "一多元分析（高数）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e2599a4572e5b625cc1687",
+    "name": "微积分（二）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e257d94572e5b625cc164d",
+    "name": "微积分（一）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e256914572e5b625cc1620",
+    "name": "微积分（三）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69db67ac8829cfa84be38df9",
+    "name": "工程制图",
+    "parent": "课程",
+    "aliases": [
+      "工图"
+    ]
+  },
+  {
+    "id": "69db64df8829cfa84be38da2",
+    "name": "批判性思维",
+    "parent": "课程",
+    "aliases": [
+      "批思"
+    ]
+  },
+  {
+    "id": "69db60da8829cfa84be38d5a",
+    "name": "线性代数",
+    "parent": "课程",
+    "aliases": [
+      "线代"
+    ]
+  },
+  {
+    "id": "69e5a73c582c0b5e569f69e3",
+    "name": "视听传播概论",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee1bd8aea294ac499adb8b",
+    "name": "普通化学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee1b13aea294ac499adb59",
+    "name": "数据结构与算法设计（未来）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee1398fa0300b9d50d0a5c",
+    "name": "工程材料学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e5ef200971532697c9a315",
+    "name": "量子力学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e5ede30971532697c9a311",
+    "name": "理论力学",
+    "parent": "课程",
+    "aliases": [
+      "理力"
+    ]
+  },
+  {
+    "id": "69e5eaac0971532697c9a310",
+    "name": "离散数学",
+    "parent": "课程",
+    "aliases": [
+      "离散"
+    ]
+  },
+  {
+    "id": "69e5c6d1e3b4fb01d056dcc9",
+    "name": "矩阵论",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e5ab43582c0b5e569f69f0",
+    "name": "新闻采访写作课件",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e5a7c4582c0b5e569f69e6",
+    "name": "外国新闻传播史",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e37f0360eea1e5305c5daa",
+    "name": "大学英语",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e5a679582c0b5e569f69e0",
+    "name": "品牌传播概论",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e5a588582c0b5e569f69de",
+    "name": "运作管理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e447257259460bd01c6f4a",
+    "name": "区域规划",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e39b627259460bd01c6f39",
+    "name": "商业数据分析与挖掘",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e39a1e7259460bd01c6f2b",
+    "name": "税制与税务",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e3975b7259460bd01c6f1c",
+    "name": "社会网络与计算",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e38b447259460bd01c6ef0",
+    "name": "运筹学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e388b0118797682c02279b",
+    "name": "微观经济学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69e387ed86664e46ad8d0ab5",
+    "name": "自然语言处理",
+    "parent": "课程",
+    "aliases": [
+      "NLP",
+      "nlp"
+    ]
+  },
+  {
+    "id": "69ef3f72804bd87c7e21c17b",
+    "name": "电机学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69f726dd278f98cd88588c20",
+    "name": "通用",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef7a0d804bd87c7e21c226",
+    "name": "固体物理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef78f9804bd87c7e21c21f",
+    "name": "高分子材料",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef780b804bd87c7e21c215",
+    "name": "先进金属材料",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef76ca804bd87c7e21c207",
+    "name": "能源材料",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef74d0804bd87c7e21c1f9",
+    "name": "工程化学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef6cd7804bd87c7e21c1ef",
+    "name": "物理实验",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef56d9804bd87c7e21c1c7",
+    "name": "热工基础",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef4219804bd87c7e21c17f",
+    "name": "电气工程基础",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee1cffaea294ac499adbac",
+    "name": "数学物理方程与特殊函数",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ef3c0a804bd87c7e21c177",
+    "name": "电力系统分析",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69eeea9c804bd87c7e21c114",
+    "name": "医科生理学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee5b80aea294ac499adc86",
+    "name": "智能制造装备与工艺（二）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee381eaea294ac499adc83",
+    "name": "医科细胞生物学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee2cefaea294ac499adc11",
+    "name": "人工智能导论（计科）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee2b04aea294ac499adc0c",
+    "name": "大学生心理健康",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee27a5aea294ac499adbf3",
+    "name": "数字信号处理",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee2733aea294ac499adbe9",
+    "name": "计算机通信与网络（计科）",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69ee250aaea294ac499adbdd",
+    "name": "多元分析学",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "6a0725cbabfe09661dcd8b7e",
+    "name": "大二课程学习攻略",
+    "parent": "课程",
+    "aliases": [
+      "模电数电实验",
+      "考试",
+      "简答题",
+      "示波器",
+      "电气版",
+      "电容",
+      "信号发生器",
+      "数字万用表"
+    ]
+  },
+  {
+    "id": "6a0728e6abfe09661dcd8db5",
+    "name": "课外书",
+    "parent": "课程",
+    "aliases": [
+      "置身事内",
+      "中国政府与经济发展",
+      "兰小欢",
+      "政府角色",
+      "经济发展"
+    ]
+  },
+  {
+    "id": "6a0728dfabfe09661dcd8dac",
+    "name": "计算机",
+    "parent": "课程",
+    "aliases": [
+      "逻辑代数",
+      "数字电路与逻辑设计",
+      "逻辑门电路",
+      "CMOS",
+      "TTL",
+      "MOS管",
+      "数字逻辑",
+      "数制转换"
+    ]
+  },
+  {
+    "id": "6a07288dabfe09661dcd8d5d",
+    "name": "电路实验",
+    "parent": "课程",
+    "aliases": [
+      "故障检查",
+      "线性有源一端口网络",
+      "电压表",
+      "电流表",
+      "二极管",
+      "电阻",
+      "短路"
+    ]
+  },
+  {
+    "id": "6a072750abfe09661dcd8c90",
+    "name": "电磁场",
+    "parent": "课程",
+    "aliases": [
+      "电磁场与电磁波",
+      "HFSS",
+      "波导仿真",
+      "华中科技大学",
+      "实验课",
+      "部分电容",
+      "预习报告"
+    ]
+  },
+  {
+    "id": "6a072739abfe09661dcd8c84",
+    "name": "电气工程实践基础第五讲（2025版） (2)",
+    "parent": "课程",
+    "aliases": [
+      "电气工程",
+      "实践基础",
+      "第五讲",
+      "2025版"
+    ]
+  },
+  {
+    "id": "6a072700abfe09661dcd8c60",
+    "name": "模电 数电实验",
+    "parent": "课程",
+    "aliases": [
+      "模电",
+      "数电实验",
+      "Arduino",
+      "月球车",
+      "小车设计",
+      "课程报告",
+      "答辩"
+    ]
+  },
+  {
+    "id": "6a072686abfe09661dcd8c2f",
+    "name": "模拟电子技术",
+    "parent": "课程",
+    "aliases": [
+      "PPT",
+      "宽版",
+      "CH04",
+      "功率放大器",
+      "PPT课件",
+      "toS",
+      "CH02"
+    ]
+  },
+  {
+    "id": "6a072600abfe09661dcd8bbb",
+    "name": "数理方程",
+    "parent": "课程",
+    "aliases": [
+      "习题课",
+      "分离变量法",
+      "行波法",
+      "积分变换法",
+      "习题",
+      "格林函数法",
+      "贝塞尔函数"
+    ]
+  },
+  {
+    "id": "69fb4c41d0537a25e4ceaa73",
+    "name": "仪器分析",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "6a0725c3abfe09661dcd8b72",
+    "name": "复变函数",
+    "parent": "课程",
+    "aliases": [
+      "串讲",
+      "张鑫灏",
+      "复变函数, 串讲, 李名剑, 大二上",
+      "李名剑",
+      "大二上",
+      "2024",
+      "答案合集"
+    ]
+  },
+  {
+    "id": "6a0725c2abfe09661dcd8b71",
+    "name": "国家安全教育  答案",
+    "parent": "课程",
+    "aliases": [
+      "国家安全教育 答案",
+      "国家安全教育",
+      "答案",
+      "选择题",
+      "填空题"
+    ]
+  },
+  {
+    "id": "6a0725b5abfe09661dcd8b64",
+    "name": "单片机",
+    "parent": "课程",
+    "aliases": [
+      "复习",
+      "MCS-51",
+      "内部结构",
+      "存储器",
+      "指令系统",
+      "进制转换",
+      "BCD码"
+    ]
+  },
+  {
+    "id": "6a0724d0abfe09661dcd8b30",
+    "name": "信号与系统",
+    "parent": "课程",
+    "aliases": [
+      "教案",
+      "电子教案",
+      "西安电子科技大学",
+      "时域分析",
+      "离散系统",
+      "差分方程",
+      "傅里叶变换"
+    ]
+  },
+  {
+    "id": "6a07241fabfe09661dcd8b15",
+    "name": "马原",
+    "parent": "课程",
+    "aliases": [
+      "论述题",
+      "材料分析题",
+      "辩证否定观",
+      "人民群众",
+      "联系与发展",
+      "价值",
+      "经济基础与上层建筑"
+    ]
+  },
+  {
+    "id": "6a00068dabfe09661dcd8a7d",
+    "name": "模电实验",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69fc99e7d0537a25e4ceaadd",
+    "name": "电路测试技术基础",
+    "parent": "课程",
+    "aliases": []
+  },
+  {
+    "id": "69fc861bd0537a25e4ceaac4",
+    "name": "云计算",
+    "parent": "课程",
+    "aliases": []
+  }
+]

@@ -1,0 +1,6 @@
+https://api.example.invalid/v1
+REPLACE_WITH_CHAT_KEY
+https://embedding.example.invalid/v1
+REPLACE_WITH_EMBEDDING_KEY
+https://vision.example.invalid/v1
+REPLACE_WITH_VISION_KEY

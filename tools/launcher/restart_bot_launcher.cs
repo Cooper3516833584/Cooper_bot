@@ -6,13 +6,33 @@ using System.Threading;
 
 internal static class RestartBotLauncher
 {
-    private const string RepoDir = @"C:\Users\Cooper\Desktop\Cooper_bot";
+    private static readonly string RepoDir = Environment.GetEnvironmentVariable("COOPER_BOT_ROOT")
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Cooper_bot");
     private const string ClientFile = "client.py";
-    private const string PreferredPython = @"C:\Users\Cooper\AppData\Local\Programs\Python\Python313\python.exe";
-    private const string PreferredPyLauncher = @"C:\Users\Cooper\AppData\Local\Programs\Python\Launcher\py.exe";
+    private static readonly string PreferredPython = LauncherSetting("LAUNCHER_PYTHON_PATH",
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\Python\Python313\python.exe"));
+    private static readonly string PreferredPyLauncher = LauncherSetting("LAUNCHER_PY_PATH",
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\Python\Launcher\py.exe"));
 
     private static readonly string LockPath = Path.Combine(RepoDir, "runtime", "state", "client", "client.lock");
     private static readonly string LogPath = Path.Combine(RepoDir, "runtime", "logs", "restart_bot_launcher.log");
+
+    private static string LauncherSetting(string key, string fallback)
+    {
+        string value = Environment.GetEnvironmentVariable(key);
+        if (!String.IsNullOrWhiteSpace(value)) return value;
+        string path = Path.Combine(RepoDir, "config", "private", "settings.env");
+        if (!File.Exists(path)) return fallback;
+        foreach (string raw in File.ReadAllLines(path, System.Text.Encoding.UTF8))
+        {
+            string line = raw.Trim();
+            int split = line.IndexOf('=');
+            if (line.StartsWith("#") || split < 0 || line.Substring(0, split).Trim() != key) continue;
+            value = line.Substring(split + 1).Trim().Trim('"', '\'');
+            if (!String.IsNullOrWhiteSpace(value)) return value;
+        }
+        return fallback;
+    }
 
     [STAThread]
     private static int Main(string[] args)

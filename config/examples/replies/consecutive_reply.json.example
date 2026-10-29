@@ -1,0 +1,4 @@
+{
+  "_comment": "groups 用自己的群号作为键；规则为触发文本 -> min_count/reply_image，图片位于 storage/auto_replies/images。",
+  "groups": {}
+}

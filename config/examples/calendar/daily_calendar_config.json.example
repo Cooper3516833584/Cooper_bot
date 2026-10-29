@@ -1,0 +1,7 @@
+{
+  "_help": [
+    "groups 用自己的群号作为键。",
+    "每群可设置 enabled、send_time、send_when_empty、send_catch_up_until、web_timeout_seconds、dry_run。"
+  ],
+  "groups": {}
+}

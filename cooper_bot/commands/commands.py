@@ -59,6 +59,7 @@ from cooper_bot.core.config import (
     AUTO_REPLY_IMAGES_CONTAINER_DIR,
     TEMP_DIR,
     AI_MEMORY_BOT_ID,
+    CALENDAR_TEST_GROUP_ID,
 )
 if TYPE_CHECKING:
     from cooper_bot.modules.ai.aisvc import AIService
@@ -4351,7 +4352,7 @@ async def _handle_explicit_command(
             await reply(api, ctx, "日历服务暂不可用。", logsvc)
             return
         try:
-            calendar_cfg = calendar_service.get_group_config(1087250737)
+            calendar_cfg = calendar_service.get_group_config(CALENDAR_TEST_GROUP_ID)
             result = await calendar_service.generate_for_date(
                 target_date,
                 cfg=calendar_cfg,

@@ -58,7 +58,7 @@ async def test_aichat_commits_only_delivered_replies_and_preserves_quote_identit
     _patch_settings_validation(monkeypatch)
     monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_args: False)
     monkeypatch.setattr(commands, "_claim_recent_reply", lambda _key: True)
-    ctx = SimpleNamespace(scene="group", group_id=30303, user_id=3516833584, nickname="Cooper", card="Cooper", level=1, _ai_chat_context_aisvc=svc)
+    ctx = SimpleNamespace(scene="group", group_id=30303, user_id=61013, nickname="Cooper", card="Cooper", level=1, _ai_chat_context_aisvc=svc)
     logsvc = SimpleNamespace(log=SimpleNamespace(info=lambda _text: None, warning=lambda _text: None), log_out=lambda *_args: None)
     api = SimpleNamespace(send_group_msg=AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 123}}))
     commands._remember_non_ai_chat_message(ctx, "查一下通知", logsvc, svc, msg_id="122")
@@ -66,12 +66,12 @@ async def test_aichat_commits_only_delivered_replies_and_preserves_quote_identit
     bot_message = svc.find_chat_message_by_msg_id("group:30303", "123")
     assert bot_message["role"] == "assistant"
     api.send_group_msg.return_value = {"status": "ok", "retcode": 0, "data": {"message_id": 125}} if confirmed else None
-    evt = {"self_id": 1622236011, "message": [{"type": "reply", "data": {"id": "123"}}]}
+    evt = {"self_id": 61007, "message": [{"type": "reply", "data": {"id": "123"}}]}
     assert await commands._handle_ai_chat_trigger(api, ctx, evt, "这是谁说的", logsvc, svc, forced_ai_input="这是谁说的", message_id="124")
     payload = json.loads(svc._kimi_runner.requests[0].prompt)
     assert payload["current_speaker"]["nickname"] == "Cooper"
     assert payload["reply_to_message_id"] == "123"
-    assert payload["conversation_history"][0]["speaker"]["user_id"] == 3516833584
+    assert payload["conversation_history"][0]["speaker"]["user_id"] == 61013
     assert payload["conversation_history"][1]["speaker"] == {"name": "Cooper_bot", "is_bot": True}
     history = svc._load_active_chat_history("group:30303")
     assert len(history) == (4 if confirmed else 2)

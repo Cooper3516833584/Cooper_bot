@@ -170,7 +170,7 @@ def _new_aisvc() -> AIService:
 def _image_evt(*, group: bool = True, mention: bool = False, text_part: str = "", message_id: str = "100"):
     segs: list[dict] = []
     if mention:
-        segs.append({"type": "at", "data": {"qq": "1622236011"}})
+        segs.append({"type": "at", "data": {"qq": "61007"}})
     segs.append({"type": "image", "data": {"file": "f1", "url": "https://a/1.png"}})
     if text_part:
         segs.append({"type": "text", "data": {"text": text_part}})
@@ -178,7 +178,7 @@ def _image_evt(*, group: bool = True, mention: bool = False, text_part: str = ""
         "post_type": "message",
         "message_type": "group" if group else "private",
         "sub_type": "friend",
-        "self_id": "1622236011",
+        "self_id": "61007",
         "message_id": message_id,
         "message": segs,
         "raw_message": "",
@@ -548,7 +548,7 @@ async def test_dispatch_reply_in_history_uses_existing_vision(dispatch_harness) 
         "post_type": "message",
         "message_type": "private",
         "sub_type": "friend",
-        "self_id": "1622236011",
+        "self_id": "61007",
         "message_id": "200",
         "message": [{"type": "reply", "data": {"id": "111"}}, {"type": "text", "data": {"text": "这张图什么意思"}}],
         "raw_message": "",
@@ -591,7 +591,7 @@ async def test_dispatch_reply_outside_history_uses_get_msg(dispatch_harness) -> 
         "post_type": "message",
         "message_type": "private",
         "sub_type": "friend",
-        "self_id": "1622236011",
+        "self_id": "61007",
         "message_id": "300",
         "message": [{"type": "reply", "data": {"id": "999"}}, {"type": "text", "data": {"text": "看看"}}],
         "raw_message": "",
@@ -626,7 +626,7 @@ async def test_dispatch_slash_fallback_keeps_vision(dispatch_harness) -> None:
         "post_type": "message",
         "message_type": "private",
         "sub_type": "friend",
-        "self_id": "1622236011",
+        "self_id": "61007",
         "message_id": "400",
         "message": [
             {"type": "image", "data": {"url": "https://a/1.png"}},
@@ -699,7 +699,7 @@ async def test_capture_false_slash_fallback_keeps_current_image(dispatch_harness
         "post_type": "message",
         "message_type": "private",
         "sub_type": "friend",
-        "self_id": "1622236011",
+        "self_id": "61007",
         "message_id": "500",
         "message": [
             {"type": "image", "data": {"url": "https://a/1.png"}},

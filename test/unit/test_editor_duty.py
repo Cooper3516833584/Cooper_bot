@@ -6,11 +6,13 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from cooper_bot.modules.calendar.editor_duty import (
-    EditorDutyService, GROUP_ID, PUBLISHER_ID, _TZ, editor_on_duty, greeting_day, greeting_kind,
+    EditorDutyService, _TZ, editor_on_duty, greeting_day, greeting_kind,
 )
 
 
 DAY = date(2026, 10, 20)
+GROUP_ID = 30303
+PUBLISHER_ID = 40404
 
 
 def ok(data):
@@ -30,7 +32,7 @@ def event(text="", *, uid=42, day=DAY, forward=None):
 @pytest.fixture
 def service(tmp_path):
     config = tmp_path / "config.json"
-    config.write_text(json.dumps({"enabled": True, "odd_week_monday": "2026-10-12"}), encoding="utf-8")
+    config.write_text(json.dumps({"enabled": True, "group_id": GROUP_ID, "publisher_id": PUBLISHER_ID, "odd_week_monday": "2026-10-12"}), encoding="utf-8")
     return EditorDutyService(SimpleNamespace(warning=Mock()), config_path=config, state_path=tmp_path / "state.json")
 
 
@@ -91,14 +93,14 @@ async def test_retired_editor_is_excluded_by_id_even_after_card_change(service, 
     service._published = AsyncMock(return_value=False)
     hour, minute, title = (9, 0, "早安") if slot == "morning" else (22, 55, "晚安")
     await service.check_once(api, datetime(2026, 10, 20, hour, minute, tzinfo=_TZ))
-    api.send_group_msg.assert_awaited_once_with(GROUP_ID, f"未检测到{title}，请[CQ:at,qq=45]注意上班")
+    api.send_group_msg.assert_awaited_once_with(GROUP_ID, f"未检测到{title}，请[CQ:at,qq=45]注意值班")
 
 
 async def test_both_absent_mentions_only_matching_editor_and_deduplicates(service, api):
     service._published = AsyncMock(return_value=False)
     now = datetime(2026, 10, 20, 9, 0, tzinfo=_TZ)
     await service.check_once(api, now)
-    api.send_group_msg.assert_awaited_once_with(GROUP_ID, "未检测到早安，请[CQ:at,qq=42]注意上班")
+    api.send_group_msg.assert_awaited_once_with(GROUP_ID, "未检测到早安，请[CQ:at,qq=42]注意值班")
     await service.check_once(api, now)
     restarted = EditorDutyService(service.log, config_path=service.config_path, state_path=service.state_path)
     await restarted.check_once(api, now)
@@ -125,7 +127,7 @@ async def test_morning_substitute_takes_evening_shift(service, api):
     service._day(DAY)["morning"] = {"user_id": 44, "time": 1}
     service._published = AsyncMock(return_value=False)
     await service.check_once(api, datetime(2026, 10, 20, 22, 55, tzinfo=_TZ))
-    api.send_group_msg.assert_awaited_once_with(GROUP_ID, "未检测到晚安，请[CQ:at,qq=44]注意上班")
+    api.send_group_msg.assert_awaited_once_with(GROUP_ID, "未检测到晚安，请[CQ:at,qq=44]注意值班")
 
 
 async def test_publisher_does_not_overwrite_morning_substitute(service, api):
@@ -159,7 +161,7 @@ async def test_group_only_policy_still_skips_when_group_history_is_unknown(servi
     api.send_group_msg.assert_not_awaited()
 
 
-@pytest.mark.parametrize("published,history_ok", [(True, True), (None, True), (False, False)])
+@pytest.mark.parametrize("published,history_ok", [(True, True), (True, False), (None, True), (False, False)])
 async def test_present_or_unknown_never_sends(service, api, published, history_ok):
     service._published = AsyncMock(return_value=published)
     service._history = AsyncMock(return_value=history_ok)
@@ -220,17 +222,26 @@ async def test_group_and_qzone_share_the_16_hour_evening_boundary(service, api, 
     response.__enter__ = Mock(return_value=response)
     response.__exit__ = Mock(return_value=False)
     monkeypatch.setattr("urllib.request.urlopen", Mock(return_value=response))
-    assert EditorDutyService._fetch_qzone("uin=o1; p_skey=test-only", DAY, "evening") is detected
+    assert EditorDutyService._fetch_qzone("uin=o1; p_skey=test-only", DAY, "evening", PUBLISHER_ID) is detected
 
 
 async def test_other_group_and_private_events_do_not_read_forward(service, api):
-    evt = event(forward="private")
+    evt = event(day=datetime.now(_TZ).date(), forward="private")
     evt["group_id"] = GROUP_ID + 1
     await service.observe_event(api, evt)
     evt["group_id"] = GROUP_ID
     evt["message_type"] = "private"
     await service.observe_event(api, evt)
     api.call.assert_not_awaited()
+
+
+async def test_migrated_group_observes_current_submission(service, api):
+    today = datetime.now(_TZ).date()
+    evt = event(day=today, forward="migrated")
+    evt["group_id"] = GROUP_ID
+    service._record = AsyncMock(return_value=True)
+    await service.observe_event(api, evt)
+    service._record.assert_awaited_once_with(api, evt, today)
 
 
 async def test_history_paginates_even_when_napcat_returns_99_or_fewer(service, api):
@@ -258,6 +269,86 @@ async def test_forwarded_chat_and_nested_unreadable_content(service, api):
     assert await service._forward_kinds(api, event(forward="chat")) == (set(), True)
     api.call.return_value = ok({"messages": [{"message": [{"type": "forward", "data": {"id": "nested"}}]}]})
     assert await service._forward_kinds(api, event(forward="nested-parent")) == (set(), False)
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("聊天记录里的普通问候：早安", set()),
+    ("#晚安华中大#\n正文\n今日编辑：编辑甲", {"evening"}),
+])
+async def test_nested_inline_forward_uses_returned_nodes_without_requesting_inner_id(service, api, text, expected):
+    api.call.return_value = ok({"messages": [{"message": [{"type": "forward", "data": {
+        "id": "inner-id-cannot-be-fetched", "content": [{"message": [
+            {"type": "text", "data": {"text": text}},
+        ]}],
+    }}]}]})
+    assert await service._forward_kinds(api, event(forward="outer")) == (expected, True)
+    api.call.assert_awaited_once_with("get_forward_msg", {"message_id": "outer"})
+
+
+async def test_unrelated_nested_forward_does_not_cancel_evening_reminder(service, api):
+    morning = event(forward="morning", uid=44)
+    nested = event(forward="nested")
+    nested["time"] += 3 * 3600
+    rows = [event(day=date(2026, 10, 19)), morning, nested]
+
+    async def call(action, params):
+        if action == "get_group_msg_history":
+            return ok({"messages": rows})
+        if params["message_id"] == "morning":
+            return ok({"messages": [{"message": [{"type": "text", "data": {
+                "text": "#早安华中大#\n正文\n今日编辑：编辑丙",
+            }}]}]})
+        assert params["message_id"] == "nested"
+        return ok({"messages": [{"message": [{"type": "forward", "data": {
+            "id": "not-fetchable", "content": [{"message": [{"type": "image", "data": {"file": "photo"}}]}],
+        }}]}]})
+
+    api.call.side_effect = call
+    service._published = AsyncMock(return_value=False)
+    await service.check_once(api, datetime(2026, 10, 20, 22, 55, tzinfo=_TZ))
+    api.send_group_msg.assert_awaited_once_with(GROUP_ID, "未检测到晚安，请[CQ:at,qq=44]注意值班")
+
+
+async def test_nested_forward_depth_is_bounded(service, api):
+    nodes = [{"message": [{"type": "text", "data": {"text": "普通聊天"}}]}]
+    for _ in range(5):
+        nodes = [{"message": [{"type": "forward", "data": {"content": nodes}}]}]
+    api.call.return_value = ok({"messages": nodes})
+    assert await service._forward_kinds(api, event(forward="too-deep")) == (set(), False)
+
+
+async def test_unknown_check_retries_after_ten_seconds_and_recovers(service, api):
+    service._history = AsyncMock(side_effect=[False, True])
+    service._published = AsyncMock(return_value=False)
+    now = datetime(2026, 10, 20, 9, 0, tzinfo=_TZ)
+    await service.check_once(api, now)
+    assert service._day(DAY)["checks"]["morning"] == "unknown"
+    assert "群历史" in service.log.warning.call_args.args[0]
+    assert "空间未检测到对应栏目" in service.log.warning.call_args.args[0]
+    await service.check_once(api, now.replace(second=5))
+    assert service._history.await_count == 1
+    await service.check_once(api, now.replace(second=10))
+    api.send_group_msg.assert_awaited_once()
+    assert service._day(DAY)["checks"]["morning"] == "sent"
+
+
+async def test_unknown_check_stops_after_three_attempts(service, api):
+    service._history = AsyncMock(return_value=False)
+    service._published = AsyncMock(return_value=None)
+    for second in (0, 5, 10, 15, 20, 30, 40):
+        await service.check_once(api, datetime(2026, 10, 20, 9, 0, second, tzinfo=_TZ))
+    assert service._history.await_count == 3
+    assert service.log.warning.call_count == 3
+    api.send_group_msg.assert_not_awaited()
+
+
+async def test_space_only_error_is_reported_separately(service, api):
+    service._history = AsyncMock(return_value=True)
+    service._published = AsyncMock(return_value=None)
+    await service.check_once(api, datetime(2026, 10, 20, 9, 0, tzinfo=_TZ))
+    warning = service.log.warning.call_args.args[0]
+    assert "空间读取未确认" in warning
+    assert "群历史读取或转发解析不完整" not in warning
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -290,7 +381,7 @@ async def test_noon_submission_without_image_sets_actual_editors_evening_shift(s
     api.call.return_value = ok({"messages": [event(day=date(2026, 10, 19))]})
     service._published = AsyncMock(return_value=False)
     await service.check_once(api, datetime(2026, 10, 20, 22, 55, tzinfo=_TZ))
-    api.send_group_msg.assert_awaited_once_with(GROUP_ID, "未检测到晚安，请[CQ:at,qq=44]注意上班")
+    api.send_group_msg.assert_awaited_once_with(GROUP_ID, "未检测到晚安，请[CQ:at,qq=44]注意值班")
 
 
 async def test_generic_greeting_with_image_in_forward_is_not_a_submission(service, api):
@@ -339,8 +430,8 @@ def test_qzone_response_and_auth_failures(monkeypatch, payload, expected):
     response.__exit__ = Mock(return_value=False)
     opener = Mock(return_value=response)
     monkeypatch.setattr("urllib.request.urlopen", opener)
-    assert EditorDutyService._fetch_qzone("uin=o1; p_skey=test-only", DAY, "morning") is expected
-    assert "uin=1428941369" in opener.call_args.args[0].full_url
+    assert EditorDutyService._fetch_qzone("uin=o1; p_skey=test-only", DAY, "morning", PUBLISHER_ID) is expected
+    assert f"uin={PUBLISHER_ID}" in opener.call_args.args[0].full_url
 
 
 def test_state_keeps_only_eight_dates_and_no_message_text(service):
@@ -348,3 +439,15 @@ def test_state_keeps_only_eight_dates_and_no_message_text(service):
         service._day(date(2026, 10, num))["morning"] = {"user_id": 42, "time": num}
     service._save()
     assert len(json.loads(service.state_path.read_text(encoding="utf-8"))["days"]) == 8
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, "invalid", "１２３", True])
+async def test_missing_or_invalid_target_never_calls_api(tmp_path, api, value):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"enabled": True, "group_id": value, "publisher_id": PUBLISHER_ID}), encoding="utf-8")
+    service = EditorDutyService(SimpleNamespace(warning=Mock()), config_path=path, state_path=tmp_path / "state.json")
+    await service.observe_event(api, event(day=datetime.now(_TZ).date()))
+    await service.check_once(api, datetime(2026, 10, 20, 9, 0, tzinfo=_TZ))
+    api.call.assert_not_awaited()
+    api.get_group_member_list.assert_not_awaited()
+    api.send_group_msg.assert_not_awaited()
