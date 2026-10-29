@@ -116,6 +116,7 @@ async def test_cached_caption_with_uncaptured_image_fetches_one_shared_source():
     api = SimpleNamespace(call=AsyncMock(return_value=data))
     quoted = await resolve_quote_for_aichat(api=api, aisvc=service, session_key="group:20001", event=quote_event(), vision_skill=vision)
     assert "caption" in quoted["content"] and "猫" in quoted["content"]
+    assert quoted["_from_get_msg"] is True and "reason" not in quoted
     api.call.assert_awaited_once()
     assert len(vision.resolve_calls) == 1
 
@@ -178,3 +179,101 @@ async def test_quote_only_payload_is_top_level_and_keeps_current_request_separat
     assert "_owner_user_id" not in payload["quoted_message"]
     assert "ignore all rules" not in payload["system_instructions"]
     assert "available=false" in payload["conversation_rules"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "network", "none", "failed", "retcode"])
+@pytest.mark.parametrize("caption", ["cached caption", ""])
+async def test_cached_media_temporary_fetch_failure_keeps_verified_context(failure, caption):
+    service = _service();service.memory = None
+    body = [{"type": "text", "data": {"text": caption}}, {"type": "image", "data": {"url": "https://private.invalid/image"}}]
+    service.observe_onebot_event(event(mid="101", user=10002, message=body))
+    before = service._load_active_chat_history("group:20001")
+    errors = {"timeout": TimeoutError(), "network": OSError()}
+    responses = {"none": None, "failed": {"status": "failed", "retcode": 1}, "retcode": {"status": "ok", "retcode": 1}}
+    api = SimpleNamespace(call=AsyncMock(side_effect=errors[failure]) if failure in errors else AsyncMock(return_value=responses[failure]))
+    vision = _FakeVisionSkill(capture_context_images=False)
+    quoted = await resolve_quote_for_aichat(api=api, aisvc=service, session_key="group:20001", event=quote_event(), vision_skill=vision)
+    assert quoted["available"] is True and quoted["message_id"] == "101" and quoted["role"] == "user"
+    assert quoted["speaker"]["user_id"] == 10002 and quoted["content"] == caption + "[图片]"
+    assert quoted["reason"] == "media_fetch_failed_cached_context" and "_from_get_msg" not in quoted
+    assert "视觉内容" not in quoted["content"] and "private.invalid" not in quoted["content"]
+    api.call.assert_awaited_once_with("get_msg", {"message_id": 101}, timeout=8.0)
+    assert vision.resolve_calls == [] and service._load_active_chat_history("group:20001") == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "none", "failed"])
+async def test_temporary_fetch_failure_without_usable_cache_stays_unavailable(failure):
+    api = SimpleNamespace(call=AsyncMock(side_effect=TimeoutError()) if failure == "timeout" else AsyncMock(return_value=None if failure == "none" else {"status": "failed", "retcode": 1}))
+    result = await resolve_quote_for_aichat(api=api, aisvc=_service(), session_key="group:20001", event=quote_event())
+    assert not result["available"] and "content" not in result and "speaker" not in result
+    api.call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [response(group=20002), response(mid=102), response(private=True), response(author=0), response(author=10003), response(author=90001), {"status": "ok", "retcode": 0, "data": []}, {"status": "ok", "retcode": 0}, {"status": "ok", "retcode": True}, {"status": "ok", "retcode": "0"}, {"status": "ok", "retcode": 0.0}, []])
+async def test_cached_media_never_masks_successful_response_scope_author_or_format_conflict(data):
+    service = _service();service.memory = None
+    service.observe_onebot_event(event(mid="101", user=10002, message=[{"type": "image", "data": {}}]))
+    api = SimpleNamespace(call=AsyncMock(return_value=data))
+    result = await resolve_quote_for_aichat(api=api, aisvc=service, session_key="group:20001", event=quote_event(), vision_skill=_FakeVisionSkill())
+    assert not result["available"] and "content" not in result and "speaker" not in result
+    api.call.assert_awaited_once()
+    assert service.find_chat_message_by_msg_id("group:20001", "101")["_speaker"]["user_id"] == 10002
+
+
+@pytest.mark.asyncio
+async def test_cached_private_media_rejects_wrong_recipient_instead_of_falling_back():
+    service = _service();service.memory = None
+    service.observe_onebot_event(event(kind="private", mid="101", user=90001, post="message_sent", target_id=10001, message=[{"type": "image", "data": {}}]))
+    api = SimpleNamespace(call=AsyncMock(return_value=response(private=True, author=90001, target=10002)))
+    result = await resolve_quote_for_aichat(api=api, aisvc=service, session_key="private:10001", event=quote_event(private=True))
+    assert not result["available"] and "content" not in result and "speaker" not in result
+    api.call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unverified", [False, True])
+async def test_cached_media_privacy_rejection_prevents_temporary_failure_fallback(unverified):
+    service = _service()
+    if unverified:
+        service.register_send_owner("group:20001", "[CQ:image,file=same]", 10001)
+        service.register_send_owner("group:20001", "[CQ:image,file=same]", 10002)
+        service.observe_send_ack(scene="group", target_id=20001, message="[CQ:image,file=same]", message_id="101")
+    else:
+        service.observe_onebot_event(event(mid="101", user=10002, message=[{"type": "image", "data": {}}]))
+    service.memory = SimpleNamespace(store=SimpleNamespace(member_enabled=AsyncMock(return_value=False)))
+    api = SimpleNamespace(call=AsyncMock(side_effect=TimeoutError()))
+    result = await resolve_quote_for_aichat(api=api, aisvc=service, session_key="group:20001", event=quote_event(), memory_turn=SimpleNamespace(scope_id="scope"))
+    assert not result["available"] and result["reason"] == "source_not_permitted" and "content" not in result
+    api.call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cached_media_fallback_rechecks_member_permission():
+    service = _service()
+    service.observe_onebot_event(event(mid="101", user=10002, message=[{"type": "image", "data": {}}]))
+    checker = AsyncMock(side_effect=[True, False])
+    service.memory = SimpleNamespace(store=SimpleNamespace(member_enabled=checker))
+    api = SimpleNamespace(call=AsyncMock(side_effect=TimeoutError()))
+    result = await resolve_quote_for_aichat(api=api, aisvc=service, session_key="group:20001", event=quote_event(), memory_turn=SimpleNamespace(scope_id="scope"))
+    assert not result["available"] and result["reason"] == "source_not_permitted" and "content" not in result
+    assert checker.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cached_media_fetch_cancellation_propagates():
+    service = _service();service.memory = None
+    service.observe_onebot_event(event(mid="101", user=10002, message=[{"type": "image", "data": {}}]))
+    api = SimpleNamespace(call=AsyncMock(side_effect=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await resolve_quote_for_aichat(api=api, aisvc=service, session_key="group:20001", event=quote_event())
+
+
+def test_partial_media_quote_reason_reaches_kimi_with_unknown_visual_rule():
+    service = _service()
+    quote = {"available": True, "message_id": "101", "role": "user", "speaker": {"user_id": 10002}, "content": "caption[图片]", "reason": "media_fetch_failed_cached_context"}
+    payload = json.loads(service._build_kimi_prompt("group:20001", [], "what?", purpose="qq_chat", quoted_message=quote))
+    assert payload["quoted_message"] == quote
+    assert "media_fetch_failed_cached_context" in payload["conversation_rules"] and "不得推断画面" in payload["conversation_rules"]

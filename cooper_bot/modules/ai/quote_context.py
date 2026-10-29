@@ -112,15 +112,28 @@ async def resolve_quote_for_aichat(*, api, aisvc, session_key, event, vision_ski
         call = getattr(api, "call", None)
         if numeric_id is None or not callable(call):
             return unavailable if not usable else await _quote_result(aisvc, item, reply_id, memory_turn, identity)
+
+        async def temporary_fetch_failure():
+            if not usable:
+                return unavailable
+            quote = await _quote_result(aisvc, item, reply_id, memory_turn, identity)
+            if quote.get("available"):
+                quote["reason"] = "media_fetch_failed_cached_context"
+            return quote
+
         try:
             response = await call("get_msg", {"message_id": numeric_id}, timeout=8.0)
         except Exception:
-            return unavailable
+            return await temporary_fetch_failure()
+        if response is None or (isinstance(response, dict) and (response.get("status") != "ok" or (type(response.get("retcode")) is int and response["retcode"] != 0))):
+            return await temporary_fetch_failure()
         if not isinstance(response, dict) or response.get("status") != "ok" or type(response.get("retcode")) is not int or response["retcode"] != 0 or not isinstance(response.get("data"), dict):
             return unavailable
         reference_event = _verified_event(response["data"], event, session_key, reply_id)
         normalized = normalize_onebot_event(reference_event) if reference_event else None
         if normalized is None or normalized[0] != session_key:
+            return dict(unavailable, reason="scope_or_author_unverified")
+        if usable and (item["role"] != normalized[1]["role"] or (item["role"] == "user" and positive_id(item["_speaker"].get("user_id")) != positive_id(normalized[1]["_speaker"].get("user_id")))):
             return dict(unavailable, reason="scope_or_author_unverified")
         item = normalized[1]
         item["_quote_fetched"] = True

@@ -73,3 +73,23 @@
 NapCat 没有上报的离线消息无法恢复；撤回/过期、缺少合法会话元数据或不允许使用的引用会明确不可用。开启自身事件前，其他模块发送或 HTTP 未确认的消息仍可能缺失。未知私聊目标安全跳过，不能从 bot 身份猜测收件人。
 
 回滚时停止 bot，先在当前 WS Server 关闭 `reportSelfMessage`，再回退本次局部代码，避免旧版本发生自回复。保留已有私有配置和历史提交，不需要数据库迁移。重启后检查 `/ping`、aichat、`/memory`、通知；内存短期历史自然清空。
+
+## 2026-10-29 定向修复（基线 35d49ef）
+
+- `cooper_bot/modules/ai/aisvc.py`：归属提示仅在多个完整消息体匹配时标记歧义。0 个匹配的独立通知不再被误过滤，不消耗其他回复的待关联提示，也不清除已有可疑标记；唯一匹配和成员退出过滤保持原样。引用规则补充媒体未取得时不得推断画面。
+- `cooper_bot/modules/ai/quote_context.py`：`get_msg` 超时、网络异常或明确失败时，仅保留已通过同会话、作者和成员检查的缓存原文、作者、媒体占位，并附 `media_fetch_failed_cached_context` 原因；回退前重新检查成员权限。无可用缓存仍不可用，取消正常传播。成功响应的格式、会话、消息 ID 或作者冲突仍拒绝，不能借缓存掩盖；从网络获取引用的标记及长期记忆行为不变。
+- `test/unit/test_onebot_message_context.py`、`test/unit/test_quote_context.py`：补齐独立通知并发、事件/ACK 合并、歧义保留、退出过滤，以及有限缓存回退、格式/作者冲突、取消和正常视觉路径测试。本节所在文档记录验证证据；合计只改 5 个文件，没有新增依赖、配置或服务。
+
+修复前先运行两个测试文件：**17 failed、67 passed**，实际复现误标、媒体缓存丢失及作者冲突等断言。补丁后的关联专项命令：
+
+```text
+python -B -m pytest -o addopts='' -q -p no:cacheprovider --basetemp runtime/test_stream_targeted_green test/unit/test_onebot_message_context.py test/unit/test_quote_context.py test/unit/test_aisvc_kimi_chat.py test/unit/test_client_message_stream.py --disable-warnings --tb=short
+```
+
+结果为 **116 passed**、0 failed、0 skipped。全量命令（允许 WSL 真实 ssocr）：
+
+```text
+python -B -m pytest -o addopts='' -q -rs -p no:cacheprovider --basetemp runtime/test_stream_followup_full --disable-warnings
+```
+
+全量结果 **849 passed**、0 failed、0 skipped，耗时 92.60 秒。`python -B -m compileall -q client.py cooper_bot`、`git diff --check` 通过，5 个修改文件通过 UTF-8/换行及已知私有账号检查。定向修复仍未修改生产 NapCat 配置或重启 bot；真实定时通知与命令并发、引用图片取回失败的现场验收需在测试群完成。
