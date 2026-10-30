@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -182,6 +183,44 @@ async def test_public_websearch_is_allowed_and_admin_bash_is_not_restricted(tmp_
     assert (await admin_runner.run(KimiRunRequest("hello", "admin", 2.0, "admin-1", "computer_probe"))).text == "ok"
 
 
+@pytest.mark.asyncio
+async def test_runtime_audit_accepts_only_profile_feishu_allowlist(tmp_path):
+    runner = _runner(
+        tmp_path,
+        "import json\n"
+        "print(json.dumps({'type':'tool_call','name':'mcp__feishu__docx_v1_document_rawContent'}))\n"
+        "print(json.dumps({'type':'assistant','content':'read-only result'}))\n",
+    )
+    profile = replace(
+        runner.settings.public,
+        tools=("WebSearch", "mcp__feishu__docx_v1_document_rawContent"),
+    )
+    runner.settings = replace(runner.settings, public=profile)
+
+    result = await runner.run(_request())
+
+    assert result.tool_names == ("mcp__feishu__docx_v1_document_rawContent",)
+    assert result.text == "read-only result"
+
+
+@pytest.mark.asyncio
+async def test_runtime_audit_rejects_unlisted_feishu_write_tool(tmp_path):
+    runner = _runner(
+        tmp_path,
+        "import json\n"
+        "print(json.dumps({'type':'tool_call','name':'mcp__feishu__bitable_v1_appTable_update'}))\n"
+        "print(json.dumps({'type':'assistant','content':'must not return'}))\n",
+    )
+    profile = replace(runner.settings.public, tools=("WebSearch", "mcp__feishu__docx_v1_document_rawContent"))
+    runner.settings = replace(runner.settings, public=profile)
+
+    with pytest.raises(KimiSecurityViolation) as exc_info:
+        await runner.run(_request())
+
+    assert exc_info.value.detail == "forbidden_tool_observed"
+    assert runner.public_security_healthy is False
+
+
 @pytest.mark.parametrize(
     ("events", "expected_tools", "expected_text"),
     [
@@ -211,6 +250,15 @@ def test_stream_json_parser_rejects_unknown_assistant_tool_schema() -> None:
         KimiCliRunner._parse_jsonl(raw, "req-1")
 
     assert exc_info.value.detail == "unrecognized_tool_schema"
+
+
+def test_stream_json_parser_does_not_accept_mcp_error_as_success() -> None:
+    raw = b'{"type":"tool_result","name":"mcp__feishu__docx_v1_document_rawContent","isError":true}\n{"type":"assistant","content":"read succeeded"}\n'
+
+    with pytest.raises(KimiProtocolError) as exc_info:
+        KimiCliRunner._parse_jsonl(raw, "req-1")
+
+    assert exc_info.value.detail == "tool_error"
 
 
 def test_stream_json_parser_fails_closed_on_unknown_legacy_urp_target() -> None:

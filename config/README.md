@@ -20,6 +20,7 @@ Kimi 的 `public_home_security.example.toml` 是独立安全配置参考，应�
 | `ai/prompts/kimi/` | 公共和管理员 agent 提示词 | 修改后重启 |
 | `ai/prompts/` 其余文件 | 邮件、资料、日历、记忆、视觉、审核、联网等业务提示词 | 修改后重启 |
 | `ai/kimi/` | Kimi 环境与安全配置参考，非提示词 | 按部署说明 |
+| `feishu/credentials.json` | 飞书自建应用凭证，仅在 `AI_FEISHU_ENABLED=true` 时传给 public Kimi 子进程 | 重启 |
 | `calendar/daily_calendar_config.json` | 按群设置的每日提醒 | 自动重读 |
 | `calendar/editor_duty_config.json` | 值班群、发布账号、排除名单、日期与策略 | `group_id`、`publisher_id` 修改后重启；其余设置自动重读 |
 | `replies/` | 精确、关键词、连续文本回复 | 自动重读 |
@@ -35,6 +36,8 @@ AI 提示词的完整目录、变量和生效范围见 [PROMPTS.md](PROMPTS.md)�
 `CALENDAR_TEST_GROUP_ID` 指定 `/calendartest` 使用的群级配置；未设置时使用通用日历参数，不发送到目标群。
 `MEMORY_PROBE_SCOPE` 和 `MEMORY_PROBE_ACTOR` 仅供手动诊断脚本使用，也可用命令行参数覆盖。
 `LAUNCHER_PYTHON_PATH` 和 `LAUNCHER_PY_PATH` 可指定 Windows 启动器使用的解释器。
+
+飞书只读 MCP 默认关闭。凭证只能放在 `config/private/feishu/credentials.json`，不得放入 `secrets.env`；详见 [飞书只读 MCP 部署与回滚](../docs/feishu_readonly_mcp.md)。
 启动器默认查找当前用户桌面下的 `Cooper_bot`，其他位置可设置系统环境变量 `COOPER_BOT_ROOT`。
 
 聊天记录、权限数据库、提交记录、日历发送状态、Kimi profile 认证与缓存仍按原有格式保存在运行目录，

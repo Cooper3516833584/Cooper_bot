@@ -12,9 +12,25 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional
 
 from cooper_bot.core import config
+from cooper_bot.modules.ai.feishu_secrets import FeishuCredentialError, load_feishu_credentials
 
 
+FEISHU_MCP_VERSION = "0.5.1"
+FEISHU_APIS = (
+    "bitable.v1.appTable.list",
+    "bitable.v1.appTableField.list",
+    "bitable.v1.appTableRecord.search",
+    "docx.v1.document.rawContent",
+)
+FEISHU_TOOLS = (
+    "mcp__feishu__bitable_v1_appTable_list",
+    "mcp__feishu__bitable_v1_appTableField_list",
+    "mcp__feishu__bitable_v1_appTableRecord_search",
+    "mcp__feishu__docx_v1_document_rawContent",
+)
+FEISHU_ENABLED_TOOLS = tuple(tool.removeprefix("mcp__feishu__") for tool in FEISHU_TOOLS)
 PUBLIC_TOOLS = ("WebSearch",)
+FEISHU_PUBLIC_TOOLS = ("WebSearch", *FEISHU_TOOLS)
 ADMIN_TOOLS = ("*",)
 _PROCESS_ENV_KEYS = (
     "SystemRoot",
@@ -84,6 +100,7 @@ class KimiProfile:
     agent_path: Path
     skills_dir: Path
     tools: tuple[str, ...]
+    feishu_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +115,7 @@ class KimiSettings:
     max_concurrency: int
     admin_enabled: bool
     allow_group_computer: bool
+    feishu_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,7 +171,12 @@ class KimiRunResult:
     protocol_observed: bool
 
 
-def build_kimi_env(profile: KimiProfile, source_env: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+def build_kimi_env(
+    profile: KimiProfile,
+    source_env: Optional[Mapping[str, str]] = None,
+    *,
+    feishu_credentials: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
     """Build a narrow child environment without inheriting bot credentials."""
     source = source_env or {}
     env = {
@@ -162,6 +185,8 @@ def build_kimi_env(profile: KimiProfile, source_env: Optional[Mapping[str, str]]
         if str(source.get(key) or "").strip()
     }
     env["KIMI_CODE_HOME"] = str(profile.home)
+    if profile.name == "public" and feishu_credentials:
+        env.update({key: str(feishu_credentials[key]) for key in ("APP_ID", "APP_SECRET")})
     return env
 
 
@@ -178,7 +203,8 @@ def load_kimi_settings() -> KimiSettings:
             workdir=Path(config.AI_KIMI_PUBLIC_WORKDIR),
             agent_path=Path(config.AI_KIMI_PUBLIC_AGENT_PATH),
             skills_dir=public_home / "empty_skills",
-            tools=PUBLIC_TOOLS,
+            tools=FEISHU_PUBLIC_TOOLS if config.AI_FEISHU_ENABLED else PUBLIC_TOOLS,
+            feishu_enabled=bool(config.AI_FEISHU_ENABLED),
         ),
         admin=KimiProfile(
             name="admin",
@@ -193,6 +219,7 @@ def load_kimi_settings() -> KimiSettings:
         max_concurrency=int(config.AI_KIMI_MAX_CONCURRENCY),
         admin_enabled=bool(config.AI_KIMI_ADMIN_ENABLED),
         allow_group_computer=bool(config.AI_KIMI_ALLOW_GROUP_COMPUTER),
+        feishu_enabled=bool(config.AI_FEISHU_ENABLED),
     )
 
 
@@ -213,6 +240,21 @@ def _validate_agent(profile: KimiProfile) -> Optional[str]:
         return f"{profile.name}_agent_missing"
     if profile.name == "public" and "subagents: []" not in text:
         return f"{profile.name}_agent_subagents_not_disabled"
+    if profile.name == "public":
+        lines = text.splitlines()
+        try:
+            start = lines.index("tools:") + 1
+        except ValueError:
+            return "public_agent_tools_missing"
+        actual: list[str] = []
+        for line in lines[start:]:
+            if line and not line[0].isspace():
+                break
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                actual.append(stripped[2:].strip().strip("\"'"))
+        if actual != list(profile.tools):
+            return "public_agent_tools_unsafe"
     for tool in profile.tools:
         marker = '- "*"' if tool == "*" else f"- {tool}"
         if marker not in text:
@@ -237,8 +279,14 @@ def validate_public_home_policy(profile: KimiProfile) -> PublicPolicyCheck:
     enabled = tools.get("enabled") if isinstance(tools, dict) else None
     if enabled is None:
         errors.append("kimi_public_tools_policy_missing")
-    elif not isinstance(enabled, list) or set(enabled) != {"WebSearch"} or len(enabled) != 1:
+    elif not isinstance(enabled, list) or set(enabled) != set(profile.tools) or len(enabled) != len(profile.tools):
         errors.append("kimi_public_tools_policy_unsafe")
+    try:
+        public_config_text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        public_config_text = ""
+    if re.search(r"(?i)(app[_-]?secret|app[_-]?id|cli_[A-Za-z0-9]{12,})", public_config_text):
+        errors.append("kimi_public_credentials_in_config")
     if isinstance(raw, dict) and raw.get("extra_agent_dirs"):
         errors.append("kimi_public_extra_agent_dirs_enabled")
     if isinstance(raw, dict) and raw.get("extra_skill_dirs"):
@@ -256,7 +304,14 @@ def validate_public_home_policy(profile: KimiProfile) -> PublicPolicyCheck:
         else:
             servers = mcp_raw.get("mcpServers") if isinstance(mcp_raw, dict) else None
             if servers:
-                errors.append("kimi_public_mcp_enabled")
+                if not getattr(profile, "feishu_enabled", False):
+                    errors.append("kimi_public_mcp_enabled")
+                elif not _valid_feishu_mcp_config(mcp_raw):
+                    errors.append("kimi_public_mcp_config_unsafe")
+            elif getattr(profile, "feishu_enabled", False):
+                errors.append("kimi_public_mcp_config_unsafe")
+    elif getattr(profile, "feishu_enabled", False):
+        errors.append("kimi_public_mcp_config_missing")
     if profile.skills_dir.is_dir():
         try:
             if any(profile.skills_dir.iterdir()):
@@ -265,7 +320,132 @@ def validate_public_home_policy(profile: KimiProfile) -> PublicPolicyCheck:
             errors.append("kimi_public_skills_not_empty")
     if (profile.workdir / ".kimi-code").exists():
         errors.append("kimi_public_project_config_present")
+    try:
+        agent_text = profile.agent_path.read_text(encoding="utf-8")
+    except OSError:
+        agent_text = ""
+    if re.search(r"(?i)(app[_-]?secret|app[_-]?id|cli_[A-Za-z0-9]{12,})", agent_text):
+        errors.append("kimi_public_credentials_in_agent")
     return PublicPolicyCheck(not errors, tuple(errors))
+
+
+def _valid_feishu_mcp_config(raw: object) -> bool:
+    """Accept only the fixed, local stdio configuration for lark-mcp 0.5.1."""
+    if not isinstance(raw, dict) or set(raw) != {"mcpServers"}:
+        return False
+    servers = raw.get("mcpServers")
+    if not isinstance(servers, dict) or set(servers) != {"feishu"}:
+        return False
+    server = servers["feishu"]
+    if not isinstance(server, dict) or set(server) != {"command", "args", "enabledTools"}:
+        return False
+    command, args = server.get("command"), server.get("args")
+    if not isinstance(command, str) or not Path(command).is_absolute():
+        return False
+    if Path(command).name.lower() not in {"node", "node.exe"}:
+        return False
+    if not isinstance(args, list) or len(args) != 10 or not all(isinstance(item, str) for item in args):
+        return False
+    if not Path(args[0]).is_absolute():
+        return False
+    if tuple(Path(args[0]).parts[-4:]) != ("@larksuiteoapi", "lark-mcp", "dist", "cli.js"):
+        return False
+    try:
+        package = json.loads((Path(args[0]).parent.parent / "package.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(package, dict) or package.get("version") != FEISHU_MCP_VERSION:
+        return False
+    expected = [
+        "mcp", "--token-mode", "tenant_access_token", "--tool-name-case", "snake",
+        "--language", "zh", "--tools", ",".join(FEISHU_APIS),
+    ]
+    # args[0] is the pinned package entry point; args[1:] are fixed.
+    if args[1:] != expected:
+        return False
+    if server.get("enabledTools") != list(FEISHU_ENABLED_TOOLS):
+        return False
+    serialized = json.dumps(raw, ensure_ascii=True)
+    if re.search(r"(?i)(APP_SECRET|APP_ID|cli_[A-Za-z0-9]{12,}|--oauth|user_access_token|https?://)", serialized):
+        return False
+    return True
+
+
+async def probe_feishu_mcp_tools(profile: KimiProfile, source_env: Optional[Mapping[str, str]] = None) -> bool:
+    """Perform a credential-safe stdio initialize/tools-list probe of configured MCP."""
+    try:
+        mcp_raw = json.loads((profile.home / "mcp.json").read_text(encoding="utf-8"))
+        if not _valid_feishu_mcp_config(mcp_raw):
+            return False
+        server = mcp_raw["mcpServers"]["feishu"]
+        credentials = load_feishu_credentials(config.FEISHU_CREDENTIALS_PATH)
+        env = build_kimi_env(profile, source_env, feishu_credentials=credentials)
+        process = await asyncio.create_subprocess_exec(
+            server["command"], *server["args"],
+            cwd=str(profile.workdir),
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (OSError, ValueError, FeishuCredentialError):
+        return False
+
+    async def send(payload: dict) -> None:
+        assert process.stdin is not None
+        process.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+        await process.stdin.drain()
+
+    async def response_for(request_id: int) -> Optional[dict]:
+        assert process.stdout is not None
+        while True:
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=8.0)
+            if not line or len(line) > 1024 * 1024:
+                return None
+            try:
+                payload = json.loads(line)
+            except (UnicodeError, json.JSONDecodeError):
+                return None
+            if isinstance(payload, dict) and payload.get("id") == request_id:
+                return payload
+
+    try:
+        await send({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "Cooper_bot-readonly-probe", "version": "1"},
+            },
+        })
+        initialized = await response_for(1)
+        if not isinstance(initialized, dict) or "error" in initialized or not isinstance(initialized.get("result"), dict):
+            return False
+        await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        await send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        listed = await response_for(2)
+        result = listed.get("result") if isinstance(listed, dict) else None
+        tools = result.get("tools") if isinstance(result, dict) else None
+        names = [item.get("name") for item in tools if isinstance(item, dict)] if isinstance(tools, list) else None
+        return (
+            isinstance(names, list)
+            and len(names) == len(FEISHU_ENABLED_TOOLS)
+            and all(isinstance(name, str) for name in names)
+            and set(names) == set(FEISHU_ENABLED_TOOLS)
+        )
+    except (OSError, ValueError, TimeoutError, asyncio.TimeoutError, AssertionError):
+        return False
+    finally:
+        try:
+            if process.returncode is None:
+                process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+        except (OSError, ProcessLookupError, TimeoutError, asyncio.TimeoutError):
+            try:
+                process.kill()
+                await process.wait()
+            except (OSError, ProcessLookupError):
+                pass
 
 
 def validate_kimi_settings(
@@ -293,6 +473,11 @@ def validate_kimi_settings(
         errors.append("kimi_admin_home_missing")
     if not settings.public.skills_dir.is_dir():
         errors.append("kimi_public_skills_dir_missing")
+    if settings.feishu_enabled:
+        try:
+            load_feishu_credentials(config.FEISHU_CREDENTIALS_PATH)
+        except FeishuCredentialError as exc:
+            errors.append(f"kimi_public_{exc.code}")
 
     public_error = _validate_agent(settings.public)
     if public_error:
@@ -597,6 +782,19 @@ class KimiCliRunner:
             return False
         return any("tool" in str(key).lower() for key in message)
 
+    @staticmethod
+    def _has_tool_error(event: dict) -> bool:
+        candidates = (event, event.get("message"), event.get("result"))
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("isError") is True or candidate.get("is_error") is True:
+                return True
+            result = candidate.get("result")
+            if isinstance(result, dict) and (result.get("isError") is True or result.get("is_error") is True):
+                return True
+        return False
+
     @classmethod
     def _parse_jsonl(cls, raw: bytes, request_id: str) -> tuple[str, tuple[str, ...], bool, bool]:
         try:
@@ -619,6 +817,8 @@ class KimiCliRunner:
             event_type = str(event.get("type") or "")
             if event_type in {"error", "failed"}:
                 raise KimiProtocolError(request_id, "terminal_error")
+            if cls._has_tool_error(event):
+                raise KimiProtocolError(request_id, "tool_error")
             names = cls._extract_tool_names(event)
             if cls._has_unrecognized_assistant_tool_schema(event, names):
                 raise KimiProtocolError(request_id, "unrecognized_tool_schema")
@@ -683,7 +883,15 @@ class KimiCliRunner:
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=str(profile.workdir),
-                env=build_kimi_env(profile, os.environ),
+                env=build_kimi_env(
+                    profile,
+                    os.environ,
+                    feishu_credentials=(
+                        load_feishu_credentials(config.FEISHU_CREDENTIALS_PATH)
+                        if request.profile == "public" and self.settings.feishu_enabled
+                        else None
+                    ),
+                ),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -725,7 +933,8 @@ class KimiCliRunner:
             text, tools, tool_seen, protocol_seen = self._parse_jsonl(stdout, request.request_id)
             result = KimiRunResult(text, request.request_id, int(process.returncode), tools, tool_seen, protocol_seen)
             if request.profile == "public":
-                forbidden = set(result.tool_names).difference(PUBLIC_TOOLS)
+                allowed_tools = set(profile.tools)
+                forbidden = set(result.tool_names).difference(allowed_tools)
                 if forbidden:
                     self._public_security_healthy = False
                     raise KimiSecurityViolation(request.request_id, "forbidden_tool_observed")

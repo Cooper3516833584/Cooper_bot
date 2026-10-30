@@ -29,6 +29,7 @@ from cooper_bot.modules.ai.kimi_cli import (
     build_kimi_env,
     detect_kimi_runtime_info,
     load_kimi_settings,
+    probe_feishu_mcp_tools,
     validate_kimi_settings,
 )
 from cooper_bot.modules.ai.model_gateway import (
@@ -315,6 +316,11 @@ class AIService:
                 "admin_permission_mode": "auto",
                 "public_config_sha256": self._kimi_file_sha256(settings.public.home / "config.toml"),
                 "public_mcp_sha256": self._kimi_file_sha256(settings.public.home / "mcp.json"),
+                "feishu_enabled": bool(settings.feishu_enabled),
+                "feishu_credentials_sha256": (
+                    self._kimi_file_sha256(core_config.FEISHU_CREDENTIALS_PATH)
+                    if settings.feishu_enabled else "disabled"
+                ),
             },
             bool(runtime.executable),
         )
@@ -339,6 +345,13 @@ class AIService:
             errors.append("kimi_public_security_probe_failed")
             return self._apply_kimi_capability_report(
                 KimiCapabilityReport(cli_available, self._kimi_runtime_version, False, False, False, False, False, tuple(dict.fromkeys(errors)))
+            )
+        if getattr(self._kimi_runner.settings, "feishu_enabled", False) and not await probe_feishu_mcp_tools(
+            self._kimi_runner.settings.public, os.environ
+        ):
+            errors.append("kimi_public_feishu_tools_probe_failed")
+            return self._apply_kimi_capability_report(
+                KimiCapabilityReport(cli_available, self._kimi_runtime_version, False, True, False, False, False, tuple(dict.fromkeys(errors)))
             )
         try:
             cached = json.loads(self._kimi_capability_cache_path.read_text(encoding="utf-8"))
@@ -372,6 +385,12 @@ class AIService:
             return self._apply_kimi_capability_report(
                 KimiCapabilityReport(cli_available, self._kimi_runtime_version, False, False, False, False, False, tuple(dict.fromkeys(errors)))
             )
+        if getattr(self._kimi_runner.settings, "feishu_enabled", False):
+            if not await probe_feishu_mcp_tools(self._kimi_runner.settings.public, os.environ):
+                errors.append("kimi_public_feishu_tools_probe_failed")
+                return self._apply_kimi_capability_report(
+                    KimiCapabilityReport(cli_available, self._kimi_runtime_version, False, True, False, False, False, tuple(dict.fromkeys(errors)))
+                )
 
         settings = self._kimi_runner.settings
         self._kimi_runner.reset_public_security_state()
