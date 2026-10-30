@@ -172,6 +172,41 @@ def test_public_policy_rejects_unsafe_tool_allowlists(tmp_path, monkeypatch, con
     assert expected_error in readiness.errors
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ('disabled = ["WebSearch"]\n', "kimi_public_tools_disabled_unsafe"),
+        ('disabled = "Bash"\n', "kimi_public_tools_disabled_invalid"),
+        ('[permission]\nrules = [{ tool = "WebSearch", decision = "deny" }]\n', "kimi_public_permission_rule_blocks_tool"),
+        ('[permission]\nrules = [{ tool = "WebSearch", decision = "ask" }]\n', "kimi_public_permission_rule_blocks_tool"),
+    ],
+)
+def test_public_policy_rejects_disabled_or_noninteractive_permission_rules(tmp_path, monkeypatch, extra, expected):
+    settings = _settings(tmp_path)
+    path = settings.public.home / "config.toml"
+    path.write_text(path.read_text(encoding="utf-8") + "\n" + extra, encoding="utf-8")
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.PROJECT_ROOT", tmp_path / "project")
+
+    readiness = validate_kimi_settings(settings, executable_resolver=lambda _path: "C:/tools/kimi.exe")
+
+    assert readiness.public_profile_valid is False
+    assert expected in readiness.errors
+
+
+def test_public_agent_rejects_disallowed_tools(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    settings.public.agent_path.write_text(
+        "---\ntools:\n  - WebSearch\ndisallowedTools:\n  - WebSearch\nsubagents: []\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.PROJECT_ROOT", tmp_path / "project")
+
+    readiness = validate_kimi_settings(settings, executable_resolver=lambda _path: "C:/tools/kimi.exe")
+
+    assert readiness.public_profile_valid is False
+    assert "public_agent_disallowed_tools" in readiness.errors
+
+
 def test_public_policy_rejects_mcp_and_nonempty_skills(tmp_path, monkeypatch) -> None:
     settings = _settings(tmp_path)
     settings.public.home.joinpath("mcp.json").write_text('{"mcpServers":{"unsafe":{}}}', encoding="utf-8")
@@ -218,6 +253,34 @@ def test_enabled_feishu_requires_exact_static_readonly_config(tmp_path, monkeypa
     readiness = validate_kimi_settings(settings, executable_resolver=lambda _path: "C:/tools/kimi.exe")
 
     assert readiness.public_profile_valid is True
+
+
+def test_default_and_feishu_examples_match_only_their_feature_modes(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[2]
+    default_config = (root / "config/examples/ai/kimi/public_home_security.example.toml").read_text(encoding="utf-8")
+    default_agent = (root / "config/examples/ai/prompts/kimi/public.md.example").read_text(encoding="utf-8")
+    feishu_config = (root / "config/examples/ai/kimi/public_home_security_feishu.example.toml").read_text(encoding="utf-8")
+    feishu_agent = (root / "config/examples/ai/prompts/kimi/public_feishu.md.example").read_text(encoding="utf-8")
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.PROJECT_ROOT", tmp_path / "project")
+
+    disabled = _settings(tmp_path / "disabled")
+    (disabled.public.home / "config.toml").write_text(default_config, encoding="utf-8")
+    disabled.public.agent_path.write_text(default_agent, encoding="utf-8")
+    assert validate_kimi_settings(disabled, executable_resolver=lambda _path: "C:/tools/kimi.exe").public_profile_valid
+
+    enabled = _enable_feishu(_settings(tmp_path / "enabled"))
+    (enabled.public.home / "config.toml").write_text(feishu_config, encoding="utf-8")
+    enabled.public.agent_path.write_text(feishu_agent, encoding="utf-8")
+    credentials = tmp_path / "enabled" / "credentials.json"
+    credentials.write_text('{"app_id":"cli_TEST1234567890","app_secret":"TEST_ONLY_SECRET"}', encoding="utf-8")
+    credentials.chmod(0o600)
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.FEISHU_CREDENTIALS_PATH", credentials)
+    assert validate_kimi_settings(enabled, executable_resolver=lambda _path: "C:/tools/kimi.exe").public_profile_valid
+
+    disabled_mismatch = replace(disabled, public=replace(disabled.public, tools=FEISHU_PUBLIC_TOOLS, feishu_enabled=True), feishu_enabled=True)
+    assert not validate_kimi_settings(disabled_mismatch, executable_resolver=lambda _path: "C:/tools/kimi.exe").public_profile_valid
+    enabled_mismatch = replace(enabled, public=replace(enabled.public, tools=PUBLIC_TOOLS, feishu_enabled=False), feishu_enabled=False)
+    assert not validate_kimi_settings(enabled_mismatch, executable_resolver=lambda _path: "C:/tools/kimi.exe").public_profile_valid
 
 
 @pytest.mark.asyncio

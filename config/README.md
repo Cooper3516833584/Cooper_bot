@@ -5,7 +5,7 @@
 
 首次部署时，将所需的示例复制到 `config/private/` 的相同相对位置，去掉文件名末尾的 `.example`，再填写实际值。
 例如 `examples/ai/prompts/chat/group_overrides.json.example` 对应 `private/ai/prompts/chat/group_overrides.json`。
-Kimi 的 `public_home_security.example.toml` 是独立安全配置参考，应按已有 profile 部署说明使用。
+Kimi 默认使用 `public_home_security.example.toml` 和 `public.md.example`（仅 WebSearch）。飞书只读模式使用文件名含 `_feishu` 的独立样例；只有设置 `AI_FEISHU_ENABLED=true` 并完成 MCP/凭证配置后才切换，部署与回滚见飞书说明。
 
 | 文件或目录 | 用途 | 修改后生效方式 |
 | --- | --- | --- |

@@ -261,6 +261,111 @@ def test_stream_json_parser_does_not_accept_mcp_error_as_success() -> None:
     assert exc_info.value.detail == "tool_error"
 
 
+@pytest.mark.parametrize(
+    "tool_content",
+    [
+        '{"code":91403,"msg":"Forbidden"}',
+        '{"isError":true,"content":[{"type":"text","text":"permission denied"}]}',
+    ],
+)
+def test_stream_json_parser_rejects_real_kimi_feishu_tool_error_by_call_id(tool_content):
+    raw = (
+        '{"role":"assistant","tool_calls":[{"id":"call-1","type":"function",'
+        '"function":{"name":"mcp__feishu__bitable_v1_appTableRecord_search","arguments":"{}"}}]}\n'
+        + '{"role":"tool","tool_call_id":"call-1","content":'
+        + json.dumps(tool_content)
+        + '}\n{"role":"assistant","content":"读取成功，找到 12 条。"}\n'
+    ).encode()
+
+    with pytest.raises(KimiProtocolError) as exc_info:
+        KimiCliRunner._parse_jsonl(raw, "req-1")
+
+    assert exc_info.value.detail in {"feishu_tool_failed", "feishu_result_unverifiable"}
+    assert "Forbidden" not in str(exc_info.value)
+    assert "12 条" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "tool_events",
+    [
+        '{"role":"assistant","tool_calls":[{"id":"call-3","function":{"name":"mcp__feishu__docx_v1_document_rawContent"}}]}\n',
+        '{"role":"assistant","tool_calls":[{"id":"call-3","function":{"name":"mcp__feishu__docx_v1_document_rawContent"}}]}\n'
+        '{"role":"tool","tool_call_id":"wrong-id","content":"{\\"content\\":\\"text\\"}"}\n',
+        '{"role":"assistant","tool_calls":[{"id":"call-3","function":{"name":"mcp__feishu__docx_v1_document_rawContent"}},'
+        '{"id":"call-4","function":{"name":"mcp__feishu__bitable_v1_appTableRecord_search"}}]}\n'
+        '{"role":"tool","tool_call_id":"call-3","content":"{\\"content\\":\\"text\\"}"}\n',
+    ],
+)
+def test_stream_json_parser_rejects_missing_or_unmatched_feishu_tool_results(tool_events):
+    raw = (tool_events + '{"role":"assistant","content":"读取成功。"}\n').encode()
+
+    with pytest.raises(KimiProtocolError) as exc_info:
+        KimiCliRunner._parse_jsonl(raw, "req-1")
+
+    assert exc_info.value.detail == "feishu_result_unverifiable"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_data", "expected_text"),
+    [
+        ("mcp__feishu__bitable_v1_appTableRecord_search", {"items": [], "has_more": False}, "没有符合条件的记录。"),
+        ("mcp__feishu__docx_v1_document_rawContent", {"content": ""}, "文档内容为空。"),
+        (
+            "mcp__feishu__docx_v1_document_rawContent",
+            {"content": '本篇说明 isError=true、Forbidden、{"code":403} 的含义。'},
+            "文档介绍错误字段。",
+        ),
+    ],
+)
+def test_stream_json_parser_accepts_valid_empty_or_error_word_feishu_content(tool_name, tool_data, expected_text):
+    raw = (
+        json.dumps({"role": "assistant", "tool_calls": [{"id": "call-ok", "function": {"name": tool_name}}]})
+        + "\n"
+        + json.dumps({"role": "tool", "tool_call_id": "call-ok", "content": json.dumps(tool_data)})
+        + "\n"
+        + json.dumps({"role": "assistant", "content": expected_text})
+        + "\n"
+    ).encode()
+
+    text, tools, observed, protocol = KimiCliRunner._parse_jsonl(raw, "req-1")
+
+    assert text == expected_text
+    assert tools == (tool_name,)
+    assert observed is True
+    assert protocol is True
+
+
+def test_stream_json_parser_rejects_oversized_feishu_result_without_echoing_content():
+    large = json.dumps({"content": "x" * (1024 * 1024 + 1)})
+    raw = (
+        '{"role":"assistant","tool_calls":[{"id":"large-1","function":{"name":"mcp__feishu__docx_v1_document_rawContent"}}]}\n'
+        + json.dumps({"role": "tool", "tool_call_id": "large-1", "content": large})
+        + '\n{"role":"assistant","content":"读取成功。"}\n'
+    ).encode()
+
+    with pytest.raises(KimiProtocolError) as exc_info:
+        KimiCliRunner._parse_jsonl(raw, "req-1")
+
+    assert exc_info.value.detail == "feishu_result_unverifiable"
+    assert "x" * 100 not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_admin_tool_results_are_not_subject_to_public_feishu_result_shape(tmp_path):
+    runner = _runner(
+        tmp_path,
+        "import json\n"
+        "print(json.dumps({'role':'assistant','tool_calls':[{'id':'admin-call','function':{'name':'mcp__feishu__docx_v1_document_rawContent'}}]}))\n"
+        "print(json.dumps({'role':'tool','tool_call_id':'admin-call','content':'not a public Feishu response'}))\n"
+        "print(json.dumps({'role':'assistant','content':'admin completed'}))\n",
+        admin_enabled=True,
+    )
+
+    result = await runner.run(KimiRunRequest("hello", "admin", 2.0, "admin-feishu-shape", "computer_probe"))
+
+    assert result.text == "admin completed"
+
+
 def test_stream_json_parser_fails_closed_on_unknown_legacy_urp_target() -> None:
     raw = b'{"type":"assistant","content":"<system_urp_calling><url>https://example.test/private</url><method>GET</method></system_urp_calling>ok"}\n'
 

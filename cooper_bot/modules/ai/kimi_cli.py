@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import os
 import re
@@ -50,6 +51,7 @@ _PROCESS_ENV_KEYS = (
 )
 _MAX_STDOUT_BYTES = 8 * 1024 * 1024
 _MAX_STDERR_BYTES = 64 * 1024
+_MAX_FEISHU_RESULT_BYTES = 1024 * 1024
 _DEFAULT_QUEUE_TIMEOUT_SECONDS = 8.0
 _DEFAULT_MAX_QUEUE = 12
 _WINDOWS_ARGV_BUDGET = 24000
@@ -241,6 +243,19 @@ def _validate_agent(profile: KimiProfile) -> Optional[str]:
     if profile.name == "public" and "subagents: []" not in text:
         return f"{profile.name}_agent_subagents_not_disabled"
     if profile.name == "public":
+        frontmatter = re.search(r"(?s)^---\s*\n(.*?)\n---(?:\s|$)", text)
+        if frontmatter:
+            metadata = frontmatter.group(1).splitlines()
+            for index, line in enumerate(metadata):
+                if re.match(r"^disallowedTools\s*:", line):
+                    value = line.split(":", 1)[1].strip()
+                    if value not in {"", "[]"}:
+                        return "public_agent_disallowed_tools"
+                    for following in metadata[index + 1:]:
+                        if following and not following[0].isspace():
+                            break
+                        if following.strip().startswith("-"):
+                            return "public_agent_disallowed_tools"
         lines = text.splitlines()
         try:
             start = lines.index("tools:") + 1
@@ -262,6 +277,53 @@ def _validate_agent(profile: KimiProfile) -> Optional[str]:
     return None
 
 
+def _pattern_may_match(pattern: str, tool: str) -> bool:
+    """Conservative matcher for Kimi MCP tool globs; false means definitely unrelated."""
+    if pattern == tool:
+        return True
+    if not pattern.startswith("mcp__"):
+        return False
+    if any(char in pattern for char in "{}!+()\\"):
+        return "feishu" in pattern.lower() or "*" in pattern or "?" in pattern
+    try:
+        return fnmatch.fnmatchcase(tool, pattern)
+    except (ValueError, re.error):
+        return True
+
+
+def _disabled_pattern_matches(tool: str, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        if pattern == tool:
+            return True
+        if tool.startswith("mcp__") and _pattern_may_match(pattern, tool):
+            return True
+    return False
+
+
+def _permission_rules_block_tools(tools: tuple[str, ...], rules: list[object]) -> bool:
+    for tool in tools:
+        for rule in rules:
+            if not isinstance(rule, dict):
+                return True
+            pattern = rule.get("tool") or rule.get("name") or rule.get("pattern")
+            decision = rule.get("decision") or rule.get("action")
+            if not isinstance(pattern, str) or not isinstance(decision, str):
+                return True
+            matches = (
+                pattern == tool
+                or pattern.startswith(tool + "(")
+                or (tool.startswith("mcp__") and _pattern_may_match(pattern, tool))
+            )
+            if not matches:
+                continue
+            if decision.lower() in {"deny", "ask"}:
+                return True
+            if decision.lower() == "allow":
+                break
+            return True
+    return False
+
+
 def validate_public_home_policy(profile: KimiProfile) -> PublicPolicyCheck:
     """Verify the public home has a strict, global WebSearch-only boundary."""
     errors: list[str] = []
@@ -281,6 +343,17 @@ def validate_public_home_policy(profile: KimiProfile) -> PublicPolicyCheck:
         errors.append("kimi_public_tools_policy_missing")
     elif not isinstance(enabled, list) or set(enabled) != set(profile.tools) or len(enabled) != len(profile.tools):
         errors.append("kimi_public_tools_policy_unsafe")
+    disabled = tools.get("disabled", []) if isinstance(tools, dict) else []
+    if not isinstance(disabled, list) or any(not isinstance(item, str) for item in disabled):
+        errors.append("kimi_public_tools_disabled_invalid")
+    elif any(_disabled_pattern_matches(tool, disabled) for tool in profile.tools):
+        errors.append("kimi_public_tools_disabled_unsafe")
+    permission = raw.get("permission") if isinstance(raw, dict) else None
+    rules = permission.get("rules", []) if isinstance(permission, dict) else []
+    if not isinstance(rules, list):
+        errors.append("kimi_public_permission_rules_invalid")
+    elif _permission_rules_block_tools(profile.tools, rules):
+        errors.append("kimi_public_permission_rule_blocks_tool")
     try:
         public_config_text = config_path.read_text(encoding="utf-8")
     except OSError:
@@ -795,8 +868,71 @@ class KimiCliRunner:
                 return True
         return False
 
+    @staticmethod
+    def _tool_calls_with_ids(event: dict) -> list[tuple[Optional[str], str]]:
+        message = event.get("message") if isinstance(event.get("message"), dict) else event
+        calls = message.get("tool_calls")
+        result: list[tuple[Optional[str], str]] = []
+        if isinstance(calls, list):
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = call.get("name") or call.get("tool_name") or function.get("name")
+                if isinstance(name, str):
+                    call_id = call.get("id") or call.get("tool_call_id")
+                    result.append((str(call_id) if call_id else None, name))
+        if str(message.get("type") or event.get("type") or "") == "tool_call":
+            names = KimiCliRunner._extract_tool_names(event)
+            result.extend((None, name) for name in names)
+        return result
+
+    @staticmethod
+    def _validate_feishu_result(tool: str, event: dict, request_id: str) -> None:
+        content = event.get("content")
+        if isinstance(content, str):
+            if len(content.encode("utf-8")) > _MAX_FEISHU_RESULT_BYTES:
+                raise KimiProtocolError(request_id, "feishu_result_unverifiable")
+            try:
+                payload = json.loads(content)
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise KimiProtocolError(request_id, "feishu_result_unverifiable") from exc
+        else:
+            payload = content
+
+        def error_flag(value: object) -> bool:
+            return isinstance(value, dict) and (value.get("isError") is True or value.get("is_error") is True)
+
+        if error_flag(event) or error_flag(payload):
+            raise KimiProtocolError(request_id, "feishu_tool_failed")
+        # MCP wrappers carry text blocks; decode only this single documented envelope.
+        if isinstance(payload, dict) and isinstance(payload.get("content"), list):
+            blocks = payload["content"]
+            text_blocks = [block.get("text") for block in blocks if isinstance(block, dict) and block.get("type") == "text"]
+            if len(text_blocks) != 1 or not isinstance(text_blocks[0], str):
+                raise KimiProtocolError(request_id, "feishu_result_unverifiable")
+            try:
+                payload = json.loads(text_blocks[0])
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise KimiProtocolError(request_id, "feishu_result_unverifiable") from exc
+        if not isinstance(payload, dict):
+            raise KimiProtocolError(request_id, "feishu_result_unverifiable")
+        nested = [payload.get(key) for key in ("data", "result") if isinstance(payload.get(key), dict)]
+        if error_flag(payload) or any(error_flag(value) for value in nested):
+            raise KimiProtocolError(request_id, "feishu_tool_failed")
+        for response in (payload, *nested):
+            code = response.get("code")
+            if isinstance(code, (int, float)) and not isinstance(code, bool) and code != 0 and ("msg" in response or "message" in response):
+                raise KimiProtocolError(request_id, "feishu_tool_failed")
+        if tool.endswith("docx_v1_document_rawContent"):
+            valid = "content" in payload and isinstance(payload.get("content"), (str, list, dict))
+        else:
+            valid = isinstance(payload.get("items"), list)
+        if not valid:
+            raise KimiProtocolError(request_id, "feishu_result_unverifiable")
+
     @classmethod
-    def _parse_jsonl(cls, raw: bytes, request_id: str) -> tuple[str, tuple[str, ...], bool, bool]:
+    def _parse_jsonl(cls, raw: bytes, request_id: str, *, validate_feishu_results: bool = True) -> tuple[str, tuple[str, ...], bool, bool]:
         try:
             lines = raw.decode("utf-8").splitlines()
         except UnicodeDecodeError as exc:
@@ -805,6 +941,9 @@ class KimiCliRunner:
         tools: list[str] = []
         tool_seen = False
         protocol_seen = False
+        pending_feishu: dict[str, str] = {}
+        completed_feishu: set[str] = set()
+        invalid_feishu_call = False
         for line in lines:
             if not line.strip():
                 continue
@@ -826,6 +965,25 @@ class KimiCliRunner:
                 tool_seen = True
                 tools.extend(names)
                 protocol_seen = True
+            calls = cls._tool_calls_with_ids(event)
+            if validate_feishu_results:
+                for call_id, name in calls:
+                    if name in FEISHU_TOOLS:
+                        if not call_id:
+                            invalid_feishu_call = True
+                        elif call_id in pending_feishu:
+                            invalid_feishu_call = True
+                        else:
+                            pending_feishu[call_id] = name
+                message = event.get("message") if isinstance(event.get("message"), dict) else event
+                if str(message.get("role") or "") == "tool":
+                    call_id = message.get("tool_call_id")
+                    if call_id is not None and str(call_id) in completed_feishu:
+                        raise KimiProtocolError(request_id, "feishu_result_unverifiable")
+                    tool = pending_feishu.pop(str(call_id), None) if call_id is not None else None
+                    if tool:
+                        cls._validate_feishu_result(tool, message, request_id)
+                        completed_feishu.add(str(call_id))
             text = cls._extract_assistant_text(event)
             if text is not None:
                 protocol_seen = True
@@ -835,6 +993,8 @@ class KimiCliRunner:
                 protocol_seen = True
         if not protocol_seen:
             raise KimiProtocolError(request_id, "unrecognized_protocol")
+        if validate_feishu_results and (pending_feishu or invalid_feishu_call):
+            raise KimiProtocolError(request_id, "feishu_result_unverifiable")
         if not final_text:
             raise KimiEmptyReplyError(request_id)
         return final_text, tuple(dict.fromkeys(tools)), tool_seen, protocol_seen
@@ -930,7 +1090,11 @@ class KimiCliRunner:
             await stderr_task
             if process.returncode != 0:
                 raise KimiProtocolError(request.request_id, "process_failed")
-            text, tools, tool_seen, protocol_seen = self._parse_jsonl(stdout, request.request_id)
+            text, tools, tool_seen, protocol_seen = self._parse_jsonl(
+                stdout,
+                request.request_id,
+                validate_feishu_results=request.profile == "public" and profile.feishu_enabled,
+            )
             result = KimiRunResult(text, request.request_id, int(process.returncode), tools, tool_seen, protocol_seen)
             if request.profile == "public":
                 allowed_tools = set(profile.tools)

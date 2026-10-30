@@ -15,6 +15,10 @@
 
 ## 宿主机配置
 
+默认模式保持 `AI_FEISHU_ENABLED=false`，public 工具仅为 `WebSearch`，不需要安装飞书 MCP 或创建飞书凭证。默认部署请使用 `public_home_security.example.toml` 与 `public.md.example`。
+
+仅在确实需要开放飞书只读查询时，才使用下方独立启用步骤：将配置和提示词样例替换为文件名含 `_feishu` 的版本，并设置 `AI_FEISHU_ENABLED=true`。启用前应完成以下本地 MCP 与凭证配置。
+
 1. 安装 Node.js 20+，并在运行 bot 的宿主机固定安装官方 MCP 包。Windows 示例：
 
    ```powershell
@@ -58,14 +62,14 @@
    }
    ```
 
-4. 合并 `config/examples/ai/kimi/public_home_security.example.toml` 的安全设置和 `config/examples/ai/prompts/kimi/public.md.example` 的工具列表到实际 public profile。保留现有 provider、model、认证设置。admin profile 不加飞书权限。
+4. 合并 `config/examples/ai/kimi/public_home_security_feishu.example.toml` 的安全设置和 `config/examples/ai/prompts/kimi/public_feishu.md.example` 的工具列表到实际 public profile。保留现有 provider、model、认证设置。admin profile 不加飞书权限。
 5. 将 `AI_FEISHU_ENABLED=true` 写入 `config/private/settings.env`，重启 bot，并运行现有 Kimi 能力诊断。实现会校验精确工具列表、本地凭证格式和 MCP 参数；配置错误会使 public profile 未就绪。运行期观测到不在白名单的工具会拒绝结果并锁定 public profile，直到可信诊断重新验证。
 
 当前没有目标文档时，只能验证本地配置和工具边界；真实文档读取、无授权时拒绝访问及撤权后失败等现场验收待操作者授权文档后进行。MCP API 错误不会被当作成功读取，QQ 侧不应输出内部凭证或原始错误对象。
 
 ## 停用与回滚
 
-停用时先停止 bot，再从 public home 移除 `feishu` MCP server，并将 public `config.toml` 和 agent 工具列表恢复为仅 `WebSearch`（保留 provider/model/auth）；随后设置 `AI_FEISHU_ENABLED=false`，重启并运行 Kimi 能力诊断。只关闭开关但保留 MCP 或额外工具会触发静态安全拒绝。凭证可在本地安全删除；若凭证曾泄露，应先在飞书后台轮换 Secret，再更新本地文件。
+停用时先停止 bot，再从 public home 移除 `feishu` MCP server，并将 public `config.toml` 和 agent 工具列表恢复为仅 `WebSearch`（可复制默认 `public_home_security.example.toml` 与 `public.md.example`，保留 provider/model/auth）；随后设置 `AI_FEISHU_ENABLED=false`，重启并运行 Kimi 能力诊断。只关闭开关但保留 MCP 或额外工具会触发静态安全拒绝。凭证可在本地安全删除；若凭证曾泄露，应先在飞书后台轮换 Secret，再更新本地文件。
 
 ## Git 泄密检查
 

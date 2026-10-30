@@ -1,0 +1,15 @@
+# Optional Feishu-enabled public profile. Use only with AI_FEISHU_ENABLED=true.
+# Merge these public-only safety settings into AI_KIMI_PUBLIC_HOME/config.toml.
+# Retain the existing provider, model, and authentication configuration.
+
+merge_all_available_skills = false
+builtin_product_skills = false
+
+[tools]
+enabled = [
+  "WebSearch",
+  "mcp__feishu__bitable_v1_appTable_list",
+  "mcp__feishu__bitable_v1_appTableField_list",
+  "mcp__feishu__bitable_v1_appTableRecord_search",
+  "mcp__feishu__docx_v1_document_rawContent"
+]
