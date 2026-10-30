@@ -87,16 +87,19 @@ async def test_ws_observes_before_routing_skips_self_and_rebinds_ack_after_recon
     monkeypatch.setattr(client.asyncio, "sleep", sleep)
     monkeypatch.setattr(client, "_POST_SYNC_TASK", None)
     moderation = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), observe_event=AsyncMock())
+    speech = SimpleNamespace(group_id=20001, observe_event=AsyncMock(), scheduler_loop=scheduler)
     with pytest.raises(asyncio.CancelledError):
         await client._run_bot_loop(
             aisvc=service, vision_skill=None, filesvc=SimpleNamespace(build_find_index=lambda: {}), state=None,
             perm=SimpleNamespace(get_level=lambda _: 1, touch_group_speaker=Mock()),
             handin=SimpleNamespace(scheduler_loop=scheduler), calendar_service=SimpleNamespace(scheduler_loop=scheduler),
             email_notify_service=SimpleNamespace(scheduler_loop=scheduler), moderation_service=moderation,
+            speech_service=speech,
         )
     await client._POST_SYNC_TASK
     assert client.dispatch.await_count == 2
     assert moderation.observe_event.await_count == 2
+    assert speech.observe_event.await_count == 4
     assert len(apis) == 2
     assert service.find_chat_message_by_msg_id("group:20001", "ack0")
     assert service.find_chat_message_by_msg_id("group:20001", "ack1")

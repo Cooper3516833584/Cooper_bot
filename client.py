@@ -28,6 +28,7 @@ from cooper_bot.modules.ai.aisvc import AIService
 from cooper_bot.modules.ai.search_bridge import start_kimi_search_bridge
 from cooper_bot.modules.calendar.daily_calendar import DailyCalendarService
 from cooper_bot.modules.calendar.editor_duty import EditorDutyService
+from cooper_bot.modules.calendar.group_speech import GroupSpeechService
 from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
 from cooper_bot.modules.moderation.service import ModerationService
@@ -145,6 +146,7 @@ async def run_forever():
         log.warning(f"反广告审核服务初始化失败，将保持关闭: {e}")
     calendar_service = DailyCalendarService(log, aisvc)
     email_notify_service = EmailNotifyService(log, aisvc)
+    speech_service = GroupSpeechService(log)
     try:
         editor_duty_service = EditorDutyService(log)
     except Exception as e:
@@ -166,6 +168,7 @@ async def run_forever():
             email_notify_service=email_notify_service,
             moderation_service=moderation_service,
             editor_duty_service=editor_duty_service,
+            speech_service=speech_service,
         )
     finally:
         await _cleanup_runtime(log, search_bridge, aisvc)
@@ -183,6 +186,7 @@ async def _run_bot_loop(
     email_notify_service,
     moderation_service=None,
     editor_duty_service=None,
+    speech_service=None,
 ):
     global _POST_SYNC_TASK
 
@@ -284,6 +288,12 @@ async def _run_bot_loop(
                     except Exception as e:
                         log.warning(f"编辑值班消息记录失败: {type(e).__name__}")
 
+                async def _observe_speech(data: dict):
+                    try:
+                        await speech_service.observe_event(data)
+                    except Exception as exc:
+                        log.warning(f"群发言统计记录失败: {type(exc).__name__}")
+
                 async def _handle_one_event(ctx, data: dict, text: str):
                     kick_command = parse_kick_command(data, text, ctx)
                     if kick_command is not None:
@@ -382,6 +392,10 @@ async def _run_bot_loop(
                     asyncio.create_task(editor_duty_service.scheduler_loop(api))
                     if editor_duty_service is not None else None
                 )
+                speech_task = (
+                    asyncio.create_task(speech_service.scheduler_loop(api))
+                    if speech_service is not None else None
+                )
 
                 try:
                     async for message in ws:
@@ -404,6 +418,10 @@ async def _run_bot_loop(
                                 api.feed_response(data)
                                 if "post_type" not in data:
                                     continue
+                            if speech_service is not None and str(data.get("group_id")) == str(speech_service.group_id):
+                                speech_observation = asyncio.create_task(_observe_speech(data))
+                                inflight.add(speech_observation)
+                                speech_observation.add_done_callback(lambda t: inflight.discard(t))
                             if _observe_chat_stream(aisvc, vision_skill, data):
                                 continue
 
@@ -459,6 +477,9 @@ async def _run_bot_loop(
                             )
                             continue
                 finally:
+                    if speech_task is not None:
+                        speech_task.cancel()
+                        await asyncio.gather(speech_task, return_exceptions=True)
                     if editor_duty_task is not None:
                         editor_duty_task.cancel()
                         await asyncio.gather(editor_duty_task, return_exceptions=True)
