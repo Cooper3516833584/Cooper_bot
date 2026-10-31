@@ -99,6 +99,23 @@ async def test_full_permissions_and_skill_discovery_are_admin_only(tmp_path, pro
 
 
 @pytest.mark.asyncio
+async def test_admin_runner_inherits_user_environment_and_supports_unicode(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KIMI_TEST_USER_SETTING", "system-python-available")
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    runner = _runner(
+        tmp_path,
+        "import json, os\n"
+        "print(json.dumps({'type': 'assistant', 'content': os.environ['KIMI_TEST_USER_SETTING'] + '\\u4e2d\\u6587\\U0001f383'}, ensure_ascii=False))\n",
+        admin_enabled=True,
+    )
+    runner.settings = replace(runner.settings, admin=replace(runner.settings.admin, name="admin"))
+
+    result = await runner.run(KimiRunRequest("hello", "admin", 2.0, "admin-env-test", "qq_chat"))
+
+    assert result.text == "system-python-available中文🎃"
+
+
+@pytest.mark.asyncio
 async def test_runner_requires_a_final_assistant_message(tmp_path) -> None:
     runner = _runner(tmp_path, "import json\nprint(json.dumps({'type': 'tool_result', 'name': 'WebSearch'}))\n")
 

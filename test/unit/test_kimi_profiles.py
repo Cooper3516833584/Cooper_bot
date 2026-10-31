@@ -140,6 +140,29 @@ def test_child_environment_keeps_only_explicit_system_values(tmp_path) -> None:
     assert "KIMI_CODE_EXPERIMENTAL_FLAG" not in env
 
 
+@pytest.mark.parametrize("encoding", [None, "utf-8", "gbk"])
+def test_admin_environment_inherits_system_and_user_values(tmp_path, encoding) -> None:
+    settings = _settings(tmp_path)
+    source = {
+        "PATH": "C:/system/python;C:/system/bin",
+        "USERPROFILE": "C:/Users/tester",
+        "APPDATA": "C:/Users/tester/AppData/Roaming",
+        "LOCALAPPDATA": "C:/Users/tester/AppData/Local",
+        "ALL_PROXY": "http://127.0.0.1:10808",
+        "TOKEN": "test-only-token",
+        "CUSTOM_SETTING": "",
+        "KIMI_CODE_HOME": "C:/unrelated/home",
+    }
+    if encoding is not None:
+        source["PYTHONIOENCODING"] = encoding
+    original = dict(source)
+
+    env = build_kimi_env(settings.admin, source)
+
+    assert env == dict(source, KIMI_CODE_HOME=str(settings.admin.home), PYTHONIOENCODING=encoding or "utf-8")
+    assert source == original
+
+
 def test_feishu_credentials_are_opt_in_and_public_profile_only(tmp_path):
     settings = _settings(tmp_path)
     fake = {"APP_ID": "cli_TEST1234567890", "APP_SECRET": "TEST_ONLY_SECRET"}

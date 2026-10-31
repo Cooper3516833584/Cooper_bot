@@ -179,13 +179,17 @@ def build_kimi_env(
     *,
     feishu_credentials: Optional[Mapping[str, str]] = None,
 ) -> dict[str, str]:
-    """Build a narrow child environment without inheriting bot credentials."""
+    """Inherit the admin environment while keeping the public profile narrow."""
     source = source_env or {}
-    env = {
-        key: str(source[key])
-        for key in _PROCESS_ENV_KEYS
-        if str(source.get(key) or "").strip()
-    }
+    if profile.name == "admin":
+        env = dict(source)
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+    else:
+        env = {
+            key: str(source[key])
+            for key in _PROCESS_ENV_KEYS
+            if str(source.get(key) or "").strip()
+        }
     env["KIMI_CODE_HOME"] = str(profile.home)
     if profile.name == "public" and feishu_credentials:
         env.update({key: str(feishu_credentials[key]) for key in ("APP_ID", "APP_SECRET")})
