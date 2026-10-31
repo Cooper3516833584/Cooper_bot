@@ -459,8 +459,8 @@ async def test_group_computer_reply_is_private_and_uses_isolated_admin_context(d
     aisvc.computer_ready = True
     perm = Mock()
     perm.get_level.return_value = 3
-    monkeypatch.setattr(commands, "AI_KIMI_ADMIN_ENABLED", True)
-    monkeypatch.setattr(commands, "AI_KIMI_ALLOW_GROUP_COMPUTER", True)
+    monkeypatch.setattr(commands, "ADMIN_USERS", set())
+    monkeypatch.setattr("cooper_bot.core.config.AI_KIMI_ALLOW_GROUP_COMPUTER", False)
 
     handled = await commands._handle_ai_chat_trigger(
         api=SimpleNamespace(),

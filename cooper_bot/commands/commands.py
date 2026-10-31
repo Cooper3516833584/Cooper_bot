@@ -52,8 +52,6 @@ from cooper_bot.core.config import (
     FIND_DIR_LIMIT,
     FIND_FILE_LIMIT,
     AI_BOT_NICK,
-    AI_KIMI_ADMIN_ENABLED,
-    AI_KIMI_ALLOW_GROUP_COMPUTER,
     ANSWER_FILE_PATH,
     KEYWORD_ANSWER_FILE_PATH,
     CONSECUTIVE_REPLY_CONFIG_PATH,
@@ -2142,15 +2140,12 @@ def _split_ai_chat_backend(ai_input: str) -> Tuple[str, str]:
 
 
 def _ai_chat_allows_kimi_computer(ctx, perm=None) -> bool:
-    """Computer access needs both an individually-admin user and enabled scope."""
-    if not AI_KIMI_ADMIN_ENABLED:
-        return False
+    """Select the full profile only for a verified personal administrator."""
     try:
         user_id = int(getattr(ctx, "user_id", 0) or 0)
-        context_level = int(getattr(ctx, "level", 0) or 0)
     except Exception:
         return False
-    if user_id <= 0 or context_level < 3:
+    if user_id <= 0:
         return False
     personal_admin = user_id in ADMIN_USERS
     if not personal_admin and perm is not None:
@@ -2158,10 +2153,7 @@ def _ai_chat_allows_kimi_computer(ctx, perm=None) -> bool:
             personal_admin = int(perm.get_level(user_id)) >= 3
         except Exception:
             personal_admin = False
-    if not personal_admin:
-        return False
-    scene = str(getattr(ctx, "scene", "") or "")
-    return scene != "group" or bool(AI_KIMI_ALLOW_GROUP_COMPUTER)
+    return personal_admin
 
 
 def _memory_identity(ctx, evt: dict, *, allow_computer: bool, perm=None) -> Optional[MemoryIdentity]:
@@ -4556,7 +4548,7 @@ async def _handle_explicit_command(
             "群聊：@Cooper_bot + 内容",
             "私聊：直接发送文本内容",
             "g/c 开头的文字会按原文发送，不再切换聊天后端。",
-            "管理员电脑操作默认仅允许私聊；群内启用须单独配置，并始终私聊回传。",
+            "个人管理员账号在群聊和私聊均使用完整配置；群内触发后的回复私聊回传。",
         ])
         if ctx.level >= 2:
             lines.extend([
