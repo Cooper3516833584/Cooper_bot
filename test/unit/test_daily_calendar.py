@@ -310,19 +310,53 @@ async def test_generate_july_first_deduplicates_web_aliases_and_keeps_hong_kong(
     assert "铭记历史，珍视和平" not in result.message
 
 
-def _web_candidate(**overrides):
+def _web_candidate(*, event_date=date(2026, 8, 19), **overrides):
     event = {
         "name": "公共服务职业纪念日示例",
         "category": "official",
         "fact": "国家正式设立，具有广泛公共服务价值。",
         "source_url": "https://www.gov.cn/example",
         "source_title": "官方日期依据",
-        "date_evidence": "每年同一月日纪念。",
+        "date_evidence": f"每年{event_date.month}月{event_date.day}日纪念。",
         "importance": 3,
         "campus_relevance": 1,
         "selection_reason": "体现公共服务职业价值，不限于本校专业。",
     }
     return {**event, **overrides}
+
+
+@pytest.mark.parametrize("target_day,accepted", [(21, False), (22, True)])
+def test_historical_event_uses_anniversary_date_before_ceremony_date(tmp_path, target_day, accepted):
+    service = _service(tmp_path)
+    target = date(2026, 10, target_day)
+    candidate = _web_candidate(
+        name="中国工农红军长征胜利90周年", category="historical_anniversary",
+        date_evidence="1936年10月三大主力会师；胜利纪念日为10月22日，纪念大会曾于2016年10月21日举行",
+    )
+
+    assert bool(service._validate_web_events({"date": target.isoformat(), "events": [candidate]}, target, {})) is accepted
+
+
+@pytest.mark.parametrize("evidence,accepted", [
+    ("每年8月19日纪念。", True),
+    ("2018年8月19日为首个纪念日。", True),
+    ("2018-08-19为首个纪念日。", True),
+    ("2018/8/19为首个纪念日。", True),
+    ("2018.8.19为首个纪念日。", True),
+    ("每年8月18日纪念。", False),
+    ("每年8月20日纪念。", False),
+    ("每年9月19日纪念。", False),
+    ("2027年8月19日首次举办。", False),
+    ("每年同一月日纪念。", False),
+    ("日期已核验。", False),
+    ("2026年2月30日，另提8月19日。", False),
+])
+def test_web_event_requires_matching_explicit_date(tmp_path, evidence, accepted):
+    service = _service(tmp_path)
+    target = date(2026, 8, 19)
+    raw = {"date": target.isoformat(), "events": [_web_candidate(date_evidence=evidence)]}
+
+    assert bool(service._validate_web_events(raw, target, {})) is accepted
 
 
 @pytest.mark.asyncio
@@ -410,8 +444,8 @@ async def test_solar_festival_cannot_bypass_review_via_local_calendar(tmp_path, 
 def test_candidates_are_filtered_and_ranked_before_final_limit(tmp_path):
     service = _service(tmp_path)
     target = date(2026, 8, 15)
-    candidates = [_web_candidate(name=f"校园选题{i}", importance=2, campus_relevance=2) for i in range(4)]
-    candidates.append(_web_candidate(name="重大历史节点", category="historical_anniversary"))
+    candidates = [_web_candidate(event_date=target, name=f"校园选题{i}", importance=2, campus_relevance=2) for i in range(4)]
+    candidates.append(_web_candidate(event_date=target, name="重大历史节点", category="historical_anniversary"))
     raw = {"date": target.isoformat(), "events": candidates}
 
     events = service._merge_events([], service._validate_web_events(raw, target, {}))
@@ -424,10 +458,10 @@ def test_aliases_share_one_slot_and_keep_stronger_assessment(tmp_path):
     service = _service(tmp_path)
     target = date(2026, 8, 15)
     candidates = [
-        _web_candidate(name="历史事件别名", canonical_name="同一历史事件", importance=2, campus_relevance=2),
-        _web_candidate(name="历史事件规范标题", canonical_name="同一历史事件", category="historical_anniversary"),
-        _web_candidate(name="另一重要事项"),
-        _web_candidate(name="第三项重要事项"),
+        _web_candidate(event_date=target, name="历史事件别名", canonical_name="同一历史事件", importance=2, campus_relevance=2),
+        _web_candidate(event_date=target, name="历史事件规范标题", canonical_name="同一历史事件", category="historical_anniversary"),
+        _web_candidate(event_date=target, name="另一重要事项"),
+        _web_candidate(event_date=target, name="第三项重要事项"),
     ]
     raw = {"date": target.isoformat(), "events": candidates}
 
@@ -452,11 +486,12 @@ async def test_failed_web_lookup_is_retried_after_recovery(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_previous_editorial_policy_cache_is_invalidated(tmp_path):
+@pytest.mark.parametrize("cache_version", [2, 3])
+async def test_previous_editorial_policy_cache_is_invalidated(tmp_path, cache_version):
     service = _service(tmp_path, _CalendarAI(json.dumps({"date": "2026-09-22", "events": []})))
     target = date(2026, 9, 22)
     service._json_save(service._daily_cache_path(target), {
-        "cache_version": 2, "date": target.isoformat(), "snapshot": {},
+        "cache_version": cache_version, "date": target.isoformat(), "snapshot": {},
         "events": [_web_candidate(name="旧策略误选的活动")], "message": "旧缓存", "special": True,
     })
 

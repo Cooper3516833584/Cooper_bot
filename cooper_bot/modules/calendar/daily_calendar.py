@@ -26,7 +26,7 @@ _CQ_RE = re.compile(r"\[CQ:[^\]]+\]", flags=re.IGNORECASE)
 _DATE_RE = re.compile(r"^(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})$")
 _RETRYABLE_WEB_ERROR_MARKERS = ("busy", "capacity", "503", "429", "temporarily", "timeout", "unavailable")
 _VALID_WEB_CATEGORIES = {"traditional", "solar_term", "solar_festival", "official", "national_memorial", "historical_anniversary"}
-_DAILY_CACHE_VERSION = 3
+_DAILY_CACHE_VERSION = 4
 _FIXED_SOLAR_EVENTS: dict[tuple[int, int], list[dict[str, str]]] = {
     (7, 1): [
         {
@@ -307,6 +307,19 @@ class DailyCalendarService:
             self._warning(f"daily calendar web query failed: {str(e)[:180]}")
         return None, False
 
+    @staticmethod
+    def _matches_event_date(evidence: str, target_date: date) -> bool:
+        # 首个明确日期必须属于事件本身，不能用后文的报道或纪念活动日期凑匹配。
+        match = re.search(r"(?<!\d)(?:(\d{4})[年./-])?(\d{1,2})[月./-](\d{1,2})(?!\d)", evidence)
+        if match is None:
+            return False
+        year, month, day = match.groups()
+        try:
+            event_date = date(int(year) if year else target_date.year, int(month), int(day))
+        except ValueError:
+            return False
+        return event_date <= target_date and (event_date.month, event_date.day) == (target_date.month, target_date.day)
+
     def _validate_web_events(self, raw: dict[str, Any], target_date: date, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         if str(raw.get("date") or "").strip() != target_date.isoformat():
             return []
@@ -341,7 +354,7 @@ class DailyCalendarService:
             if category in local_names:
                 if key not in local_names[category]:
                     continue
-            elif not self._is_official_source(source_url) or not fact or not date_evidence:
+            elif not self._is_official_source(source_url) or not fact or not self._matches_event_date(date_evidence, target_date):
                 continue
             if category not in {"traditional", "solar_term"}:
                 if type(importance) is not int or importance not in range(4):
