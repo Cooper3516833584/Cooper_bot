@@ -476,7 +476,8 @@ async def probe_feishu_mcp_tools(profile: KimiProfile, source_env: Optional[Mapp
     async def response_for(request_id: int) -> Optional[dict]:
         assert process.stdout is not None
         while True:
-            line = await asyncio.wait_for(process.stdout.readline(), timeout=8.0)
+            # MCP 冷启动可能接近 8 秒，避免启动抖动使聊天整次运行都被禁用。
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=30.0)
             if not line or len(line) > 1024 * 1024:
                 return None
             try:

@@ -307,13 +307,26 @@ def test_default_and_feishu_examples_match_only_their_feature_modes(tmp_path, mo
 
 
 @pytest.mark.asyncio
-async def test_fake_mcp_initialize_and_tools_list_probe_fails_closed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cold_start", [False, True])
+async def test_fake_mcp_initialize_and_tools_list_probe_fails_closed(tmp_path, monkeypatch, cold_start):
     settings = _enable_feishu(_settings(tmp_path))
     credentials = tmp_path / "credentials.json"
     credentials.write_text('{"app_id":"cli_TEST1234567890","app_secret":"TEST_ONLY_SECRET"}', encoding="utf-8")
     credentials.chmod(0o600)
     monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.config.FEISHU_CREDENTIALS_PATH", credentials)
     import cooper_bot.modules.ai.kimi_cli as kimi_cli
+
+    if cold_start:
+        original_wait_for = asyncio.wait_for
+
+        async def delayed_startup(awaitable, timeout):
+            # 模拟 MCP 首个响应耗时 9 秒，清理进程的等待不受影响。
+            if timeout != 2.0 and timeout < 9.0:
+                awaitable.close()
+                raise asyncio.TimeoutError
+            return await original_wait_for(awaitable, timeout=timeout)
+
+        monkeypatch.setattr(kimi_cli.asyncio, "wait_for", delayed_startup)
 
     class FakeWriter:
         def __init__(self):
