@@ -22,6 +22,7 @@ from cooper_bot.modules.ai.kimi_cli import (
     KimiTimeoutError,
     build_kimi_env,
     detect_kimi_runtime_info,
+    _stop_process,
 )
 
 
@@ -162,12 +163,13 @@ async def test_runner_trims_only_old_chat_history_at_windows_boundary(tmp_path, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ("Bash", "Read", "Write", "Edit", "FetchURL", "Agent"))
-async def test_public_forbidden_tool_discards_reply_and_latches_unhealthy(tmp_path, tool_name) -> None:
+@pytest.mark.parametrize("has_final_answer", [False, True])
+async def test_public_forbidden_tool_discards_reply_and_latches_unhealthy(tmp_path, tool_name, has_final_answer) -> None:
     runner = _runner(
         tmp_path,
         "import json\n"
         f"print(json.dumps({{'type': 'assistant', 'message': {{'role': 'assistant', 'tool_calls': [{{'name': {tool_name!r}}}]}}}}))\n"
-        "print(json.dumps({'type': 'assistant', 'content': 'must not return'}))\n",
+        + ("print(json.dumps({'type': 'assistant', 'content': 'must not return'}))\n" if has_final_answer else ""),
     )
 
     with pytest.raises(KimiSecurityViolation, match="request_id=req-1") as exc_info:
@@ -460,6 +462,102 @@ async def test_stdout_overflow_terminates_child_fast_and_releases_its_slot(tmp_p
     current = asyncio.current_task()
     pending = {task for task in asyncio.all_tasks() if task is not current and task not in tasks_before}
     assert pending == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exited", [False, True])
+async def test_stop_process_bounds_wait_even_when_wait_never_finishes(monkeypatch, exited) -> None:
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli._PROCESS_STOP_TIMEOUT_SECONDS", 0.03)
+
+    class StuckWait:
+        returncode = 0 if exited else None
+        terminated = killed = False
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    started = time.monotonic()
+    process = StuckWait()
+    await asyncio.wait_for(_stop_process(process), timeout=0.5)
+    assert time.monotonic() - started < 0.5
+    assert process.terminated is (not exited)
+    assert process.killed is (not exited)
+
+
+@pytest.mark.asyncio
+async def test_pipe_drain_has_a_total_deadline(monkeypatch) -> None:
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli._PROCESS_STOP_TIMEOUT_SECONDS", 0.03)
+
+    class ContinuousOutput:
+        async def read(self, _size):
+            await asyncio.sleep(0.005)
+            return b"still running"
+
+    await asyncio.wait_for(KimiCliRunner._drain_stream(ContinuousOutput()), timeout=0.5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows process-tree regression")
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_runner_reaps_tool_descendants_and_releases_slot(tmp_path, cancel) -> None:
+    import ctypes
+    import subprocess
+
+    pid_file = tmp_path / "tool.pid"
+    runner = _runner(
+        tmp_path,
+        "import json, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "if sys.argv[-1] == 'follow-up':\n"
+        "    print(json.dumps({'type': 'assistant', 'content': 'ok'}))\n"
+        "else:\n"
+        "    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"    Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+        "    print(json.dumps({'type': 'assistant', 'content': 'already generated'}), flush=True)\n"
+        "    time.sleep(60)\n",
+    )
+    tasks_before = set(asyncio.all_tasks())
+    task = asyncio.create_task(runner.run(_request(timeout_seconds=1.0)))
+    child_pid = None
+    try:
+        if cancel:
+            async def wait_for_child():
+                while not pid_file.exists():
+                    await asyncio.sleep(0.02)
+            await asyncio.wait_for(wait_for_child(), timeout=5.0)
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else KimiTimeoutError):
+            await asyncio.wait_for(task, timeout=10.0)
+        child_pid = int(pid_file.read_text())
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel.OpenProcess(0x00100000, False, child_pid)
+        if handle:
+            try:
+                assert kernel.WaitForSingleObject(handle, 0) == 0, "tool child survived teardown"
+            finally:
+                kernel.CloseHandle(handle)
+        assert runner._processes == set()
+        assert (await runner.run(_request("follow-up"))).text == "ok"
+        await asyncio.sleep(0)
+        assert not {t for t in asyncio.all_tasks() if t not in tasks_before and not t.done()}
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runner.aclose()
+        if pid_file.exists():
+            child_pid = int(pid_file.read_text())
+            subprocess.run(["taskkill", "/PID", str(child_pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW)
 
 
 class _FakeVersionProcess:

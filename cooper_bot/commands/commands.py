@@ -4151,6 +4151,7 @@ async def _handle_ai_chat_trigger(
             except Exception as e:
                 logsvc.log.warning(f"memory turn setup failed: {type(e).__name__}")
                 memory_turn = None
+        reply_delivered = False
         try:
             if memory_turn is not None:
                 async with memory_turn:
@@ -4167,7 +4168,8 @@ async def _handle_ai_chat_trigger(
                     if not await memory_turn.acquire_send_permit():
                         await memory_turn.abort("scope_changed")
                         return True
-                    sent = await reply(api, ctx, out, logsvc, force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None)
+                    sent = await reply(api, ctx, out, logsvc)
+                    reply_delivered = bool(sent)
                     await memory_turn.finish_delivery(bool(sent))
                     _commit_delivered_chat(sent, out)
                     return True
@@ -4200,8 +4202,8 @@ async def _handle_ai_chat_trigger(
                 ctx,
                 out,
                 logsvc,
-                force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None,
             )
+            reply_delivered = bool(sent)
             _commit_delivered_chat(sent, out)
         except Exception as e:
             try:
@@ -4211,13 +4213,15 @@ async def _handle_ai_chat_trigger(
                 )
             except Exception:
                 pass
+            if reply_delivered:
+                await notify_admin_error(api, ctx, f"aichat/{route_backend}/post_delivery", e, logsvc)
+                return True
             fallback_text = aisvc.fallback_error_reply
             fallback_sent = await reply(
                 api,
                 ctx,
                 fallback_text,
                 logsvc,
-                force_private_user_id=ctx.user_id if allow_computer and ctx.scene == "group" else None,
             )
             if fallback_sent is False and ctx.scene == "group":
                 await reply(api, ctx, fallback_text, logsvc, force_private_user_id=ctx.user_id)

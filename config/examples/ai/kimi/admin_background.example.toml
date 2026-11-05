@@ -1,0 +1,6 @@
+# 合并到 AI_KIMI_ADMIN_HOME/config.toml；保留原 provider、模型及认证配置。
+# 若已有 [task] 或 [background]，在原表内更新；[task] 中的同名键优先。
+[background]
+print_background_mode = "exit"
+keep_alive_on_exit = false
+bash_auto_background_on_timeout = false

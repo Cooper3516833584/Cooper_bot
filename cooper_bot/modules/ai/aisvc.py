@@ -440,8 +440,10 @@ class AIService:
                     )
                 )
                 public_websearch_ready = bool(search_result.protocol_observed and "WebSearch" in search_result.tool_names)
-            except KimiCliError:
+            except KimiSecurityViolation:
                 protocol_ok = False
+            except KimiCliError:
+                pass
         if not protocol_ok or not public_forbidden_tools_blocked:
             errors.append("kimi_public_security_probe_failed")
         if not public_websearch_ready:

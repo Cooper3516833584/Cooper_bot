@@ -7,6 +7,8 @@
 例如 `examples/ai/prompts/chat/group_overrides.json.example` 对应 `private/ai/prompts/chat/group_overrides.json`。
 Kimi 默认使用 `public_home_security.example.toml` 和 `public.md.example`（仅 WebSearch）。飞书只读模式使用文件名含 `_feishu` 的独立样例；只有设置 `AI_FEISHU_ENABLED=true` 并完成 MCP/凭证配置后才切换，部署与回滚见飞书说明。
 
+管理员 Kimi 将 `examples/ai/kimi/admin_background.example.toml` 的后台策略合并到 `AI_KIMI_ADMIN_HOME/config.toml`，不要覆盖认证或模型配置。bot 会为管理员子进程固定主轮结束即退出并清理辅助任务；本机配置同时关闭 Bash 超时自动转后台，长任务需显式设置合理 timeout。现有管理员总时限仍为 480 秒，公共 profile 的工具权限策略不变。
+
 | 文件或目录 | 用途 | 修改后生效方式 |
 | --- | --- | --- |
 | `settings.env` | 模型、记忆、视觉、文件收发、保留策略、日历测试目标及诊断设置 | 重启 |

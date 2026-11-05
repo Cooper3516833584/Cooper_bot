@@ -129,7 +129,9 @@ def _patch_settings_validation(monkeypatch, *, public: bool = True, admin: bool 
 
 
 @pytest.mark.asyncio
-async def test_admin_group_response_uses_private_ack_and_independent_commit(monkeypatch):
+@pytest.mark.parametrize("scene", ["group", "private_friend"])
+@pytest.mark.parametrize("memory_enabled", [False, True])
+async def test_admin_response_uses_origin_ack_and_independent_commit(tmp_path, monkeypatch, scene, memory_enabled):
     from cooper_bot.core.onebot import OneBotAPI
     from test.unit.test_onebot_message_context import event
     svc = AIService(_Log());svc.memory = None;svc._kimi_runner = _Runner()
@@ -138,28 +140,53 @@ async def test_admin_group_response_uses_private_ack_and_independent_commit(monk
     _patch_settings_validation(monkeypatch)
     monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_: True)
     monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
-    ctx = SimpleNamespace(scene="group", group_id=20001, user_id=10001, nickname="admin", card="", level=3, _ai_chat_context_aisvc=svc)
-    evt = event(mid="admin-request", message="perform admin task")
+    is_group = scene == "group"
+    session_key = "group:20001" if is_group else "private:10001"
+    ctx = SimpleNamespace(scene=scene, group_id=20001 if is_group else None, user_id=10001, nickname="admin", card="", level=3, _ai_chat_context_aisvc=svc)
+    evt = event(kind="group" if is_group else "private", group=ctx.group_id, mid="admin-request", message="perform admin task")
+    if memory_enabled:
+        monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", {20001})
+        svc.memory = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+        identity = MemoryIdentity(90001, 10001, "group" if is_group else "private", ctx.group_id, "admin", True)
+        await svc.memory.set_enabled(identity, True)
+        svc.memory.turn = AsyncMock(wraps=svc.memory.turn)
+        svc.chat_with_context = AsyncMock(wraps=svc.chat_with_context)
     evt["_chat_ingest_seq"] = svc.observe_onebot_event(evt)
     api = OneBotAPI(None, _Log(), http_base="http://localhost", on_send_confirmed=svc.observe_send_ack)
     api._call_http = AsyncMock(return_value={"status": "ok", "retcode": 0, "data": {"message_id": 501}})
     logsvc = SimpleNamespace(log=Mock(), log_out=Mock())
     assert await commands._handle_ai_chat_trigger(api, ctx, evt, "perform admin task", logsvc, svc, forced_ai_input="perform admin task", message_id="admin-request")
-    api._call_http.assert_awaited_once_with("send_private_msg", {"user_id": 10001, "message": "kimi-reply"}, timeout=6.0)
-    assert [row["role"] for row in svc._load_active_chat_history("group:20001")] == ["user"]
-    assert svc.find_chat_message_by_msg_id("private:10001", "501")["content"] == "kimi-reply"
-    assert [row["role"] for row in svc._load_active_chat_history("admin:10001:group:20001")] == ["user", "assistant"]
-    assert svc._load_active_chat_history("admin:10002:group:20001") == []
+    api._call_http.assert_awaited_once_with(
+        "send_group_msg" if is_group else "send_private_msg",
+        {"group_id" if is_group else "user_id": 20001 if is_group else 10001, "message": "kimi-reply"}, timeout=6.0,
+    )
+    assert [row["role"] for row in svc._load_active_chat_history(session_key)] == ["user", "assistant"]
+    assert svc.find_chat_message_by_msg_id(session_key, "501")["content"] == "kimi-reply"
+    assert svc._load_active_chat_history("private:10001" if is_group else "group:20001") == []
+    assert [row["role"] for row in svc._load_active_chat_history(f"admin:10001:{session_key}")] == ["user", "assistant"]
+    assert svc._load_active_chat_history(f"admin:10002:{session_key}") == []
+    request = svc._kimi_runner.requests[0]
+    payload = json.loads(request.prompt)
+    assert request.profile == "admin"
+    assert payload["trusted_request_context"]["scene"] == ("group" if is_group else "private")
+    assert "按 cooper-admin 完整权限配置执行管理员任务" in payload["system_instructions"]
+    if memory_enabled:
+        svc.memory.turn.assert_awaited_once()
+        assert svc.chat_with_context.await_args.kwargs["memory_turn"].identity.profile == "admin"
+        await svc.memory.aclose()
 
 
 @pytest.mark.asyncio
-async def test_kimi_failure_records_only_actual_fallback_ack(monkeypatch):
+@pytest.mark.parametrize("allow_computer", [False, True])
+async def test_kimi_failure_records_only_actual_fallback_ack(monkeypatch, allow_computer):
     from cooper_bot.core.onebot import OneBotAPI
     from test.unit.test_onebot_message_context import event
     svc = AIService(_Log());svc.memory = None;svc._kimi_runner = _Runner();svc._public_runtime_safe = True
+    svc._kimi_runner.settings.admin_enabled = allow_computer
+    svc._computer_verified = allow_computer
     svc._kimi_runner.run = AsyncMock(side_effect=RuntimeError("test backend failure"))
     _patch_settings_validation(monkeypatch)
-    monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_: False)
+    monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_: allow_computer)
     monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
     monkeypatch.setattr(commands, "notify_admin_error", AsyncMock())
     ctx = SimpleNamespace(scene="group", group_id=20001, user_id=10001, nickname="user", card="", level=1, _ai_chat_context_aisvc=svc)
@@ -171,7 +198,8 @@ async def test_kimi_failure_records_only_actual_fallback_ack(monkeypatch):
     history = svc._load_active_chat_history("group:20001")
     assert [row["role"] for row in history] == ["user", "assistant"]
     assert history[-1]["_msg_id"] == "501" and history[-1]["content"] == svc.fallback_error_reply
-    api._call_http.assert_awaited_once()
+    api._call_http.assert_awaited_once_with("send_group_msg", {"group_id": 20001, "message": svc.fallback_error_reply}, timeout=6.0)
+    assert svc._load_active_chat_history("private:10001") == []
 
 
 @pytest.mark.asyncio

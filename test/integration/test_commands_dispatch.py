@@ -453,7 +453,7 @@ async def test_command_aichat_private_uppercase_c_is_sent_to_kimi_as_plain_text(
 
 
 @pytest.mark.asyncio
-async def test_group_computer_reply_is_private_and_uses_isolated_admin_context(dispatch_harness, monkeypatch) -> None:
+async def test_group_computer_reply_stays_in_group_and_uses_isolated_admin_context(dispatch_harness, monkeypatch) -> None:
     ctx = _make_ctx(scene="group", group_id=20001, level=3, user_id=10001)
     aisvc = _FakeAIService()
     aisvc.computer_ready = True
@@ -477,7 +477,7 @@ async def test_group_computer_reply_is_private_and_uses_isolated_admin_context(d
     aisvc.chat_with_context.assert_awaited_once()
     assert aisvc.chat_with_context.await_args.kwargs["allow_computer"] is True
     assert aisvc.chat_with_context.await_args.kwargs["actor_user_id"] == ctx.user_id
-    assert dispatch_harness.messages[-1]["force_private_user_id"] == ctx.user_id
+    assert dispatch_harness.messages[-1]["force_private_user_id"] is None
 
 
 @pytest.mark.asyncio

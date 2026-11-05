@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tomllib
 from urllib.parse import urlparse
 from dataclasses import dataclass
@@ -55,6 +56,7 @@ _MAX_FEISHU_RESULT_BYTES = 1024 * 1024
 _DEFAULT_QUEUE_TIMEOUT_SECONDS = 8.0
 _DEFAULT_MAX_QUEUE = 12
 _WINDOWS_ARGV_BUDGET = 24000
+_PROCESS_STOP_TIMEOUT_SECONDS = 2.0
 _LEGACY_URP_CALL_RE = re.compile(
     r"<system_urp_calling>\s*<url>(?P<url>[^<]+)</url>\s*<method>GET</method>\s*</system_urp_calling>\s*",
     re.IGNORECASE,
@@ -184,6 +186,9 @@ def build_kimi_env(
     if profile.name == "admin":
         env = dict(source)
         env.setdefault("PYTHONIOENCODING", "utf-8")
+        # QQ requests end with the main turn; auxiliary jobs must not hold the reply.
+        env["KIMI_CODE_BACKGROUND_PRINT_BACKGROUND_MODE"] = "exit"
+        env["KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT"] = "false"
     else:
         env = {
             key: str(source[key])
@@ -593,21 +598,39 @@ def validate_kimi_settings(
 
 
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
-    """Best-effort child teardown: terminate, then kill after a short grace period."""
+    """Bound teardown, including Windows tool descendants that may hold pipes open."""
     if process.returncode is not None:
         return
-    try:
-        process.terminate()
-    except ProcessLookupError:
-        return
-    try:
-        await asyncio.wait_for(process.wait(), timeout=2.0)
-    except TimeoutError:
+    if os.name == "nt" and process.returncode is None and getattr(process, "pid", None):
         try:
-            process.kill()
+            await asyncio.to_thread(
+                subprocess.run,
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_PROCESS_STOP_TIMEOUT_SECONDS,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if process.returncode is None:
+        try:
+            process.terminate()
         except ProcessLookupError:
-            return
-        await process.wait()
+            pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+    except TimeoutError:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
+        except TimeoutError:
+            pass
 
 
 async def detect_kimi_runtime_info(
@@ -937,7 +960,7 @@ class KimiCliRunner:
             raise KimiProtocolError(request_id, "feishu_result_unverifiable")
 
     @classmethod
-    def _parse_jsonl(cls, raw: bytes, request_id: str, *, validate_feishu_results: bool = True) -> tuple[str, tuple[str, ...], bool, bool]:
+    def _parse_jsonl(cls, raw: bytes, request_id: str, *, validate_feishu_results: bool = True, allowed_tools: Optional[tuple[str, ...]] = None) -> tuple[str, tuple[str, ...], bool, bool]:
         try:
             lines = raw.decode("utf-8").splitlines()
         except UnicodeDecodeError as exc:
@@ -961,9 +984,11 @@ class KimiCliRunner:
             event_type = str(event.get("type") or "")
             if event_type in {"error", "failed"}:
                 raise KimiProtocolError(request_id, "terminal_error")
+            names = cls._extract_tool_names(event)
+            if allowed_tools is not None and set(names).difference(allowed_tools):
+                raise KimiSecurityViolation(request_id, "forbidden_tool_observed")
             if cls._has_tool_error(event):
                 raise KimiProtocolError(request_id, "tool_error")
-            names = cls._extract_tool_names(event)
             if cls._has_unrecognized_assistant_tool_schema(event, names):
                 raise KimiProtocolError(request_id, "unrecognized_tool_schema")
             if names:
@@ -990,9 +1015,14 @@ class KimiCliRunner:
                         cls._validate_feishu_result(tool, message, request_id)
                         completed_feishu.add(str(call_id))
             text = cls._extract_assistant_text(event)
+            message = event.get("message") if isinstance(event.get("message"), dict) else event
+            if names or str(message.get("role") or event_type) in {"tool", "tool_call", "tool_result", "tool_message"}:
+                final_text = ""
             if text is not None:
                 protocol_seen = True
-                if text:
+                # Kimi 0.34 may combine its legacy search marker and final text.
+                legacy_answer = not calls and bool(names) and isinstance(message.get("content"), str) and "<system_urp_calling>" in message["content"]
+                if not names or legacy_answer:
                     final_text = text
             elif event_type in {"tool_call", "tool", "tool_result", "tool_message", "usage", "done"}:
                 protocol_seen = True
@@ -1011,9 +1041,12 @@ class KimiCliRunner:
     @staticmethod
     async def _drain_stream(stream: asyncio.StreamReader) -> None:
         """Read a terminated child's pipe to EOF so its transport can close."""
+        async def drain() -> None:
+            while await stream.read(65536):
+                pass
+
         try:
-            while await asyncio.wait_for(stream.read(65536), timeout=2.0):
-                continue
+            await asyncio.wait_for(drain(), timeout=_PROCESS_STOP_TIMEOUT_SECONDS)
         except (TimeoutError, OSError):
             pass
 
@@ -1028,9 +1061,11 @@ class KimiCliRunner:
             if not task.done():
                 task.cancel()
         await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                await self._drain_stream(stream)
+        await asyncio.gather(*(self._drain_stream(stream) for stream in (process.stdout, process.stderr) if stream is not None))
+        # An exited parent can leave inherited pipe handles in detached descendants.
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
 
     async def run(self, request: KimiRunRequest) -> KimiRunResult:
         if self._closing:
@@ -1083,13 +1118,11 @@ class KimiCliRunner:
                         break
             if failure is not None:
                 await self._stop_process(process)
-                await self._reap_readers(process, stdout_task, stderr_task)
                 if isinstance(failure, KimiProtocolError) and failure.detail == "stdout_limit":
                     raise KimiProtocolError(request.request_id, "stdout_limit") from failure
                 raise failure
             if stdout_task not in done or stderr_task not in done:
                 await self._stop_process(process)
-                await self._reap_readers(process, stdout_task, stderr_task)
                 raise KimiTimeoutError(request.request_id)
             stdout = await stdout_task
             await stderr_task
@@ -1099,6 +1132,7 @@ class KimiCliRunner:
                 stdout,
                 request.request_id,
                 validate_feishu_results=request.profile == "public" and profile.feishu_enabled,
+                allowed_tools=profile.tools if request.profile == "public" else None,
             )
             result = KimiRunResult(text, request.request_id, int(process.returncode), tools, tool_seen, protocol_seen)
             if request.profile == "public":
@@ -1108,11 +1142,17 @@ class KimiCliRunner:
                     self._public_security_healthy = False
                     raise KimiSecurityViolation(request.request_id, "forbidden_tool_observed")
             return result
+        except KimiSecurityViolation:
+            if request.profile == "public":
+                self._public_security_healthy = False
+            raise
         except asyncio.CancelledError:
             if process is not None:
                 await self._stop_process(process)
             raise
         finally:
+            if process is not None and stdout_task is not None and stderr_task is not None:
+                await self._reap_readers(process, stdout_task, stderr_task)
             for task in (stdout_task, stderr_task, wait_task):
                 if task is not None and not task.done():
                     task.cancel()

@@ -152,6 +152,8 @@ def test_admin_environment_inherits_system_and_user_values(tmp_path, encoding) -
         "TOKEN": "test-only-token",
         "CUSTOM_SETTING": "",
         "KIMI_CODE_HOME": "C:/unrelated/home",
+        "KIMI_CODE_BACKGROUND_PRINT_BACKGROUND_MODE": "steer",
+        "KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT": "true",
     }
     if encoding is not None:
         source["PYTHONIOENCODING"] = encoding
@@ -159,7 +161,10 @@ def test_admin_environment_inherits_system_and_user_values(tmp_path, encoding) -
 
     env = build_kimi_env(settings.admin, source)
 
-    assert env == dict(source, KIMI_CODE_HOME=str(settings.admin.home), PYTHONIOENCODING=encoding or "utf-8")
+    assert env == dict(
+        source, KIMI_CODE_HOME=str(settings.admin.home), PYTHONIOENCODING=encoding or "utf-8",
+        KIMI_CODE_BACKGROUND_PRINT_BACKGROUND_MODE="exit", KIMI_CODE_BACKGROUND_KEEP_ALIVE_ON_EXIT="false",
+    )
     assert source == original
 
 
