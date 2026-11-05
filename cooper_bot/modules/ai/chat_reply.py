@@ -68,7 +68,9 @@ async def recent_context(api, evt, aisvc, identity, session_key, cutoff):
             continue
         allowed[mid] = True
         checked.append(item)
-    return list(reversed(checked))[-getattr(aisvc, "_CHAT_CONTEXT_MAX_MESSAGES", 300):]
+    ordered = sorted(reversed(checked), key=lambda item: float(item.get("_history_time") or item.get("_event_time") or 0))
+    limit = max(0, int(getattr(aisvc, "_CHAT_CONTEXT_MAX_MESSAGES", 300)))
+    return ordered[-limit:] if limit else []
 
 
 def render_reply(text, *, group, speakers):

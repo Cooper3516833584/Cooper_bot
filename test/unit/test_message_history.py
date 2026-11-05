@@ -104,8 +104,54 @@ async def test_failure_and_timeout_leave_chat_available():
     client = SimpleNamespace(call=AsyncMock(side_effect=TimeoutError))
     service = MessageHistoryService()
     assert await service.context(client, event(10, 1000), max_messages=20, ttl_seconds=20) == []
+    service.on_connect()
     client.call = AsyncMock(return_value={"status": "failed", "retcode": 1})
     assert await service.context(client, event(10, 1000), max_messages=20, ttl_seconds=20) == []
+
+
+@pytest.mark.parametrize("failure", [TimeoutError, OSError])
+async def test_history_failure_backs_off_and_retries_after_expiry(monkeypatch, failure):
+    clock = [100.0]
+    monkeypatch.setattr("cooper_bot.modules.history.historysvc.time", SimpleNamespace(time=lambda: 1000, monotonic=lambda: clock[0]))
+    service = MessageHistoryService()
+    client = SimpleNamespace(call=AsyncMock(side_effect=failure))
+    for _ in range(3):
+        assert await service.context(client, event(10, 1000), max_messages=20, ttl_seconds=20) == []
+    assert client.call.await_count == 1
+    clock[0] += 16
+    client.call = api([event(1, 990)], []).call
+    assert (await service.context(client, event(11, 1000), max_messages=20, ttl_seconds=20))[0]["message_id"] == 1
+
+
+async def test_outer_history_deadline_is_cached_and_reconnect_allows_retry(monkeypatch):
+    service = MessageHistoryService()
+    await service._load_fences()
+    monkeypatch.setattr(service, "_CONTEXT_TIMEOUT_SECONDS", 0.1)
+    async def stalled(*args, **kwargs):
+        await asyncio.Event().wait()
+    client = SimpleNamespace(call=AsyncMock(side_effect=stalled))
+    for _ in range(3):
+        assert await service.context(client, event(10, 1000), max_messages=20, ttl_seconds=20) == []
+    assert client.call.await_count == 1
+    service.on_connect()
+    client.call = api([event(1, 990)], []).call
+    assert (await service.context(client, event(11, 1000), max_messages=20, ttl_seconds=20))[0]["message_id"] == 1
+
+
+async def test_cancelled_history_request_does_not_create_failure_cache():
+    service = MessageHistoryService()
+    started = asyncio.Event()
+    async def stalled(*args, **kwargs):
+        started.set()
+        await asyncio.Event().wait()
+    client = SimpleNamespace(call=AsyncMock(side_effect=stalled))
+    task = asyncio.create_task(service.context(client, event(10, 1000), max_messages=20, ttl_seconds=20))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    client.call = api([event(1, 990)], []).call
+    assert (await service.context(client, event(11, 1000), max_messages=20, ttl_seconds=20))[0]["message_id"] == 1
 
 
 async def test_clear_boundary_survives_restart_and_does_not_store_bodies(tmp_path, monkeypatch):

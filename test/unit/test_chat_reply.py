@@ -26,7 +26,7 @@ async def test_recent_context_combines_recovery_and_live_without_replaying_comma
            "message_id": "old", "message": "/dangerous old command"}
     history = SimpleNamespace(context=AsyncMock(return_value=[old]),
                               filter_context=AsyncMock(side_effect=lambda identity, rows: rows))
-    live = {"role": "user", "content": "latest", "_msg_id": "live", "_speaker": {"user_id": 11}, "_ingest_seq": 2}
+    live = {"role": "user", "content": "latest", "_msg_id": "live", "_speaker": {"user_id": 11}, "_ingest_seq": 2, "_event_time": 995}
     svc = SimpleNamespace(message_history=history, _CHAT_CONTEXT_MAX_MESSAGES=300, _CHAT_CONTEXT_TTL_SECONDS=1800,
                           _load_active_chat_history=lambda key: [live], memory=None)
     current = dict(old, message_id="current")
@@ -34,6 +34,22 @@ async def test_recent_context_combines_recovery_and_live_without_replaying_comma
     assert [row["_msg_id"] for row in rows] == ["old", "live"]
     assert rows[0]["content"] == "/dangerous old command"
     assert not hasattr(history, "dispatch")
+
+
+async def test_reconnect_keeps_newest_messages_across_recovery_and_live_cache():
+    live = [{"role": "user", "content": "live", "_msg_id": str(i), "_speaker": {"user_id": 10},
+             "_event_time": 100 + i, "_ingest_seq": i} for i in range(1, 300)]
+    recovered = [{"post_type": "message", "message_type": "group", "self_id": 90, "group_id": 20,
+                  "user_id": 10, "sender": {"user_id": 10}, "time": 100 + i,
+                  "message_id": str(i), "message": "recovered"} for i in range(200, 500)]
+    history = SimpleNamespace(context=AsyncMock(return_value=recovered),
+                              filter_context=AsyncMock(side_effect=lambda identity, rows: rows))
+    svc = SimpleNamespace(message_history=history, _CHAT_CONTEXT_MAX_MESSAGES=300, _CHAT_CONTEXT_TTL_SECONDS=1800,
+                          _load_active_chat_history=lambda key: live, memory=None)
+    rows = await recent_context(None, {"message_id": "500"}, svc, None, "group:20", 500)
+    assert [row["_msg_id"] for row in rows] == [str(i) for i in range(200, 500)]
+    assert rows[0]["content"] == "live"
+    assert sum(row["content"] == "recovered" for row in rows) == 200
 
 
 async def test_member_opt_out_filters_recovered_and_live_context():

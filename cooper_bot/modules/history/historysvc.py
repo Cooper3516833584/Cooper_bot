@@ -20,6 +20,8 @@ class HistoryResult:
 class MessageHistoryService:
     """Fetch history without dispatching messages or persisting their contents."""
 
+    _CONTEXT_TIMEOUT_SECONDS = 8.0
+
     def __init__(self, *, state_path=None):
         self._locks = {}
         self._contexts = OrderedDict()
@@ -206,12 +208,16 @@ class MessageHistoryService:
             return []
         key = (bot, scene, target, actor_id)
         lock = self._context_locks.setdefault(key, asyncio.Lock())
+        generation = self._generation
         async def retrieve():
             async with lock:
                 return await self._context(api, evt, max_messages=max_messages, ttl_seconds=ttl_seconds, actor_id=actor_id)
         try:
-            return await asyncio.wait_for(retrieve(), timeout=8.0)
+            return await asyncio.wait_for(retrieve(), timeout=self._CONTEXT_TIMEOUT_SECONDS)
         except TimeoutError:
+            cached = self._contexts.get(key)
+            if generation == self._generation and (not cached or cached[0] <= time.monotonic()):
+                self._cache_context(key, 0, [], 15)
             return []
 
     async def _context(self, api, evt, *, max_messages, ttl_seconds, actor_id=None):
@@ -241,14 +247,18 @@ class MessageHistoryService:
         try:
             result = await asyncio.wait_for(self.fetch(
                 api, scene=scene, target_id=target, lower=lower, upper=upper,
-                limit=limit, bot_id=bot, max_pages=20), timeout=8.0)
+                limit=limit, bot_id=bot, max_pages=20), timeout=self._CONTEXT_TIMEOUT_SECONDS)
         except (TimeoutError, OSError):
-            return []
+            result = HistoryResult(False)
         if generation != self._generation:
             return []
         rows = list(result.messages)
         # Retry incomplete/failed retrieval sooner; contents remain memory-only.
-        self._contexts[key] = (time.monotonic() + (300 if result.complete or len(rows) == limit else 15), upper, rows)
+        self._cache_context(key, upper, rows, 300 if result.complete or len(rows) == limit else 15)
+        return rows
+
+    def _cache_context(self, key, upper, rows, seconds):
+        self._contexts[key] = (time.monotonic() + seconds, upper, rows)
         self._contexts.move_to_end(key)
         while len(self._contexts) > 128:
             self._contexts.popitem(last=False)
@@ -256,4 +266,3 @@ class MessageHistoryService:
             self._locks = {key: lock for key, lock in self._locks.items() if lock.locked()}
         if len(self._context_locks) > 256:
             self._context_locks = {key: lock for key, lock in self._context_locks.items() if lock.locked()}
-        return rows

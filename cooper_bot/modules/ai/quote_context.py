@@ -22,8 +22,8 @@ async def message_allowed(aisvc, item, *, memory_turn=None, identity=None):
     if identity is not None:
         selector = getattr(service, "_identity_scope", None)
         if callable(selector):
-            # Quotes originate in the ordinary QQ conversation, even for an admin task.
-            source_identity = replace(identity, profile="public") if is_dataclass(identity) else identity
+            # Group messages use shared member policy; private chats keep their actual profile.
+            source_identity = replace(identity, profile="public") if is_dataclass(identity) and identity.scene == "group" else identity
             try:
                 scope = selector(source_identity)
                 if scope and not getattr(service, "_started", False):

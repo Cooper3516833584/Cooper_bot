@@ -33,6 +33,53 @@ class _Runner:
 
 
 @pytest.mark.asyncio
+async def test_private_admin_opt_out_filters_restored_context_before_model(tmp_path, monkeypatch):
+    from cooper_bot.commands.memory_commands import handle_memory_command
+    from cooper_bot.modules.ai.chat_reply import recent_context
+    from cooper_bot.modules.ai.message_context import normalize_onebot_event
+    from cooper_bot.modules.history.historysvc import MessageHistoryService
+
+    clock = [1000]
+    monkeypatch.setattr("time.time", lambda: clock[0])
+    identity = MemoryIdentity(90001, 10001, "private", None, "admin", True, True)
+    svc = AIService(_Log())
+    svc.memory = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    svc.message_history = MessageHistoryService()
+    svc._kimi_runner = _Runner()
+    svc._kimi_runner.settings.admin_enabled = True
+    svc._computer_verified = True
+    _patch_settings_validation(monkeypatch)
+    try:
+        await svc.memory.set_enabled(identity, True)
+        await svc.memory.set_member_enabled(identity, True)
+        await handle_memory_command(svc.memory, identity, "/memory off", reset_context=svc.message_history.forget_context)
+        clock[0] = 1002
+        old = {"post_type": "message", "message_type": "private", "self_id": 90001, "user_id": 10001,
+               "sender": {"user_id": 10001}, "time": 1001, "message_id": "after-off", "message": "private history"}
+        current = dict(old, time=1002, message_id="current")
+        api = SimpleNamespace(call=AsyncMock(side_effect=[
+            {"status": "ok", "retcode": 0, "data": {"messages": [old]}},
+            {"status": "ok", "retcode": 0, "data": {"messages": []}}]))
+        assert await recent_context(api, current, svc, identity, "private:10001", None) == []
+        # Recheck permission even if recovery was prepared before the opt-out.
+        row = dict(normalize_onebot_event(old)[1], _history_time=1001)
+        await svc.kimi_chat_with_context("private:10001", "current request", allow_computer=True, actor_user_id=10001,
+                                        recent_context=[row], context_identity=identity, defer_history=True)
+        payload = json.loads(svc._kimi_runner.requests[-1].prompt)
+        assert not payload.get("recent_conversation")
+        assert payload["latest_user_request"] == "current request"
+        assert not (await svc.memory.status(identity))["member_enabled"]
+        await handle_memory_command(svc.memory, identity, "/memory on", reset_context=svc.message_history.forget_context)
+        clock[0] = 1004
+        row = dict(row, _history_time=1003, _msg_id="after-on")
+        await svc.kimi_chat_with_context("private:10001", "next request", allow_computer=True, actor_user_id=10001,
+                                        recent_context=[row], context_identity=identity, defer_history=True)
+        assert json.loads(svc._kimi_runner.requests[-1].prompt)["recent_conversation"][0]["message_id"] == "after-on"
+    finally:
+        await svc.memory.aclose()
+
+
+@pytest.mark.asyncio
 async def test_admin_chat_keeps_persona_and_shares_the_existing_context_budget(monkeypatch):
     svc = AIService(_Log())
     svc.memory = None
@@ -77,6 +124,7 @@ async def test_full_admin_history_does_not_crowd_out_newer_group_context(monkeyp
     payload = json.loads(svc._kimi_runner.requests[0].prompt)
     assert len(payload["conversation_history"]) + len(payload["recent_conversation"]) == 4
     assert payload["recent_conversation"][0]["message_id"] == "latest-group-message"
+    assert payload["recent_conversation"][0]["time"] > payload["conversation_history"][-1]["time"]
 
 
 @pytest.mark.asyncio

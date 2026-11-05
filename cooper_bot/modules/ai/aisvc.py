@@ -547,6 +547,7 @@ class AIService:
     def _build_kimi_prompt(self, base_key: str, history: List[Dict[str, str]], current: str, *, purpose: str, memory_context: Optional[dict] = None, speaker: Optional[dict] = None, reply_to: str = "", allow_computer: bool = False, actor_user_id: Optional[int] = None, quoted_message: Optional[dict] = None, recent_context: Optional[list] = None) -> str:
         messages = self._materialize_history_for_model(history)
         for source, message in zip(history, messages):
+            message["time"] = source.get("_history_time") or source.get("_event_time") or 0
             message["speaker"] = {"name": self.bot_nick, "is_bot": True} if message["role"] == "assistant" else source.get("_speaker", {"is_bot": False})
             if source.get("_msg_id"):
                 message["message_id"] = source["_msg_id"]
@@ -607,6 +608,7 @@ class AIService:
     def _build_recent_conversation(self, rows):
         messages = self._materialize_history_for_model(rows)
         for source, message in zip(rows, messages):
+            message["time"] = source.get("_history_time") or source.get("_event_time") or 0
             message["speaker"] = source.get("_speaker", {"is_bot": message["role"] == "assistant"})
             if source.get("_msg_id"):
                 message["message_id"] = source["_msg_id"]

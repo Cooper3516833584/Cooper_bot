@@ -156,6 +156,22 @@ def test_windows_budget_trims_recovered_context_without_changing_current_request
     assert sent["quoted_message"] == payload["quoted_message"]
 
 
+@pytest.mark.parametrize("recent_newest", [True, False])
+def test_windows_budget_removes_oldest_across_both_histories(tmp_path, monkeypatch, recent_newest):
+    runner = _runner(tmp_path, "", argv_budget=2400)
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.os.name", "nt")
+    rows = [{"role": "user", "content": "x" * 300, "message_id": str(i), "time": i} for i in range(1, 11)]
+    payload = {"conversation_history": rows[::2] if recent_newest else rows[1::2],
+               "recent_conversation": rows[1::2] if recent_newest else rows[::2],
+               "latest_user_request": "current", "quoted_message": {"content": "quote"}}
+    sent = json.loads(runner._build_argv(_request(json.dumps(payload)), runner.settings.public)[-1])
+    remaining = sorted(row["time"] for row in sent["conversation_history"] + sent["recent_conversation"])
+    assert 0 < len(remaining) < 10
+    assert remaining == list(range(11 - len(remaining), 11))
+    assert sent["latest_user_request"] == "current"
+    assert sent["quoted_message"] == payload["quoted_message"]
+
+
 @pytest.mark.asyncio
 async def test_runner_trims_only_old_chat_history_at_windows_boundary(tmp_path, monkeypatch) -> None:
     runner = _runner(tmp_path, "import json, sys\nprint(json.dumps({'type': 'assistant', 'content': sys.argv[-1]}))\n", argv_budget=2400)
