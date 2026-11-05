@@ -13,6 +13,7 @@ from cooper_bot.core.config import (
     HTTP_TOKEN,
     CLIENT_LOCK_PATH,
     LOG_DIR,
+    STATE_DIR,
     PERM_DB_PATH,
     AUTO_APPROVE_FRIEND_REQUEST,
     AUTO_APPROVE_FRIEND_REMARK,
@@ -29,6 +30,7 @@ from cooper_bot.modules.ai.search_bridge import start_kimi_search_bridge
 from cooper_bot.modules.calendar.daily_calendar import DailyCalendarService
 from cooper_bot.modules.calendar.editor_duty import EditorDutyService
 from cooper_bot.modules.calendar.group_speech import GroupSpeechService
+from cooper_bot.modules.history.historysvc import MessageHistoryService
 from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
 from cooper_bot.modules.moderation.service import ModerationService
@@ -146,7 +148,9 @@ async def run_forever():
         log.warning(f"反广告审核服务初始化失败，将保持关闭: {e}")
     calendar_service = DailyCalendarService(log, aisvc)
     email_notify_service = EmailNotifyService(log, aisvc)
-    speech_service = GroupSpeechService(log)
+    history_service = MessageHistoryService(state_path=STATE_DIR / "context_history_state.json")
+    aisvc.message_history = history_service
+    speech_service = GroupSpeechService(log, history_service=history_service)
     try:
         editor_duty_service = EditorDutyService(log)
     except Exception as e:
@@ -256,6 +260,9 @@ async def _run_bot_loop(
             ) as ws:
                 # action 走 HTTP，WS 仅收事件（可显著减少超时/卡顿/误报失败）
                 api = OneBotAPI(ws, log, http_base=HTTP_BASE, http_token=HTTP_TOKEN, on_send_confirmed=getattr(aisvc, "observe_send_ack", None))
+                history_service = getattr(aisvc, "message_history", None)
+                if history_service is not None:
+                    history_service.on_connect()
                 logsvc = LogService(LOG_DIR, log)
                 dispatch_sem = asyncio.Semaphore(MAX_DISPATCH_CONCURRENCY)
                 conv_locks: Dict[str, asyncio.Lock] = {}
@@ -413,6 +420,9 @@ async def _run_bot_loop(
                             if not isinstance(data, dict):
                                 log.warning(f"WS message ignored: expected JSON object, got {type(data).__name__}")
                                 continue
+
+                            if history_service is not None:
+                                history_service.observe_status(data)
 
                             if "echo" in data:
                                 api.feed_response(data)

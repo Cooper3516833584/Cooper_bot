@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from cooper_bot.core import config
+from cooper_bot.modules.history.historysvc import MessageHistoryService
 
 
 GROUP_ID = 798977395
@@ -33,10 +34,11 @@ class GroupSpeechService:
 
     group_id = GROUP_ID
 
-    def __init__(self, log, *, db_path=None, admins=None):
+    def __init__(self, log, *, db_path=None, admins=None, history_service=None):
         self.log = log
         self.db_path = Path(db_path) if db_path is not None else config.DATABASES_DIR / "group_speech.sqlite3"
         self.admins = admins
+        self.history = history_service if history_service is not None else MessageHistoryService()
         self._db_lock = asyncio.Lock()
         self._check_lock = asyncio.Lock()
         self._next_sync = 0
@@ -94,42 +96,17 @@ class GroupSpeechService:
             await self._insert([row])
 
     async def _backfill(self, api, lower, upper):
-        cursor = None
-        seen = set()
-        for _ in range(2000):
-            params = {"group_id": GROUP_ID, "count": 100, "reverseOrder": True}
-            if cursor is not None:
-                params["message_seq"] = cursor
-            payload = response_data(await api.call("get_group_msg_history", params))
-            messages = payload.get("messages") if isinstance(payload, dict) else None
-            if not isinstance(messages, list):
-                return False
-            if not messages:
-                return True
-            rows = []
-            for evt in messages:
-                if not isinstance(evt, dict):
-                    return False
-                row = self._row(evt)
-                if row is None:
-                    return False
-                rows.append(row)
-            await self._insert([row for row in rows if lower <= row[2] < upper])
-            if min(row[2] for row in rows) < lower:
-                return True
-            # NapCat includes the anchor itself when no older history is available.
-            if len(rows) == 1 and cursor is not None and rows[0][0] == str(cursor):
-                def record_floor(c):
-                    if c.execute("SELECT 1 FROM meta WHERE key='coverage'").fetchone() is None:
-                        c.execute("INSERT OR IGNORE INTO meta VALUES('history_floor',?)", (rows[0][2],))
-                await self._db(record_floor)
-                return True
-            earliest = min(range(len(rows)), key=lambda i: rows[i][2])
-            cursor = messages[earliest]["message_id"]
-            if str(cursor) in seen:
-                return False
-            seen.add(str(cursor))
-        return False
+        async def insert_page(events):
+            await self._insert([self._row(evt) for evt in events])
+
+        result = await self.history.fetch(api, scene="group", target_id=GROUP_ID,
+                                          lower=lower, upper=upper, on_page=insert_page)
+        if result.complete and result.floor is not None:
+            def record_floor(c):
+                if c.execute("SELECT 1 FROM meta WHERE key='coverage'").fetchone() is None:
+                    c.execute("INSERT OR IGNORE INTO meta VALUES('history_floor',?)", (result.floor,))
+            await self._db(record_floor)
+        return result.complete
 
     async def _chunks(self, api, end):
         stored = await self._db(lambda c: c.execute("SELECT chunks FROM reports WHERE end_ts=?", (end,)).fetchone())

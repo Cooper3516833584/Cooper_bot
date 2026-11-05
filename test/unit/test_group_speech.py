@@ -61,6 +61,17 @@ async def test_paginated_backfill_restarts_without_double_count(tmp_path, servic
     mock.send_private_msg.assert_not_awaited()
 
 
+async def test_statistics_uses_injected_shared_history_component(tmp_path):
+    from cooper_bot.modules.history.historysvc import HistoryResult
+    shared = SimpleNamespace(fetch=AsyncMock(return_value=HistoryResult(True)))
+    service = GroupSpeechService(SimpleNamespace(warning=Mock()), db_path=tmp_path / "speech.sqlite3", admins=[900], history_service=shared)
+    assert await service._backfill(SimpleNamespace(), 100, 200)
+    arguments = shared.fetch.await_args.kwargs
+    assert arguments["scene"] == "group" and arguments["target_id"] == GROUP_ID
+    await arguments["on_page"]([event(1, 150)])
+    assert await service._db(lambda c: c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]) == 1
+
+
 async def test_report_zero_members_threshold_and_end_exclusion(service):
     now = datetime(2026, 11, 1, 22, tzinfo=TZ)
     end = int(now.timestamp())

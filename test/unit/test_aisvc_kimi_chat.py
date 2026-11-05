@@ -33,6 +33,120 @@ class _Runner:
 
 
 @pytest.mark.asyncio
+async def test_admin_chat_keeps_persona_and_shares_the_existing_context_budget(monkeypatch):
+    svc = AIService(_Log())
+    svc.memory = None
+    svc._kimi_runner = _Runner()
+    svc._kimi_runner.settings.admin_enabled = True
+    svc._computer_verified = True
+    svc._CHAT_CONTEXT_MAX_MESSAGES = 5
+    _patch_settings_validation(monkeypatch)
+    monkeypatch.setattr(svc, "_select_chat_system_prompt", lambda key: "群聊人设")
+    svc._save_chat_turn("admin:10001:group:20001", "old-task", "old-result")
+    recent = [{"role": "user", "content": str(i), "_msg_id": str(i),
+               "_speaker": {"user_id": 20002, "nickname": "学渣"}} for i in range(10)]
+    await svc.kimi_chat_with_context("group:20001", "回学渣一句不用谢", allow_computer=True,
+                                     actor_user_id=10001, recent_context=recent, defer_history=True)
+    payload = json.loads(svc._kimi_runner.requests[0].prompt)
+    assert payload["system_instructions"] == "群聊人设"
+    assert len(payload["conversation_history"]) + len(payload["recent_conversation"]) == 5
+    assert payload["recent_conversation"][-1]["speaker"]["user_id"] == 20002
+    assert "统一发送" in payload["reply_contract"]
+    assert svc._kimi_runner.requests[0].profile == "admin"
+    assert all("学渣" not in json.dumps(row, ensure_ascii=False) for row in svc._load_active_chat_history("admin:10001:group:20001"))
+
+
+@pytest.mark.asyncio
+async def test_full_admin_history_does_not_crowd_out_newer_group_context(monkeypatch):
+    import time
+    svc = AIService(_Log())
+    svc.memory = None
+    svc._kimi_runner = _Runner()
+    svc._kimi_runner.settings.admin_enabled = True
+    svc._computer_verified = True
+    svc._CHAT_CONTEXT_MAX_MESSAGES = 4
+    _patch_settings_validation(monkeypatch)
+    for i in range(2):
+        svc._save_chat_turn("admin:10001:group:20001", f"old-{i}", "result")
+    for row in svc._chat_sessions["admin:10001:group:20001"]["messages"]:
+        row["_event_time"] = time.time() - 60
+    recent = [{"role": "user", "content": "我谢谢你", "_msg_id": "latest-group-message",
+               "_speaker": {"user_id": 20002, "nickname": "学渣"}, "_history_time": time.time()-1}]
+    await svc.kimi_chat_with_context("group:20001", "回学渣一句不用谢", allow_computer=True,
+                                     actor_user_id=10001, recent_context=recent, defer_history=True)
+    payload = json.loads(svc._kimi_runner.requests[0].prompt)
+    assert len(payload["conversation_history"]) + len(payload["recent_conversation"]) == 4
+    assert payload["recent_conversation"][0]["message_id"] == "latest-group-message"
+
+
+@pytest.mark.asyncio
+async def test_structured_mention_uses_existing_single_reply_delivery(monkeypatch):
+    svc = AIService(_Log())
+    svc.memory = None
+    svc._kimi_runner = _Runner()
+    svc._kimi_runner.settings.admin_enabled = True
+    svc._computer_verified = True
+    _patch_settings_validation(monkeypatch)
+    monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_: True)
+    monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
+    reply = AsyncMock(return_value=True)
+    monkeypatch.setattr(commands, "reply", reply)
+    svc._kimi_runner.run = AsyncMock(return_value=SimpleNamespace(text='{"qq_reply":{"text":"不用谢","at":[20002]}}'))
+    ctx = SimpleNamespace(scene="group", group_id=20001, user_id=10001, nickname="admin", card="")
+    event = {"self_id": 90001, "message_id": "request", "message": [{"type": "at", "data": {"qq": "20002"}}]}
+    assert await commands._handle_ai_chat_trigger(SimpleNamespace(), ctx, event, "回复不用谢", SimpleNamespace(log=Mock()), svc, forced_ai_input="回复不用谢", message_id="request")
+    reply.assert_awaited_once()
+    assert reply.await_args.args[2] == "[CQ:at,qq=20002] 不用谢"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scene", ["group", "private"])
+async def test_fresh_service_restores_aichat_context_and_sends_one_reply(tmp_path, monkeypatch, scene):
+    from cooper_bot.modules.history.historysvc import MessageHistoryService
+    from test.unit.test_onebot_message_context import event
+    import time
+
+    bot, actor, group = 90001, 10001, 20001
+    identity = MemoryIdentity(bot, actor, scene, group if scene == "group" else None, "admin", True)
+    path = tmp_path / "metadata.json"
+    previous = MessageHistoryService(state_path=path)
+    await previous.record_delivery(identity, "old-bot")
+    svc = AIService(_Log())
+    svc.memory = None
+    svc.message_history = MessageHistoryService(state_path=path)
+    svc._kimi_runner = _Runner()
+    svc._kimi_runner.settings.admin_enabled = True
+    svc._computer_verified = True
+    _patch_settings_validation(monkeypatch)
+    monkeypatch.setattr(commands, "_ai_chat_allows_kimi_computer", lambda *_: True)
+    monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
+    reply = AsyncMock(return_value=True)
+    monkeypatch.setattr(commands, "reply", reply)
+    now = int(time.time())
+    old = event(kind=scene, user=20002 if scene == "group" else actor, group=group if scene == "group" else None,
+                mid="old-user", message="我谢谢你", time=now-20, sender={"nickname": "学渣"})
+    old_bot = event(kind=scene, user=bot, group=group if scene == "group" else None,
+                    mid="old-bot", message="之前的回复", time=now-10)
+    current = event(kind=scene, user=actor, group=group if scene == "group" else None,
+                    mid="current", message="回学渣一句不用谢", time=now)
+    client = SimpleNamespace(call=AsyncMock(side_effect=[{"status": "ok", "retcode": 0, "data": {"messages": [old, old_bot]}},
+                                                        {"status": "ok", "retcode": 0, "data": {"messages": []}}]))
+    ctx = SimpleNamespace(scene="group" if scene == "group" else "private_friend", group_id=current["group_id"],
+                          user_id=actor, nickname="admin", card="")
+    svc.observe_onebot_event(current)
+    current["_chat_ingest_seq"] = 1
+    await commands._handle_ai_chat_trigger(client, ctx, current, "回学渣一句不用谢", SimpleNamespace(log=Mock()),
+                                            svc, forced_ai_input="回学渣一句不用谢", message_id="current")
+    prompt = json.loads(svc._kimi_runner.requests[0].prompt)
+    assert [row["message_id"] for row in prompt["recent_conversation"]] == ["old-user", "old-bot"]
+    assert [row["role"] for row in prompt["recent_conversation"]] == ["user", "assistant"]
+    assert prompt["recent_conversation"][0]["speaker"]["nickname"] == "学渣"
+    assert client.call.await_args_list[0].args[0] == ("get_group_msg_history" if scene == "group" else "get_friend_msg_history")
+    reply.assert_awaited_once()
+    assert "我谢谢你" not in path.read_text()
+
+
+@pytest.mark.asyncio
 async def test_aichat_retains_300_full_messages_without_memory_budget(monkeypatch) -> None:
     svc = AIService(_Log())
     svc._kimi_runner = _Runner()
@@ -169,7 +283,8 @@ async def test_admin_response_uses_origin_ack_and_independent_commit(tmp_path, m
     payload = json.loads(request.prompt)
     assert request.profile == "admin"
     assert payload["trusted_request_context"]["scene"] == ("group" if is_group else "private")
-    assert "按 cooper-admin 完整权限配置执行管理员任务" in payload["system_instructions"]
+    assert "按 cooper-admin 完整权限配置执行管理员任务" in payload["admin_instructions"]
+    assert payload["system_instructions"] == svc._select_chat_system_prompt(session_key)
     if memory_enabled:
         svc.memory.turn.assert_awaited_once()
         assert svc.chat_with_context.await_args.kwargs["memory_turn"].identity.profile == "admin"

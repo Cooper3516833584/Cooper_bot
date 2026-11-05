@@ -9,9 +9,35 @@ from cooper_bot.commands.memory_commands import handle_memory_command
 from cooper_bot.modules.memory.models import CapturedInput, MemoryIdentity
 from cooper_bot.modules.memory.policy import scope_for
 from cooper_bot.modules.memory.service import MemoryService
+from unittest.mock import AsyncMock
 
 
 GROUP_ID = 30303
+
+
+@pytest.mark.asyncio
+async def test_context_recovery_boundary_follows_memory_operations_and_idempotent_on(tmp_path):
+    identity = _group_identity(90909, personal_admin=True)
+    service = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    reset = AsyncMock()
+    try:
+        await handle_memory_command(service, identity, "/memory on", reset_context=reset)
+        assert reset.await_count == 1
+        await handle_memory_command(service, identity, "/memory on", reset_context=reset)
+        assert reset.await_count == 1
+        await handle_memory_command(service, identity, "/memory new", reset_context=reset)
+        assert reset.await_count == 2
+        await handle_memory_command(service, identity, "/memory off", reset_context=reset)
+        assert reset.await_count == 3
+        await handle_memory_command(service, identity, "/memory on", reset_context=reset)
+        assert reset.await_count == 4
+        text, _ = await handle_memory_command(service, identity, "/memory clear", reset_context=reset)
+        assert reset.await_count == 4
+        token = re.search(r"--confirm (\S+)", text)[1]
+        await handle_memory_command(service, identity, f"/memory clear --confirm {token}", reset_context=reset)
+        assert reset.await_count == 5
+    finally:
+        await service.aclose()
 
 
 def _group_identity(actor: int, *, group_id: int = GROUP_ID, admin_profile: bool = False, personal_admin: bool = False, memory_operator: bool | None = None) -> MemoryIdentity:

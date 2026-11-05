@@ -749,11 +749,16 @@ class KimiCliRunner:
             history = payload.get("conversation_history") if isinstance(payload, dict) else None
             if not isinstance(history, list):
                 raise KimiInputTooLargeError(request.request_id)
-            low, high = 1, len(history)
+            recent = payload.get("recent_conversation", [])
+            if not isinstance(recent, list):
+                raise KimiInputTooLargeError(request.request_id)
+            low, high = 1, len(history) + len(recent)
             fitting = None
             while low <= high:
                 omitted = (low + high) // 2
-                payload["conversation_history"] = history[omitted:]
+                payload["conversation_history"] = history[max(0, omitted - len(recent)):]
+                if recent:
+                    payload["recent_conversation"] = recent[min(omitted, len(recent)):]
                 payload["omitted_older_messages"] = omitted
                 argv[-1] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                 result = tuple(argv)

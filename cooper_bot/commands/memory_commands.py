@@ -12,8 +12,18 @@ def _short_fact(row: dict) -> str:
     return f"{row['fact_id'][:8]}  {text[:160]}"
 
 
-async def handle_memory_command(service, identity, text: str, *, clear_admin_history=None) -> tuple[str, bool]:
+async def handle_memory_command(service, identity, text: str, *, clear_admin_history=None, reset_context=None) -> tuple[str, bool]:
     """Return reply text and whether a group admin result must be private."""
+    async def _reset_context(target_identity):
+        if callable(reset_context):
+            await reset_context(target_identity)
+
+    async def _reset_on_change(target_identity, mode=None):
+        if callable(reset_context):
+            status = await service.status(target_identity)
+            if not status["scope_enabled"] or not status["member_enabled"] or (mode and status["capture_mode"] != mode):
+                await _reset_context(target_identity)
+
     def _clear_admin_volatile() -> None:
         if identity.profile == "admin" and callable(clear_admin_history):
             try:
@@ -56,6 +66,7 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
         if not service.enabled:
             return ("聊天记忆总开关当前关闭；请由部署者设置 AI_MEMORY_ENABLED=true 后重启。", private)
         if action == "on":
+            await _reset_on_change(replace(identity, profile="public") if identity.scene == "group" else identity)
             if identity.scene == "group":
                 if not await service.group_scope_enabled(identity):
                     # 群聊 /memory on = 开启当前 public group scope，默认 all（记录普通群聊）。
@@ -70,6 +81,7 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
             await service.set_member_enabled(identity, True)
             return ("已开启当前作用域的记忆。", private)
         if action == "off":
+            await _reset_context(replace(identity, profile="public") if identity.scene == "group" else identity)
             # 关闭当前会话（私聊或群聊）的记忆开关，与 /memory on 对称；不物理删除已有数据。
             if identity.scene == "group":
                 await service.set_group_enabled(replace(identity, profile="public"), False)
@@ -106,12 +118,14 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
             if argument.startswith("--confirm "):
                 token=argument.split(maxsplit=1)[1]
                 if not await _consume_confirmation(token,identity,"clear",f"user:{identity.actor_user_id}"): return ("确认码无效、已过期或不属于当前作用域。", private)
+                await _reset_context(identity)
                 await service.clear_subject(identity); _clear_admin_volatile(); return ("已清除你在当前作用域的记忆。", private)
             token=await _new_confirmation(identity,"clear",f"user:{identity.actor_user_id}")
             return (f"将清除你在当前作用域的记忆。60 秒内发送 /memory clear --confirm {token} 确认。", private)
         if action == "new":
             if identity.scene == "group" and identity.profile == "public" and not identity.personal_admin:
                 return ("仅可信个人管理员可开始新的群记忆对话。", private)
+            await _reset_context(identity)
             await service.rotate_conversation(identity); _clear_admin_volatile(); return ("已开始新对话；长期显式记忆仍会保留。", private)
         if action == "history":
             before = None
@@ -133,8 +147,11 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
             group_identity = replace(identity, profile="public")
             if sub == "on":
                 mode=(argument.split(maxsplit=1)[1].lower() if len(argument.split(maxsplit=1)) > 1 else "directed")
+                if mode in {"directed", "all"}:
+                    await _reset_on_change(group_identity, mode)
                 await service.set_group_enabled(group_identity, True, mode); return (f"已开启当前群记忆（{mode}）。", False)
             if sub == "off":
+                await _reset_context(group_identity)
                 await service.set_group_enabled(group_identity, False); return ("已停止当前群的记忆采集和召回。", False)
             if sub == "remember":
                 value=argument[len("remember"):].strip(); row=await service.remember_explicit(group_identity,value,subject_id=f"group:{group_identity.group_id}"); return (f"已保存群约定（ID：{row['fact_id']}）。",False)
@@ -144,6 +161,7 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
                 if clear_argument.startswith("--confirm "):
                     token=clear_argument.split(maxsplit=1)[1]
                     if not await _consume_confirmation(token,group_identity,"group_clear",target): return ("确认码无效、已过期或不属于当前群。",False)
+                    await _reset_context(group_identity)
                     await service.clear_group(group_identity); return ("已清除当前公共群作用域的记忆数据。",False)
                 token=await _new_confirmation(group_identity,"group_clear",target)
                 return (f"将清除当前公共群作用域的全部记忆数据。60 秒内发送 /memory group clear --confirm {token} 确认。",False)

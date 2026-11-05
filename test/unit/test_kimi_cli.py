@@ -143,6 +143,19 @@ async def test_runner_rejects_oversized_windows_argument_before_spawn(tmp_path, 
         await runner.run(_request("😀" * 1000))
 
 
+def test_windows_budget_trims_recovered_context_without_changing_current_request(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, "", argv_budget=2200)
+    monkeypatch.setattr("cooper_bot.modules.ai.kimi_cli.os.name", "nt")
+    payload = {"conversation_history": [], "recent_conversation": [{"content": "x" * 300, "message_id": str(i)} for i in range(20)],
+               "latest_user_request": "完整当前请求", "quoted_message": {"content": "完整引用"}}
+    argv = runner._build_argv(_request(json.dumps(payload, ensure_ascii=False)), runner.settings.public)
+    sent = json.loads(argv[-1])
+    assert len(sent["recent_conversation"]) < 20
+    assert sent["recent_conversation"][-1]["message_id"] == "19"
+    assert sent["latest_user_request"] == payload["latest_user_request"]
+    assert sent["quoted_message"] == payload["quoted_message"]
+
+
 @pytest.mark.asyncio
 async def test_runner_trims_only_old_chat_history_at_windows_boundary(tmp_path, monkeypatch) -> None:
     runner = _runner(tmp_path, "import json, sys\nprint(json.dumps({'type': 'assistant', 'content': sys.argv[-1]}))\n", argv_budget=2400)

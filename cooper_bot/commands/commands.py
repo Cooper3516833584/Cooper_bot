@@ -36,6 +36,7 @@ from cooper_bot.commands.memory_commands import handle_memory_command
 from cooper_bot.commands.kick_commands import handle_kick_command
 from cooper_bot.modules.ai.message_context import extract_reply_message_id, has_reply_segment, message_id as context_message_id
 from cooper_bot.modules.ai.quote_context import message_allowed, resolve_quote_for_aichat
+from cooper_bot.modules.ai.chat_reply import mentioned_users, recent_context
 from cooper_bot.core.config import (
     ADMIN_USERS,
     DATA_DIR,
@@ -4111,7 +4112,14 @@ async def _handle_ai_chat_trigger(
         chat_with_context_fn = getattr(aisvc, "chat_with_context", None)
         commit_chat_turn = getattr(aisvc, "commit_chat_turn", None)
         delivery_context = {"defer_history": True, "speaker": _ai_chat_speaker(ctx), "reply_to": _extract_reply_msg_id(evt) or ""} if callable(commit_chat_turn) else {}
+        mentions = mentioned_users(evt)
+        if mentions and delivery_context:
+            delivery_context["speaker"]["mentioned_user_ids"] = mentions
         identity = _memory_identity(ctx, evt, allow_computer=allow_computer, perm=perm)
+        visible_context = await recent_context(api, evt, aisvc, identity, session_key, history_cutoff)
+        if visible_context:
+            delivery_context["recent_context"] = visible_context
+            delivery_context["context_identity"] = identity
         quoted_message = await resolve_quote_for_aichat(api=api, aisvc=aisvc, session_key=session_key, event=evt, vision_skill=vision_skill, identity=identity)
         evt["_aichat_quote"] = quoted_message
         if quoted_message is not None:
@@ -4135,6 +4143,13 @@ async def _handle_ai_chat_trigger(
         memory_turn = None
         memory_service = getattr(aisvc, "memory", None)
         identity = _memory_identity(ctx, evt, allow_computer=allow_computer, perm=perm)
+        async def _record_context_delivery(sent):
+            history_service = getattr(aisvc, "message_history", None)
+            if sent and identity is not None and history_service is not None:
+                try:
+                    await history_service.record_delivery(identity, getattr(ctx, "_last_reply_message_id", ""))
+                except Exception as exc:
+                    logsvc.log.warning(f"Chat delivery metadata unavailable: {type(exc).__name__}")
         if memory_service is not None and identity is not None:
             try:
                 memory_turn = await memory_service.turn(
@@ -4170,6 +4185,7 @@ async def _handle_ai_chat_trigger(
                         return True
                     sent = await reply(api, ctx, out, logsvc)
                     reply_delivered = bool(sent)
+                    await _record_context_delivery(sent)
                     await memory_turn.finish_delivery(bool(sent))
                     _commit_delivered_chat(sent, out)
                     return True
@@ -4204,6 +4220,7 @@ async def _handle_ai_chat_trigger(
                 logsvc,
             )
             reply_delivered = bool(sent)
+            await _record_context_delivery(sent)
             _commit_delivered_chat(sent, out)
         except Exception as e:
             try:
@@ -5147,7 +5164,10 @@ async def dispatch(
                     if identity.profile == "admin" and session_key and callable(clear_admin_history)
                     else None
                 )
-                result, force_private = await handle_memory_command(service, identity, t, clear_admin_history=clear_callback)
+                history_service = getattr(aisvc, "message_history", None)
+                result, force_private = await handle_memory_command(
+                    service, identity, t, clear_admin_history=clear_callback,
+                    reset_context=getattr(history_service, "forget_context", None))
                 await reply(api, ctx, result, logsvc, force_private_user_id=ctx.user_id if force_private else None)
             return
         if _is_known_explicit_command(t) or int(getattr(ctx, "level", 0) or 0) < 1:
