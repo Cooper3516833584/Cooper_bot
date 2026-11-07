@@ -1,7 +1,9 @@
 import json
+from io import BytesIO
 from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -196,20 +198,20 @@ async def test_midnight_evening_submission_does_not_cover_tonights_shift(service
 
 @pytest.mark.parametrize("hour,minute,expected", [
     (0, 20, date(2026, 10, 19)),
-    (12, 0, date(2026, 10, 19)),
-    (15, 59, date(2026, 10, 19)),
-    (16, 0, DAY),
+    (9, 59, date(2026, 10, 19)),
+    (10, 0, DAY),
+    (12, 52, DAY),
     (22, 55, DAY),
 ])
-def test_evening_day_changes_at_16_while_morning_keeps_calendar_date(hour, minute, expected):
+def test_evening_day_changes_at_10_while_morning_keeps_calendar_date(hour, minute, expected):
     stamp = int(datetime(2026, 10, 20, hour, minute, tzinfo=_TZ).timestamp())
     assert greeting_day(stamp, "evening") == expected
     assert greeting_day(stamp, "morning") == DAY
 
 
-@pytest.mark.parametrize("hour,minute,detected", [(15, 59, False), (16, 0, True)])
-async def test_group_and_qzone_share_the_16_hour_evening_boundary(service, api, monkeypatch, hour, minute, detected):
-    text = "#晚安华中大#\n正文\n今日编辑：编辑甲"
+@pytest.mark.parametrize("hour,minute,detected", [(9, 59, False), (10, 0, True), (12, 52, True)])
+async def test_group_and_qzone_share_the_10_hour_evening_boundary(service, api, monkeypatch, hour, minute, detected):
+    text = "#晚安华中大#\n正文"
     evt = event(forward="evening-boundary")
     evt["time"] = int(datetime(2026, 10, 20, hour, minute, tzinfo=_TZ).timestamp())
     api.call.return_value = ok({"messages": [{"message": [{"type": "text", "data": {"text": text}}]}]})
@@ -361,18 +363,20 @@ async def test_space_only_error_is_reported_separately(service, api):
     ("#快讯#\n早安华中大，晚安华中大\n今日编辑：编辑甲", set()),
     ("#周五去哪玩#\n今日编辑：编辑甲\n晚安", set()),
     ("转一条 #早安华中大#\n今日编辑：编辑甲", set()),
-    ("#早安华中大#\n正文", set()),
-    ("#早安华中大#\n正文\n（今日编辑：）", set()),
-    ("#早安华中大#\n今日编辑：\n正文", set()),
+    ("#早安华中大#\n正文", {"morning"}),
+    ("#午安华中大#", {"morning"}),
+    ("#晚安华中大#", {"evening"}),
+    ("#早安华中大#\n正文\n（今日编辑：）", {"morning"}),
+    ("#早安华中大#\n今日编辑：\n正文", {"morning"}),
     ("#早安华中大好呀#\n正文\n今日编辑：编辑甲", set()),
 ])
-def test_greeting_uses_actual_column_tag_and_editor_signature(text, expected):
+def test_greeting_uses_actual_column_tag_without_requiring_signature(text, expected):
     assert greeting_kind(text) == expected
 
 
 async def test_noon_submission_without_image_sets_actual_editors_evening_shift(service, api):
     api.call.return_value = ok({"messages": [{"sender": {"user_id": 9000}, "message": [
-        {"type": "text", "data": {"text": "#午安华中大#\n正文\n今日编辑：编辑丙"}},
+        {"type": "text", "data": {"text": "#午安华中大#\n正文"}},
     ]}]})
     noon = event(forward="noon", uid=44)
     noon["time"] = int(datetime(2026, 10, 20, 12, 5, tzinfo=_TZ).timestamp())
@@ -432,6 +436,46 @@ def test_qzone_response_and_auth_failures(monkeypatch, payload, expected):
     monkeypatch.setattr("urllib.request.urlopen", opener)
     assert EditorDutyService._fetch_qzone("uin=o1; p_skey=test-only", DAY, "morning", PUBLISHER_ID) is expected
     assert f"uin={PUBLISHER_ID}" in opener.call_args.args[0].full_url
+
+
+@pytest.mark.parametrize("detail,expected", [
+    ({"code": 0, "tid": "long-post", "content": "#晚安华中大#\n" + "正文" * 300}, True),
+    ({"code": 0, "tid": "long-post", "content": "#快讯#\n正文"}, False),
+    ({"code": -3000, "message": "login required"}, None),
+    ({"code": 0, "tid": "long-post"}, None),
+    ({"code": 0, "tid": "another-post", "content": "#晚安华中大#"}, None),
+])
+def test_qzone_reads_full_text_for_truncated_submission(monkeypatch, detail, expected):
+    stamp = int(datetime(2026, 10, 20, 21, 56, tzinfo=_TZ).timestamp())
+    payload = {"code": 0, "msglist": [{
+        "created_time": stamp, "content": "#晚安华中大#\n截断正文",
+        "has_more_con": 1, "tid": "long-post",
+    }]}
+    opener = Mock(side_effect=[
+        BytesIO(json.dumps(payload).encode()),
+        BytesIO(("_Callback(" + json.dumps(detail) + ");").encode()),
+    ])
+    monkeypatch.setattr("urllib.request.urlopen", opener)
+    assert EditorDutyService._fetch_qzone("uin=o1; p_skey=test-only", DAY, "evening", PUBLISHER_ID) is expected
+    assert opener.call_count == 2
+    request = opener.call_args.args[0]
+    url = urlsplit(request.full_url)
+    assert url.path.endswith("/emotion_cgi_msgdetail_v6")
+    params = parse_qs(url.query)
+    assert params["not_trunc_con"] == ["1"]
+    assert params["tid"] == ["long-post"]
+    assert params["uin"] == [str(PUBLISHER_ID)]
+    assert request.get_header("Cookie") == "uin=o1; p_skey=test-only"
+
+
+def test_qzone_truncated_submission_without_id_is_unknown(monkeypatch):
+    payload = {"code": 0, "msglist": [{
+        "created_time": event()["time"], "content": "#早安华中大#", "has_more_con": 1,
+    }]}
+    opener = Mock(return_value=BytesIO(json.dumps(payload).encode()))
+    monkeypatch.setattr("urllib.request.urlopen", opener)
+    assert EditorDutyService._fetch_qzone("uin=o1; p_skey=test-only", DAY, "morning", PUBLISHER_ID) is None
+    opener.assert_called_once()
 
 
 def test_state_keeps_only_eight_dates_and_no_message_text(service):

@@ -18,7 +18,6 @@ _TZ = ZoneInfo(TIMEZONE)
 _SLOTS = {"morning": (9, 0, "早安"), "evening": (22, 55, "晚安")}
 _CARD = re.compile(r"(?:周|星期)\s*([一二三四五六日天])\s*([SD]+)(?![A-Za-z])", re.I)
 _GREETING_TITLE = re.compile(r"^\s*#(早安华中大|午安华中大|晚安华中大)#")
-_EDITOR_SIGNATURE = re.compile(r"今日编辑[ \t\u3000]*[：:][ \t\u3000]*[^\s（）()]")
 
 
 def editor_on_duty(card: str, day: date, odd_monday: date) -> bool:
@@ -40,17 +39,17 @@ def _text(message) -> str:
 
 
 def greeting_kind(text: str) -> set[str]:
-    # 按实际投稿/说说的栏目标签和署名识别，午安是迟发的早安。
+    # 按实际投稿/说说的栏目标签识别，午安是迟发的早安。
     title = _GREETING_TITLE.match(text)
-    if not title or not _EDITOR_SIGNATURE.search(text):
+    if not title:
         return set()
     return {"evening" if title[1] == "晚安华中大" else "morning"}
 
 
 def greeting_day(stamp: int, slot: str) -> date:
     local = datetime.fromtimestamp(stamp, _TZ)
-    # 16:00 前收到的晚安归前一晚，不能抵消当天 22:55 的值班提醒。
-    return local.date() - timedelta(days=1) if slot == "evening" and local.hour < 16 else local.date()
+    # 10:00 前收到的晚安归前一晚，不能抵消当天 22:55 的值班提醒。
+    return local.date() - timedelta(days=1) if slot == "evening" and local.hour < 10 else local.date()
 
 
 def _data(response):
@@ -241,18 +240,22 @@ class EditorDutyService:
             token += (token << 5) + ord(char)
         params = {"uin": publisher_id, "ftype": 0, "sort": 0, "pos": 0, "num": 20,
                   "replynum": 0, "g_tk": token & 0x7fffffff, "format": "json"}
-        url = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6?"
-        req = urllib.request.Request(url + urllib.parse.urlencode(params), headers={
+        url = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/"
+        headers = {
             "Cookie": cookie, "Referer": f"https://user.qzone.qq.com/{publisher_id}",
             "User-Agent": "Mozilla/5.0",
-        })
-        with urllib.request.urlopen(req, timeout=12) as response:
-            raw = response.read(2 * 1024 * 1024).decode("utf-8")
-        raw = raw.strip()
-        if not raw.startswith("{"):
-            start, end = raw.find("("), raw.rfind(")")
-            raw = raw[start + 1:end] if start >= 0 and end > start else ""
-        payload = json.loads(raw)
+        }
+
+        def fetch(action, query):
+            req = urllib.request.Request(url + action + "?" + urllib.parse.urlencode(query), headers=headers)
+            with urllib.request.urlopen(req, timeout=12) as response:
+                raw = response.read(2 * 1024 * 1024).decode("utf-8").strip()
+            if not raw.startswith("{"):
+                start, end = raw.find("("), raw.rfind(")")
+                raw = raw[start + 1:end] if start >= 0 and end > start else ""
+            return json.loads(raw)
+
+        payload = fetch("emotion_cgi_msglist_v6", params)
         if payload.get("code") != 0:
             return None
         items = payload.get("msglist")
@@ -268,6 +271,18 @@ class EditorDutyService:
             item_day = datetime.fromtimestamp(stamp, _TZ).date()
             older |= item_day < day
             if greeting_day(stamp, slot) == day and slot in greeting_kind(str(item.get("content") or "")):
+                if item.get("has_more_con"):
+                    if not item.get("tid"):
+                        return None
+                    detail = fetch("emotion_cgi_msgdetail_v6", {
+                        "uin": publisher_id, "tid": item["tid"], "not_trunc_con": 1,
+                        "g_tk": token & 0x7fffffff, "format": "json",
+                    })
+                    if (detail.get("code") != 0 or detail.get("tid") != item["tid"]
+                            or not isinstance(detail.get("content"), str)):
+                        return None
+                    if slot not in greeting_kind(detail["content"]):
+                        continue
                 return True
         return False if older or len(items) < 20 else None
 
