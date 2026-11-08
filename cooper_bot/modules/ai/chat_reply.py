@@ -81,9 +81,9 @@ def render_reply(text, *, group, speakers):
     if not isinstance(payload, dict) or "qq_reply" not in payload:
         return text
     reply = payload["qq_reply"]
-    if set(payload) != {"qq_reply"} or not isinstance(reply, dict) or set(reply) != {"text", "at"}:
+    if set(payload) != {"qq_reply"} or not isinstance(reply, dict) or set(reply) not in ({"text"}, {"text", "at"}):
         raise ValueError("invalid QQ reply envelope")
-    body, mentions = reply["text"], reply["at"]
+    body, mentions = reply["text"], reply.get("at", [])
     if not isinstance(body, str) or not body.strip() or not isinstance(mentions, list) or len(mentions) > 10:
         raise ValueError("invalid QQ reply content")
     targets = list(dict.fromkeys(positive_id(uid) for uid in mentions))

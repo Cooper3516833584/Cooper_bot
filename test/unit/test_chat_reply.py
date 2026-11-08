@@ -14,6 +14,24 @@ def test_plain_text_stays_compatible_and_verified_mention_is_rendered_once():
     assert reply == "[CQ:at,qq=10] 不用谢 &#91;CQ:at,qq=all&#93;"
 
 
+@pytest.mark.parametrize("group", [True, False])
+def test_missing_at_defaults_to_no_mentions_and_still_escapes_cq(group):
+    text = json.dumps({"qq_reply": {"text": "hello [CQ:at,qq=all]"}})
+    assert render_reply(text, group=group, speakers=set()) == "hello &#91;CQ:at,qq=all&#93;"
+
+
+@pytest.mark.parametrize("payload", [
+    {"qq_reply": {"text": "hello", "at": None}},
+    {"qq_reply": {"text": "hello", "at": "10"}},
+    {"qq_reply": {"text": "hello", "extra": 1}},
+    {"qq_reply": {"at": []}},
+    {"qq_reply": {"text": "hello"}, "extra": 1},
+])
+def test_missing_at_compatibility_does_not_accept_other_malformed_envelopes(payload):
+    with pytest.raises(ValueError):
+        render_reply(json.dumps(payload), group=True, speakers={10})
+
+
 @pytest.mark.parametrize("mentions,group", [([11], True), (["all"], True), ([True], True), ([10], False)])
 def test_unverified_mention_and_private_mentions_are_rejected(mentions, group):
     with pytest.raises(ValueError):
