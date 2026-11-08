@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "admin_only": true,
+  "group_id": 0,
+  "app_token": "",
+  "table_id": "",
+  "members": ["成员甲", "成员乙"],
+  "ministers": ["部长甲", "部长乙"]
+}

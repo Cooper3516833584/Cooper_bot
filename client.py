@@ -30,6 +30,7 @@ from cooper_bot.modules.ai.search_bridge import start_kimi_search_bridge
 from cooper_bot.modules.calendar.daily_calendar import DailyCalendarService
 from cooper_bot.modules.calendar.editor_duty import EditorDutyService
 from cooper_bot.modules.calendar.group_speech import GroupSpeechService
+from cooper_bot.modules.calendar.topic_reminder import TopicReminderService
 from cooper_bot.modules.history.historysvc import MessageHistoryService
 from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
@@ -151,6 +152,7 @@ async def run_forever():
     history_service = MessageHistoryService(state_path=STATE_DIR / "context_history_state.json")
     aisvc.message_history = history_service
     speech_service = GroupSpeechService(log, history_service=history_service)
+    topic_reminder_service = TopicReminderService(log)
     try:
         editor_duty_service = EditorDutyService(log)
     except Exception as e:
@@ -173,6 +175,7 @@ async def run_forever():
             moderation_service=moderation_service,
             editor_duty_service=editor_duty_service,
             speech_service=speech_service,
+            topic_reminder_service=topic_reminder_service,
         )
     finally:
         await _cleanup_runtime(log, search_bridge, aisvc)
@@ -191,6 +194,7 @@ async def _run_bot_loop(
     moderation_service=None,
     editor_duty_service=None,
     speech_service=None,
+    topic_reminder_service=None,
 ):
     global _POST_SYNC_TASK
 
@@ -403,6 +407,10 @@ async def _run_bot_loop(
                     asyncio.create_task(speech_service.scheduler_loop(api))
                     if speech_service is not None else None
                 )
+                topic_reminder_task = (
+                    asyncio.create_task(topic_reminder_service.scheduler_loop(api))
+                    if topic_reminder_service is not None else None
+                )
 
                 try:
                     async for message in ws:
@@ -487,6 +495,9 @@ async def _run_bot_loop(
                             )
                             continue
                 finally:
+                    if topic_reminder_task is not None:
+                        topic_reminder_task.cancel()
+                        await asyncio.gather(topic_reminder_task, return_exceptions=True)
                     if speech_task is not None:
                         speech_task.cancel()
                         await asyncio.gather(speech_task, return_exceptions=True)

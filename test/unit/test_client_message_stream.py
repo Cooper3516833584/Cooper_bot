@@ -88,6 +88,15 @@ async def test_ws_observes_before_routing_skips_self_and_rebinds_ack_after_recon
     monkeypatch.setattr(client, "_POST_SYNC_TASK", None)
     moderation = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), observe_event=AsyncMock())
     speech = SimpleNamespace(group_id=20001, observe_event=AsyncMock(), scheduler_loop=scheduler)
+    topic_connections, topic_closed = [], []
+
+    async def topic_scheduler(api):
+        topic_connections.append(api)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            topic_closed.append(api)
+
     with pytest.raises(asyncio.CancelledError):
         await client._run_bot_loop(
             aisvc=service, vision_skill=None, filesvc=SimpleNamespace(build_find_index=lambda: {}), state=None,
@@ -95,12 +104,14 @@ async def test_ws_observes_before_routing_skips_self_and_rebinds_ack_after_recon
             handin=SimpleNamespace(scheduler_loop=scheduler), calendar_service=SimpleNamespace(scheduler_loop=scheduler),
             email_notify_service=SimpleNamespace(scheduler_loop=scheduler), moderation_service=moderation,
             speech_service=speech,
+            topic_reminder_service=SimpleNamespace(scheduler_loop=topic_scheduler),
         )
     await client._POST_SYNC_TASK
     assert client.dispatch.await_count == 2
     assert moderation.observe_event.await_count == 2
     assert speech.observe_event.await_count == 4
     assert len(apis) == 2
+    assert topic_connections == apis and topic_closed == apis
     assert service.find_chat_message_by_msg_id("group:20001", "ack0")
     assert service.find_chat_message_by_msg_id("group:20001", "ack1")
 
