@@ -24,7 +24,8 @@ def service(tmp_path):
 def api(pages, members=None):
     return SimpleNamespace(call=AsyncMock(side_effect=[ok({"messages": p}) for p in pages]),
                            get_group_member_list=AsyncMock(return_value=ok(members or [{"user_id": 10, "card": "甲"}, {"user_id": 20, "nickname": "乙"}])),
-                           send_private_msg=AsyncMock(return_value=ok({"message_id": 999})))
+                           send_private_msg=AsyncMock(),
+                           send_group_msg=AsyncMock(return_value=ok({"message_id": 999})))
 
 
 def test_week_boundary():
@@ -58,7 +59,7 @@ async def test_paginated_backfill_restarts_without_double_count(tmp_path, servic
     restarted = GroupSpeechService(service.log, db_path=service.db_path, admins=[900])
     await restarted.check_once(api([[first, second, old]]), now + timedelta(hours=8), force_sync=True)
     assert await service._db(lambda c: c.execute("SELECT COUNT(*) FROM messages").fetchone()[0]) == 2
-    mock.send_private_msg.assert_not_awaited()
+    mock.send_group_msg.assert_not_awaited()
 
 
 async def test_statistics_uses_injected_shared_history_component(tmp_path):
@@ -79,13 +80,15 @@ async def test_report_zero_members_threshold_and_end_exclusion(service):
     rows += [event(80, end, 20), event(81, end - WEEK - 400, 20)]
     mock = api([rows])
     await service.check_once(mock, now)
-    text = mock.send_private_msg.await_args.args[1]
+    text = mock.send_group_msg.await_args.args[1]
+    assert mock.send_group_msg.await_args.args[0] == GROUP_ID
+    mock.send_private_msg.assert_not_awaited()
     assert "乙（20）：0 条" in text
     assert "甲（10）" not in text
     assert "本周消息共 50 条" in text
     assert "不足50条 1 人" in text
     await service.check_once(api([rows]), now + timedelta(minutes=1))
-    assert mock.send_private_msg.await_count == 1
+    assert mock.send_group_msg.await_count == 1
 
 
 async def test_failed_history_never_sends_or_advances_coverage(service):
@@ -93,7 +96,7 @@ async def test_failed_history_never_sends_or_advances_coverage(service):
     mock = api([])
     mock.call = AsyncMock(return_value={"status": "failed", "retcode": 200})
     await service.check_once(mock, now)
-    mock.send_private_msg.assert_not_awaited()
+    mock.send_group_msg.assert_not_awaited()
     assert await service._db(lambda c: c.execute("SELECT value FROM meta WHERE key='coverage'").fetchone()) is None
 
 
@@ -103,7 +106,7 @@ async def test_stalled_cursor_keeps_report_pending(service):
     second = event(2, int(now.timestamp()) - 20)
     mock = api([[evt, second], [evt, second]])
     await service.check_once(mock, now)
-    mock.send_private_msg.assert_not_awaited()
+    mock.send_group_msg.assert_not_awaited()
 
 
 async def test_napcat_inclusive_anchor_exhaustion_marks_first_week(service):
@@ -111,7 +114,7 @@ async def test_napcat_inclusive_anchor_exhaustion_marks_first_week(service):
     evt = event(1, int(now.timestamp()) - 100)
     mock = api([[evt], [evt]])
     await service.check_once(mock, now)
-    assert "本期此前数据不可补回" in mock.send_private_msg.await_args.args[1]
+    assert "本期此前数据不可补回" in mock.send_group_msg.await_args.args[1]
 
 
 async def test_missed_deadline_and_partial_delivery_resume(service):
@@ -119,16 +122,17 @@ async def test_missed_deadline_and_partial_delivery_resume(service):
     end = report_end(now)
     old = event(1, end - WEEK - 400)
     await service.check_once(api([[old]]), now)
-    service.admins = [900, 901]
+    service.admins = []
+    await service._db(lambda c: c.execute("INSERT INTO reports VALUES(?,?)", (end, '["part 1", "part 2"]')))
     mock = api([[old]])
-    mock.send_private_msg.side_effect = [ok({"message_id": 1}), None]
+    mock.send_group_msg.side_effect = [ok({"message_id": 1}), None]
     late = datetime(2026, 11, 2, 6, tzinfo=TZ)
     await service.check_once(mock, late, force_sync=True)
-    restarted = GroupSpeechService(service.log, db_path=service.db_path, admins=[900, 901])
+    restarted = GroupSpeechService(service.log, db_path=service.db_path, admins=[])
     retry = api([[old]])
     await restarted.check_once(retry, late, force_sync=True)
-    assert retry.send_private_msg.await_count == 1
-    assert retry.send_private_msg.await_args.args[0] == 901
+    retry.send_group_msg.assert_awaited_once_with(GROUP_ID, "part 2")
+    retry.send_private_msg.assert_not_awaited()
     assert await service._db(lambda c: c.execute("SELECT value FROM meta WHERE key='next_end'").fetchone()[0]) == end + WEEK
 
 
@@ -137,7 +141,7 @@ async def test_long_roster_split_and_cq_escape(service):
     members = [{"user_id": uid, "card": "[CQ:at,qq=all]" + "甲" * 80} for uid in range(1, 150)]
     mock = api([[]], members=members)
     await service.check_once(mock, datetime.fromtimestamp(end, TZ))
-    assert mock.send_private_msg.await_count > 1
-    texts = [call.args[1] for call in mock.send_private_msg.await_args_list]
+    assert mock.send_group_msg.await_count > 1
+    texts = [call.args[1] for call in mock.send_group_msg.await_args_list]
     assert all(len(text) < 2450 and "[CQ:" not in text for text in texts)
     assert sum(text.count("：0 条") for text in texts) == 149

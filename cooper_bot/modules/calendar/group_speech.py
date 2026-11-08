@@ -170,24 +170,19 @@ class GroupSpeechService:
                 await self._db(lambda c: c.execute("INSERT OR REPLACE INTO meta VALUES('coverage',?)", (stamp,)))
                 self._next_sync = stamp + 300
             while end <= stamp:
-                admins = sorted({int(uid) for uid in (config.ADMIN_USERS if self.admins is None else self.admins) if int(uid) > 0})
-                if not admins:
-                    self.log.warning("群发言统计：未配置管理员，报告等待发送")
-                    return
                 chunks = await self._chunks(api, end)
                 if chunks is None:
                     self.log.warning("群发言统计：成员列表读取失败，报告延后")
                     return
                 delivered = set(await self._db(lambda c: c.execute("SELECT admin,part FROM delivered WHERE end_ts=?", (end,)).fetchall()))
-                for admin in admins:
-                    for part, chunk in enumerate(chunks):
-                        if (admin, part) in delivered:
-                            continue
-                        data = response_data(await api.send_private_msg(admin, chunk))
-                        if not isinstance(data, dict) or not data.get("message_id"):
-                            self.log.warning("群发言统计：报告发送未确认，稍后重试")
-                            return
-                        await self._db(lambda c: c.execute("INSERT OR IGNORE INTO delivered VALUES(?,?,?)", (end, admin, part)))
+                for part, chunk in enumerate(chunks):
+                    if (GROUP_ID, part) in delivered:
+                        continue
+                    data = response_data(await api.send_group_msg(GROUP_ID, chunk))
+                    if not isinstance(data, dict) or not data.get("message_id"):
+                        self.log.warning("群发言统计：报告发送未确认，稍后重试")
+                        return
+                    await self._db(lambda c: c.execute("INSERT OR IGNORE INTO delivered VALUES(?,?,?)", (end, GROUP_ID, part)))
                 end += WEEK
                 await self._db(lambda c: c.execute("UPDATE meta SET value=? WHERE key='next_end'", (end,)))
 
