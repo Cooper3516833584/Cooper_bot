@@ -69,7 +69,7 @@ def render_reports(records, now, members, ministers):
         lines.append("⚠️ 部分选题缺少立项日期或已完成但缺少结项日期，未计入对应统计："
                      + "、".join(n for n in members if n in undated))
     lines.append("💡 请各位成员关注选题进度，合理安排时间，确保按时推进。")
-    minister_text = ("📊 【部长选题创建统计（近3天）】\n"
+    minister_text = ("📊 【部长选题创建统计】\n"
                      f"🗓️ {recent_start:%Y年%m月%d日}—{now:%Y年%m月%d日 %H:%M}（北京时间）\n"
                      + "\n".join(f"{name}：{count}篇" for name, count in counts.items())
                      + "\n💪 各位部长继续加油，保持选题产出节奏！")
