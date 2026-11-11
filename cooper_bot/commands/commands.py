@@ -4530,24 +4530,25 @@ async def _handle_explicit_command(
         return
     if cmd in ("help", "h"):
         lines = [
-            "命令速览：",
             "基础：",
-            "/help 或 /h",
-            "/ping",
-            "/whoami",
-            "/count  开始临时收集名单（模式内仅收集名单；发送 end 结束并清空）",
+            "/help 或 /h  查看帮助",
+            "/ping  检查在线状态",
+            "/whoami  查看身份和权限等级",
+            "/count  开始临时收集名单；发送 end 结束并清空",
             "/countlist  查看已提交名单和未交名单",
             "/countremove 序号  移除已提交名单中的人名",
         ]
         if ctx.level >= 2:
             lines.append("/autoat  单条消息依次 @ 当前群全部成员（仅群聊）")
-            lines.append("/signin 截止时间  创建signin任务（群内创建，私聊发图提交）")
+            lines.append("/signin HH:MM  创建签到任务（群内创建，私聊发教室时间牌照片）")
+            lines.append("/memory help  查看记忆管理用法（个人权限 2 级及以上）")
+            lines.append("/kick on|off|status  开启/关闭/查看本群反广告审核（仅群聊，个人权限 2 级及以上）")
         if ctx.level >= 3:
             lines.extend([
                 "",
                 "管理功能：",
-                "/level list",
-                "/level QQ号 等级",
+                "/level list  查看用户权限列表",
+                "/level QQ号 等级  设置权限（0~3）",
                 "/calendartest YYYY.M.D  测试生成指定日期的重要日提醒",
             ])
         if ctx.level >= 1:
@@ -4555,32 +4556,27 @@ async def _handle_explicit_command(
                 "",
                 "资料检索：",
                 "/ls [root/子目录]  查看目录",
-                "/find 搜索内容 [可选: root/子目录]  支持关键词，也支持直接描述需求",
-                "/get 序号（如 /get 1 2 3 4）  获取文件/文件夹（文件夹自动打包）",
-                "提示：/find 不用只输关键词，也可以直接说你想找什么。",
-                "例如：/find 数字电子技术教材",
-                "例如：/find 期末复习用的高数资料",
-                "例如：/find 带答案的数理方程习题",
-                "提示：可直接回复序号进入下级目录。",
+                "/find 关键词 [root/子目录]  搜索文件或文件夹",
+                "/get 序号 [序号...]  获取搜索结果中的文件；文件夹自动打包",
+                "搜索后直接回复文件夹序号可进入目录。",
             ])
         lines.extend([
             "",
-            "AI聊天（Kimi Code）：",
-            "群聊：@Cooper_bot + 内容",
+            "AI聊天：",
+            "群聊：@机器人 + 内容",
             "私聊：直接发送文本内容",
-            "g/c 开头的文字会按原文发送，不再切换聊天后端。",
-            "个人管理员账号在群聊和私聊均使用完整配置；群内触发后的回复私聊回传。",
         ])
         if ctx.level >= 2:
             lines.extend([
                 "",
                 "提交功能：",
-                "/handin 任务名 [文件后缀] [提醒时间...] 截止时间（仅群聊，如 pdf/docx）",
+                "/handin 任务名 [文件后缀] [提醒时间...] 截止时间（仅群聊）",
+                "时间格式：月.日 时:分；后缀如 pdf、docx。",
                 "/handinstat  查看可管理任务并查询未交",
                 "/handincheck  查看可管理任务的已交文件（可配合 /get）",
                 "/handinget  打包可管理任务的已交文件并发送",
-                "/chandin  取消可管理的提交任务（按提示回复序号）",
-                "私聊发送文件后按提示操作；多文件发完后回复 done；限定后缀时多文件至少包含一个匹配文件。",
+                "/chandin  取消可管理的提交任务",
+                "提交：私聊发送文件，按提示选择任务；多文件发完后回复 done。",
             ])
         msg = "\n".join(lines)
         await reply(api, ctx, msg, logsvc)
