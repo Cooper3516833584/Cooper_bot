@@ -426,7 +426,7 @@ async def test_dispatch_private_pure_image_triggers_ai(dispatch_harness) -> None
 
 
 @pytest.mark.asyncio
-async def test_dispatch_group_image_without_mention_saves_unresolved_slot(dispatch_harness) -> None:
+async def test_dispatch_group_image_without_mention_saves_unresolved_slot(dispatch_harness, monkeypatch) -> None:
     ctx = _make_ctx(scene="group")
     aisvc = _new_aisvc()
     aisvc.memory = None
@@ -456,6 +456,27 @@ async def test_dispatch_group_image_without_mention_saves_unresolved_slot(dispat
     assert len(history) == 1 and history[0]["_msg_id"] == "100"
     assert history[0]["_vision"][0]["status"] == "unresolved"
     assert vision.resolve_calls == []  # 未触发 AI，不解析
+
+    monkeypatch.setattr(AIService, "chat_ready", property(lambda self: True))
+    aisvc.chat_with_context.return_value = "fake-ai-reply"
+    followup = dict(evt, message_id="101", message=[
+        {"type": "at", "data": {"qq": evt["self_id"]}},
+        {"type": "text", "data": {"text": "刚才的图里有什么"}},
+    ])
+    client._observe_chat_stream(aisvc, vision, followup)
+    await commands.dispatch(
+        api=SimpleNamespace(), ctx=ctx, evt=followup, text="刚才的图里有什么",
+        filesvc=_make_filesvc_stub(), logsvc=_DummyLogService(), state=commands.BotState(),
+        handin=Mock(), perm=Mock(), aisvc=aisvc, vision_skill=vision,
+    )
+
+    aisvc.chat_with_context.assert_awaited_once()
+    assert len(vision.resolve_calls) == 1
+    assert vision.resolve_calls[0][0]["slot_id"] == "100:1"
+    history = aisvc._load_active_chat_history("group:20001")
+    image_message = next(item for item in history if item.get("_msg_id") == "100")
+    assert image_message["_vision"][0]["status"] == "ready"
+    assert "类型：表情包；画面：猫" in aisvc._materialize_history_for_model([image_message])[0]["content"]
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,59 @@ def test_unverified_mention_and_private_mentions_are_rejected(mentions, group):
         render_reply(json.dumps({"qq_reply": {"text": "hello", "at": mentions}}), group=group, speakers={10})
 
 
+@pytest.mark.parametrize("body", [
+    "@123456789 hello @123456789",
+    "＠123456789 hello @123456789",
+    "[CQ:at,qq=123456789] hello [CQ:at,qq=123456789]",
+    "@123456789 hello [CQ:at,qq=123456789]",
+])
+@pytest.mark.parametrize("structured", [False, True])
+def test_inline_mentions_are_verified_and_rendered_only_once(body, structured):
+    text = json.dumps({"qq_reply": {"text": body, "at": [123456789, 123456789]}}) if structured else body
+    assert render_reply(text, group=True, speakers={123456789}) == "[CQ:at,qq=123456789] hello"
+
+
+def test_inline_mentions_keep_distinct_members_and_target_order():
+    text = json.dumps({"qq_reply": {"text": "@987654321 hello @123456789", "at": [123456789]}})
+    assert render_reply(text, group=True, speakers={123456789, 987654321}) == "[CQ:at,qq=123456789] [CQ:at,qq=987654321] hello"
+
+
+@pytest.mark.parametrize("group,speakers", [(True, set()), (False, {123456789})])
+@pytest.mark.parametrize("structured", [False, True])
+def test_numeric_mentions_without_allowed_group_target_do_not_show_raw_qq(group, speakers, structured):
+    text = "@123456789 hello"
+    if structured:
+        text = json.dumps({"qq_reply": {"text": text}})
+    assert render_reply(text, group=group, speakers=speakers) == "该用户 hello"
+
+
+def test_plain_cq_cannot_bypass_target_checks_or_mention_everyone():
+    for body in ("[CQ:at,qq=all] hello", "[CQ:at,qq=987654321] hello"):
+        out = render_reply(body, group=True, speakers={123456789})
+        assert out == body.replace("[", "&#91;").replace("]", "&#93;")
+    assert render_reply("[CQ:at,qq=123456789] hello", group=False, speakers={123456789}) == "&#91;CQ:at,qq=123456789&#93; hello"
+
+
+@pytest.mark.parametrize("text", [
+    "普通回复 @昵称，QQ号 123456789",
+    "邮箱 user@123456789.com 和 user+tag@example.com",
+    "链接 https://example.com/@123456789 和 https://example.com/?q=@123456789",
+    "示例 `@123456789` 和 `[CQ:at,qq=123456789]`",
+])
+def test_normalizing_mentions_preserves_regular_text_email_urls_and_code(text):
+    out = render_reply(text, group=True, speakers={123456789})
+    assert out == text.replace("[CQ:at,qq=123456789]", "&#91;CQ:at,qq=123456789&#93;")
+
+
+def test_inline_mentions_respect_existing_ten_target_limit():
+    ids = list(range(123456780, 123456791))
+    text = " ".join(f"@{uid}" for uid in ids) + " hello"
+    out = render_reply(text, group=True, speakers=set(ids))
+    assert out.count("[CQ:at,") == 10
+    assert "@123456790" not in out
+    assert "该用户" in out
+
+
 async def test_recent_context_combines_recovery_and_live_without_replaying_commands():
     old = {"post_type": "message", "message_type": "group", "self_id": 90, "group_id": 20,
            "user_id": 10, "sender": {"user_id": 10, "nickname": "学渣"}, "time": 990,

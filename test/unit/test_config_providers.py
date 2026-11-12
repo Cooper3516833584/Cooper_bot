@@ -13,20 +13,19 @@ def _vision_from_file(tmp_path: Path, monkeypatch, lines: list[str]) -> tuple[st
 
 
 def test_vision_file_config_keeps_line_position_when_embedding_blank(tmp_path, monkeypatch) -> None:
-    """embedding 第 3、4 行留空时，vision 仍必须取第 5、6 行。"""
+    """Embedding 留空或残留旧视觉凭据时，识图仍复用 DeepSeek。"""
     base, key = _vision_from_file(
         tmp_path,
         monkeypatch,
-        ["https://deepseek.example", "deepseek-key", "", "", "https://vision.example/", "vision-key"],
+        ["https://deepseek.example/", "deepseek-key", "", "", "https://vision.example", "vision-key"],
     )
 
-    assert base == "https://vision.example"  # 末尾斜杠被去掉
-    assert key == "vision-key"
-    # VISION_ENABLED 由这两项推导；留空的 embedding 不能再把 vision 顶掉。
+    assert base == "https://deepseek.example"  # 末尾斜杠被去掉
+    assert key == "deepseek-key"
     assert bool(base and key) is True
 
 
-def test_vision_file_config_unchanged_for_full_six_lines(tmp_path, monkeypatch) -> None:
+def test_vision_file_config_reuses_deepseek_with_full_six_lines(tmp_path, monkeypatch) -> None:
     base, key = _vision_from_file(
         tmp_path,
         monkeypatch,
@@ -40,20 +39,23 @@ def test_vision_file_config_unchanged_for_full_six_lines(tmp_path, monkeypatch) 
         ],
     )
 
-    assert base == "https://vision.example"
-    assert key == "vision-key"
+    assert base == "https://deepseek.example"
+    assert key == "deepseek-key"
     assert bool(base and key) is True
 
 
 def test_vision_file_config_needs_enough_lines_without_index_error(tmp_path, monkeypatch) -> None:
-    for lines in ([], ["only-one"], ["a", "b", "c", "d"]):
+    for lines in ([], ["", "", "", "", "https://old.example", "old-key"]):
         base, key = _vision_from_file(tmp_path, monkeypatch, lines)
         assert (base, key) == ("", "")
 
-    # 只有第 5 行、缺第 6 行：base 有值但 key 为空，仍然判定为未启用。
-    base, key = _vision_from_file(tmp_path, monkeypatch, ["a", "b", "c", "d", "e"])
+    # 只有 DeepSeek base、缺 key 时，仍然判定为未启用。
+    base, key = _vision_from_file(tmp_path, monkeypatch, ["https://deepseek.example"])
+    assert base == "https://deepseek.example"
     assert key == ""
     assert bool(base and key) is False
+
+    assert _vision_from_file(tmp_path, monkeypatch, ["https://deepseek.example", "key"]) == ("https://deepseek.example", "key")
 
 
 def test_vision_file_config_survives_unreadable_path(tmp_path, monkeypatch) -> None:

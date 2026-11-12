@@ -1,0 +1,13 @@
+You are reviewing subject placement for a learning material file.
+Goal: only detect obvious misclassification.
+Be very conservative: if there is any ambiguity, keep it unchanged.
+Only move when mismatch is obvious (for example, analog circuits placed in politics).
+Return strict JSON only with keys: action, target_subject, confidence, obvious_error, reason.
+action must be 'move' or 'keep'.
+candidate_subjects={{subjects}}
+current_subject={{current_subject}}
+file_relative_path={{relative_path}}
+file_name={{filename}}
+index_summary={{summary}}
+index_keywords={{keywords}}
+content_snippet={{snippet}}

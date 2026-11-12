@@ -383,18 +383,17 @@ except FileNotFoundError:
 
 # ===== 视觉描述 Skill（VISION_*）=====
 # 视觉 API 配置优先从环境变量 / secrets.env 读取；
-# 未配置时兜底读取 api_key.txt 第 5、6 行（视觉 base url + key）。
+# 未配置时复用 api_key.txt 第 1、2 行的 DeepSeek base url + key。
 def _read_vision_config_from_api_key_txt() -> "tuple[str, str]":
-    # api_key.txt 是位置型配置：空行表示该行留空，必须保留行位，
-    # 否则未配置 Embedding 时第 5、6 行的 Vision 配置会左移到第 3、4 行。
+    # api_key.txt 是位置型配置；保留空行，不读取旧的第 5、6 行视觉凭据。
     try:
         lines = [
             x.strip()
             for x in AI_API_KEY_PATH.read_text(encoding="utf-8").splitlines()
         ]
-        if len(lines) < 6:
-            lines += [""] * (6 - len(lines))
-        return lines[4].rstrip("/"), lines[5]
+        if len(lines) < 2:
+            lines += [""] * (2 - len(lines))
+        return lines[0].rstrip("/"), lines[1]
     except Exception:
         pass
     return "", ""
@@ -405,7 +404,7 @@ _VISION_BASE_URL_FROM_FILE, _VISION_API_KEY_FROM_FILE = _read_vision_config_from
 VISION_ENABLED = _get_env_bool("VISION_ENABLED", bool(_VISION_BASE_URL_FROM_FILE and _VISION_API_KEY_FROM_FILE))
 VISION_API_KEY = _get_env("VISION_API_KEY", _VISION_API_KEY_FROM_FILE)
 VISION_BASE_URL = _get_env("VISION_BASE_URL", _VISION_BASE_URL_FROM_FILE)
-VISION_MODEL = _get_env("VISION_MODEL", "qwen3.5-flash")
+VISION_MODEL = _get_env("VISION_MODEL", "deepseek-flash")
 VISION_TIMEOUT_SECONDS = float(_get_env("VISION_TIMEOUT_SECONDS", "20") or "20")
 VISION_MAX_IMAGES_PER_MESSAGE = int(_get_env("VISION_MAX_IMAGES_PER_MESSAGE", "20") or "20")
 VISION_MAX_IMAGE_BYTES = int(_get_env("VISION_MAX_IMAGE_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024))

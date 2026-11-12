@@ -3,9 +3,18 @@ from __future__ import annotations
 
 import html
 import json
+import re
 
 from .message_context import message_segments, normalize_onebot_event, positive_id
 from .quote_context import message_allowed
+
+
+_CQ_AT_RE = re.compile(r"\[CQ:at,[^\]]*\]", re.I)
+_INLINE_AT_RE = re.compile(
+    r"(?P<literal>https?://[^\s<>]+|`+[^`]*`+|[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"
+    r"|(?P<cq>\[CQ:at,[^\]]*\])"
+    r"|(?<![A-Za-z0-9_@])[@＠](?P<qq>[0-9]{1,20})(?![A-Za-z0-9_@])", re.I,
+)
 
 
 def mentioned_users(event):
@@ -73,13 +82,38 @@ async def recent_context(api, evt, aisvc, identity, session_key, cutoff):
     return ordered[-limit:] if limit else []
 
 
+def _render_mentions(body, *, group, speakers, targets, escape_body=False):
+    def escape_cq(value):
+        return _CQ_AT_RE.sub(lambda m: m[0].replace("[", "&#91;").replace("]", "&#93;"), value)
+
+    def replace(match):
+        value = match[0]
+        if match.group("literal"):
+            return value if escape_body else escape_cq(value)
+        is_cq = match.group("cq") is not None
+        uid = positive_id(message_segments(value)[0]["data"].get("qq")) if is_cq else positive_id(match.group("qq"))
+        if not group or uid is None or uid not in speakers or (uid not in targets and len(targets) >= 10):
+            if is_cq:
+                return value if escape_body else escape_cq(value)
+            return "该用户"
+        if uid not in targets:
+            targets.append(uid)
+        return ""
+
+    # 仅已确认的群成员可转成真正的 @；与结构化目标合并后，同一人只保留一次。
+    body = _INLINE_AT_RE.sub(replace, body)
+    if escape_body:
+        body = html.escape(body, quote=False).replace("[", "&#91;").replace("]", "&#93;")
+    return " ".join([*(f"[CQ:at,qq={uid}]" for uid in targets), body.strip()]).strip() if targets else body
+
+
 def render_reply(text, *, group, speakers):
     try:
         payload = json.loads(text)
     except (ValueError, TypeError):
-        return text
+        payload = None
     if not isinstance(payload, dict) or "qq_reply" not in payload:
-        return text
+        return _render_mentions(text, group=group, speakers=speakers, targets=[]) if isinstance(text, str) else text
     reply = payload["qq_reply"]
     if set(payload) != {"qq_reply"} or not isinstance(reply, dict) or set(reply) not in ({"text"}, {"text", "at"}):
         raise ValueError("invalid QQ reply envelope")
@@ -89,5 +123,4 @@ def render_reply(text, *, group, speakers):
     targets = list(dict.fromkeys(positive_id(uid) for uid in mentions))
     if targets and (not group or any(uid is None or uid not in speakers for uid in targets)):
         raise ValueError("unverified QQ mention target")
-    body = html.escape(body, quote=False).replace("[", "&#91;").replace("]", "&#93;")
-    return " ".join([*(f"[CQ:at,qq={uid}]" for uid in targets), body])
+    return _render_mentions(body, group=group, speakers=speakers, targets=targets, escape_body=True)

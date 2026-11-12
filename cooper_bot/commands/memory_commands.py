@@ -13,7 +13,10 @@ def _short_fact(row: dict) -> str:
 
 
 async def handle_memory_command(service, identity, text: str, *, clear_admin_history=None, reset_context=None) -> tuple[str, bool]:
-    """Return reply text and whether a group admin result must be private."""
+    """Return reply text and a routing flag; memory replies stay in the current session."""
+    if identity.scene == "group":
+        identity = replace(identity, profile="public")
+
     async def _reset_context(target_identity):
         if callable(reset_context):
             await reset_context(target_identity)
@@ -48,7 +51,7 @@ async def handle_memory_command(service, identity, text: str, *, clear_admin_his
     parts = raw.split(maxsplit=2)
     action = parts[1].lower() if len(parts) > 1 else "help"
     argument = parts[2] if len(parts) > 2 else ""
-    private = identity.profile == "admin" and identity.scene == "group"
+    private = False
     # 所有记忆指令都要求权限等级 2 或以上；/memory on / off 是当前会话（私聊或群聊）的记忆开关。
     if not identity.memory_operator:
         return ("记忆指令需要权限等级 2 或以上。", private)

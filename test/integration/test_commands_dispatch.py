@@ -128,6 +128,114 @@ class _FakeAIService:
         self.semantic_find_paths = AsyncMock(return_value=[])
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scene", ["group", "private_friend"])
+@pytest.mark.parametrize("level", [1, 2, 3])
+@pytest.mark.parametrize("action", ["help", "status", "on", "off", "list", "history", "unknown"])
+async def test_memory_reply_stays_in_originating_session(tmp_path, monkeypatch, dispatch_harness, scene, level, action):
+    from cooper_bot.modules.memory.service import MemoryService
+
+    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", set())
+    ctx = _make_ctx(scene=scene, level=level, group_id=20001 if scene == "group" else None)
+    ai = _FakeAIService()
+    ai.memory = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    try:
+        await commands.dispatch(
+            api=SimpleNamespace(), ctx=ctx, evt={"self_id": 10101},
+            text=f"/memory {action}", filesvc=SimpleNamespace(),
+            logsvc=_DummyLogService(), state=commands.BotState(),
+            handin=SimpleNamespace(), perm=SimpleNamespace(get_level=lambda _actor: level), aisvc=ai,
+        )
+        assert len(dispatch_harness.messages) == 1
+        message = dispatch_harness.messages[0]
+        assert message["scene"] == scene
+        assert message["group_id"] == ctx.group_id
+        assert message["user_id"] == ctx.user_id
+        assert message["force_private_user_id"] is None
+        assert message["text"]
+        assert "记忆服务暂时不可用" not in message["text"]
+        if level < 2:
+            assert "需要权限等级 2 或以上" in message["text"]
+        await ai.memory.start()
+        scope_ids = await ai.memory.store.scope_ids()
+        if scene == "group":
+            assert all(":public:group:20001" in scope_id for scope_id in scope_ids)
+            if level >= 2 and action == "status":
+                assert "profile：public" in message["text"]
+        elif level == 3:
+            assert all(":admin:private:10001" in scope_id for scope_id in scope_ids)
+        ai.chat.assert_not_awaited()
+        ai.chat_with_context.assert_not_awaited()
+    finally:
+        await ai.memory.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_admin", [False, True])
+async def test_admin_group_memory_commands_use_public_scope(tmp_path, monkeypatch, dispatch_harness, configured_admin):
+    from dataclasses import replace
+    from cooper_bot.modules.memory.models import CapturedInput, MemoryIdentity
+    from cooper_bot.modules.memory.policy import scope_for
+    from cooper_bot.modules.memory.service import MemoryService
+
+    monkeypatch.setattr(commands, "ADMIN_USERS", {10001} if configured_admin else set())
+    monkeypatch.setattr("cooper_bot.modules.memory.service.config.AI_MEMORY_GROUP_ALLOWLIST", set())
+    ctx = _make_ctx(level=1 if configured_admin else 3)
+    ai = _FakeAIService()
+    ai.memory = MemoryService(enabled=True, db_path=tmp_path / "memory.sqlite3")
+    identity = MemoryIdentity(10101, ctx.user_id, "group", ctx.group_id, "public", True, True)
+    scope_id = scope_for(identity)
+    reset = AsyncMock()
+    ai.message_history = SimpleNamespace(forget_context=reset)
+
+    async def run(action):
+        await commands.dispatch(
+            api=SimpleNamespace(), ctx=ctx, evt={"self_id": 10101},
+            text=f"/memory {action}", filesvc=SimpleNamespace(),
+            logsvc=_DummyLogService(), state=commands.BotState(),
+            handin=SimpleNamespace(), perm=SimpleNamespace(get_level=lambda _actor: ctx.level), aisvc=ai,
+        )
+        message = dispatch_harness.messages[-1]
+        assert message["force_private_user_id"] is None
+        return message["text"]
+
+    try:
+        await ai.memory.set_group_enabled(identity, True, "all")
+        own = await ai.memory.remember_explicit(identity, "existing public fact")
+        other = replace(identity, actor_user_id=10002)
+        await ai.memory.remember_explicit(other, "other member fact")
+        await ai.memory.capture_passive(identity, CapturedInput("memory-history", "public history", source_kind="passive_chat"))
+        assert "profile：public" in await run("status")
+        assert "existing public fact" in await run("list")
+        assert "other member fact" not in dispatch_harness.messages[-1]["text"]
+        assert "existing public fact" in await run("search existing")
+        assert "public history" in await run("history")
+        assert "已记住" in await run(f"remember --replace {own['fact_id']} updated public fact")
+        assert "updated public fact" in await run("list")
+        updated = next(row for row in await ai.memory.list_facts(identity) if row["text"] == "updated public fact")
+        assert "已遗忘" in await run(f"forget {updated['fact_id']}")
+        assert "已记住" in await run("remember retained fact")
+        previous = (await ai.memory.store.scope(scope_id))["active_conversation_id"]
+        assert "已开始新对话" in await run("new")
+        assert (await ai.memory.store.scope(scope_id))["active_conversation_id"] != previous
+        assert "retained fact" in await run("list")
+        token = (await run("clear")).split("--confirm ")[1].split()[0]
+        assert "已清除" in await run(f"clear --confirm {token}")
+        assert await ai.memory.list_facts(identity) == []
+        assert len(await ai.memory.list_facts(other)) == 1
+        assert "已关闭" in await run("off")
+        assert not (await ai.memory.store.scope(scope_id))["enabled"]
+        assert "已开启" in await run("on")
+        assert (await ai.memory.store.scope(scope_id))["enabled"]
+        assert "已保存群约定" in await run("group remember shared rule")
+        assert "shared rule" in await run("list")
+        assert await ai.memory.store.scope_ids() == [scope_id]
+        assert reset.await_args_list
+        assert all(call.args[0].profile == "public" for call in reset.await_args_list)
+    finally:
+        await ai.memory.aclose()
+
+
 class _FakeHandinTask:
     def __init__(
         self,

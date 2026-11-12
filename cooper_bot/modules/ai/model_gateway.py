@@ -10,15 +10,15 @@ provider 一览：
     deepseek   文本任务（邮件分类、群通知判定/省流、日历文案、资料摘要、资料纠偏）
     search     DeepSeek Search API（直接返回结构化网页检索结果）
     embedding  向量化（/find 语义检索与资料索引）
-    vision     图片描述（qwen，与 DeepSeek 无关，集群聊图片解析）
+    vision     图片描述（默认 deepseek-flash，复用 DeepSeek 凭据）
 
 凭据取自 ``config/private/api_key.txt`` 的固定行位（空行必须保留位置，代表该行留空）：
 
     第 1 行 DeepSeek base url    第 2 行 DeepSeek api key
     第 3 行 Embedding base url   第 4 行 Embedding api key
-    第 5 行 Vision base url      第 6 行 Vision api key
+    第 5、6 行保留旧 Vision 配置位置，不再默认使用
 
-Vision 优先使用环境变量 / secrets.env；缺行按空字符串补齐，不抛异常。
+Vision 优先使用 VISION_* 环境变量，否则复用 DeepSeek 凭据；缺行按空字符串补齐。
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ KIND_VISION = "openai_compat_vision"
 # 端点实测（2026-09-12，/models）只公布 deepseek-flash 与 deepseek-v4-pro。
 DEFAULT_CHAT_MODEL = "deepseek-flash"
 DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
-DEFAULT_VISION_MODEL = "qwen3.5-flash"
+DEFAULT_VISION_MODEL = "deepseek-flash"
 
 REASONING_EFFORT_HIGH = "high"
 
@@ -85,7 +85,7 @@ def read_api_key_lines(api_key_path: Optional[Path] = None, log=None) -> List[st
     行序（与既有 6 行格式一致，不引入注释语法，每行都当作取值）：
         1 = deepseek base url，2 = deepseek api key，
         3 = embedding base url，4 = embedding api key，
-        5 = vision base url，6 = vision api key。
+        5、6 = 旧 vision 凭据（保留行位，不再默认使用）。
     """
     path = Path(api_key_path) if api_key_path is not None else Path(core_config.AI_API_KEY_PATH)
     try:
@@ -136,8 +136,8 @@ def build_providers(
         VISION_PROVIDER: ProviderConfig(
             name=VISION_PROVIDER,
             kind=KIND_VISION,
-            base_url=str(vision_base_url or "").rstrip("/"),
-            api_key=str(vision_api_key or ""),
+            base_url=str(vision_base_url or base).rstrip("/"),
+            api_key=str(vision_api_key or key),
             model=str(vision_model or DEFAULT_VISION_MODEL),
             enabled=bool(vision_enabled),
         ),
@@ -150,7 +150,7 @@ def load_providers(api_key_path: Optional[Path] = None) -> Dict[str, ProviderCon
     行序（保留空行，缺行按空字符串补齐；不引入注释语法，每行都当作取值）：
         1 = deepseek base url，2 = deepseek api key，
         3 = embedding base url，4 = embedding api key，
-        5 = vision base url，6 = vision api key。
+        5、6 = 旧 vision 凭据（保留行位，不再默认使用）。
     """
     # 补足到 6 行，避免位置型配置因缺行或空行而越界/左移。
     lines = read_api_key_lines(api_key_path) + [""] * 6
@@ -159,8 +159,8 @@ def load_providers(api_key_path: Optional[Path] = None) -> Dict[str, ProviderCon
         deepseek_api_key=lines[1],
         embedding_base_url=lines[2],
         embedding_api_key=lines[3],
-        vision_base_url=str(core_config.VISION_BASE_URL or lines[4]),
-        vision_api_key=str(core_config.VISION_API_KEY or lines[5]),
+        vision_base_url=str(core_config.VISION_BASE_URL or lines[0]),
+        vision_api_key=str(core_config.VISION_API_KEY or lines[1]),
         vision_enabled=bool(core_config.VISION_ENABLED),
         chat_model=str(core_config.AI_CHAT_MODEL or ""),
         embed_model=str(core_config.AI_EMBED_MODEL or ""),
@@ -518,6 +518,8 @@ class ModelGateway:
             "messages": messages,
             "temperature": 0.0,
         }
+        if cfg.model.startswith("deepseek-"):
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         if max_tokens is not None:
             kwargs["max_tokens"] = int(max_tokens)
         try:

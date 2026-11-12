@@ -128,7 +128,13 @@ async def test_full_admin_history_does_not_crowd_out_newer_group_context(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_structured_mention_uses_existing_single_reply_delivery(monkeypatch):
+@pytest.mark.parametrize("model_reply", [
+    '{"qq_reply":{"text":"不用谢","at":[20002]}}',
+    '{"qq_reply":{"text":"@20002 不用谢 [CQ:at,qq=20002]","at":[20002,20002]}}',
+    "@20002 不用谢 @20002",
+    "[CQ:at,qq=20002] 不用谢 [CQ:at,qq=20002]",
+])
+async def test_structured_mention_uses_existing_single_reply_delivery(monkeypatch, model_reply):
     svc = AIService(_Log())
     svc.memory = None
     svc._kimi_runner = _Runner()
@@ -139,7 +145,7 @@ async def test_structured_mention_uses_existing_single_reply_delivery(monkeypatc
     monkeypatch.setattr(commands, "_claim_recent_reply", lambda _: True)
     reply = AsyncMock(return_value=True)
     monkeypatch.setattr(commands, "reply", reply)
-    svc._kimi_runner.run = AsyncMock(return_value=SimpleNamespace(text='{"qq_reply":{"text":"不用谢","at":[20002]}}'))
+    svc._kimi_runner.run = AsyncMock(return_value=SimpleNamespace(text=model_reply))
     ctx = SimpleNamespace(scene="group", group_id=20001, user_id=10001, nickname="admin", card="")
     event = {"self_id": 90001, "message_id": "request", "message": [{"type": "at", "data": {"qq": "20002"}}]}
     assert await commands._handle_ai_chat_trigger(SimpleNamespace(), ctx, event, "回复不用谢", SimpleNamespace(log=Mock()), svc, forced_ai_input="回复不用谢", message_id="request")

@@ -42,8 +42,8 @@ def test_load_providers_reads_six_lines_in_order(tmp_path: Path, monkeypatch) ->
     assert providers["deepseek"].api_key == "ds-key"
     assert providers["embedding"].base_url == "https://embed.example/v1"
     assert providers["embedding"].api_key == "embed-key"
-    assert providers["vision"].base_url == "https://vision.example/v1"
-    assert providers["vision"].api_key == "vision-key"
+    assert providers["vision"].base_url == "https://ds.example/v1"
+    assert providers["vision"].api_key == "ds-key"
     assert providers["deepseek"].ready is True
     assert providers["embedding"].ready is True
     assert providers["vision"].ready is True
@@ -52,7 +52,7 @@ def test_load_providers_reads_six_lines_in_order(tmp_path: Path, monkeypatch) ->
     assert providers["search"].api_key == providers["deepseek"].api_key
 
 
-def test_load_providers_with_four_lines_leaves_vision_unconfigured(tmp_path: Path, monkeypatch) -> None:
+def test_load_providers_with_four_lines_reuses_deepseek_for_vision(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("cooper_bot.core.config.VISION_BASE_URL", "")
     monkeypatch.setattr("cooper_bot.core.config.VISION_API_KEY", "")
     # 与部署环境解耦：没有凭据的环境里 VISION_ENABLED 默认 False，会掩盖行位断言。
@@ -63,8 +63,10 @@ def test_load_providers_with_four_lines_leaves_vision_unconfigured(tmp_path: Pat
 
     assert providers["deepseek"].ready is True
     assert providers["embedding"].ready is True
-    assert providers["vision"].base_url == ""
-    assert providers["vision"].ready is False
+    assert providers["vision"].base_url == "https://ds.example"
+    assert providers["vision"].api_key == "k"
+    assert providers["vision"].model == "deepseek-flash"
+    assert providers["vision"].ready is True
 
 
 def test_load_providers_lets_env_override_vision_file_values(tmp_path: Path, monkeypatch) -> None:
@@ -456,9 +458,37 @@ async def test_vision_describe_uses_injected_client_and_model() -> None:
     assert client.chat.completions.calls[0]["model"] == "qwen3.5-flash"
     assert client.chat.completions.calls[0]["max_tokens"] == 1600
     assert client.chat.completions.calls[0]["temperature"] == 0.0
+    assert "extra_body" not in client.chat.completions.calls[0]
     content = client.chat.completions.calls[0]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "系统提示"}
     assert content[1]["image_url"]["url"] == "data:image/png;base64,AAA"
+
+
+async def test_vision_describe_reuses_deepseek_client_credentials_and_disables_thinking(monkeypatch) -> None:
+    captured = {}
+    client = _FakeVisionClient(content='{"scene":"red square"}')
+
+    def make_client(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(model_gateway, "AsyncOpenAI", make_client)
+    gateway = ModelGateway(provider_source=lambda: model_gateway.build_providers(
+        deepseek_base_url="https://ds.example/v1/", deepseek_api_key="ds-key", chat_model="deepseek-v4-pro",
+    ))
+    text = await gateway.vision_describe(
+        "data:image/png;base64,AAA", system_prompt="describe as JSON", max_tokens=1600, timeout=20,
+    )
+
+    assert text == '{"scene":"red square"}'
+    assert captured["base_url"] == "https://ds.example/v1"
+    assert captured["api_key"] == "ds-key"
+    assert captured["timeout"] == 20
+    call = client.chat.completions.calls[0]
+    assert call["model"] == "deepseek-flash"
+    assert call["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert call["max_tokens"] == 1600
+    assert call["messages"][0]["content"][1]["image_url"]["url"] == "data:image/png;base64,AAA"
 
 
 async def test_vision_describe_retries_without_max_tokens_on_type_error() -> None:
@@ -697,8 +727,8 @@ def test_load_providers_keeps_fixed_positions_with_blank_lines(tmp_path: Path, m
     assert providers["embedding"].base_url == ""
     assert providers["embedding"].api_key == ""
     assert providers["embedding"].ready is False
-    assert providers["vision"].base_url == "https://vision.example/v1"
-    assert providers["vision"].api_key == "vision-key"
+    assert providers["vision"].base_url == "https://ds.example/v1"
+    assert providers["vision"].api_key == "ds-key"
     assert providers["vision"].ready is True
 
 

@@ -1,0 +1,12 @@
+{
+  "checked_at": 1794388533,
+  "fingerprint": {
+    "version": "future-version-string",
+    "public_config_sha256": "a"
+  },
+  "protocol_ok": true,
+  "public_forbidden_tools_blocked": true,
+  "public_websearch_ready": true,
+  "admin_bash_ready": true,
+  "errors": []
+}
