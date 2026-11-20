@@ -42,6 +42,9 @@ AI 提示词的完整目录、变量和生效范围见 [PROMPTS.md](PROMPTS.md)�
 
 飞书只读 MCP 默认关闭。凭证只能放在 `config/private/feishu/credentials.json`，不得放入 `secrets.env`；详见 [飞书只读 MCP 部署与回滚](../docs/feishu_readonly_mcp.md)。
 选题提醒独立使用上述凭证，通过飞书只读记录查询 API 获取结构化数据，不依赖 Kimi 或其飞书开关。成员按“负责人或参与人＋立项日期”统计立项，按“已完成＋本月结项日期”统计完成（每月15日起展示）；部长按系统创建人、创建时间统计前天零点至播报时刻的新增数。缺失日期的相关记录会提示未计入。测试期保持 `admin_only: true`；确认后才设为 `false` 并填写目标 `group_id`。未启用或管理员为空时不会转发到群。断线重连后仅补发当天22:50后的报告，发送结果不明时保留状态避免自动重发；状态位于 `runtime/state/topic_reminder/state.json`，不会上传 Git。真实表标识及名单仅填写在私有配置中。
+
+群发选题提醒可在私有配置中填写 `member_qq`，键为 `members` 中的姓名，值为 QQ 号（正整数）。两行进度名单中同一个 QQ 号只在首次出现时 @，没有映射的成员仍显示姓名。
+
 启动器默认查找当前用户桌面下的 `Cooper_bot`，其他位置可设置系统环境变量 `COOPER_BOT_ROOT`。
 
 聊天记录、权限数据库、提交记录、日历发送状态、Kimi profile 认证与缓存仍按原有格式保存在运行目录，

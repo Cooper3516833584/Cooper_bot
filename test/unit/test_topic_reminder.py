@@ -136,6 +136,28 @@ async def test_group_delivery_requires_explicit_configuration(reminder):
     api.send_private_msg.assert_not_called()
 
 
+async def test_group_mentions_pending_members_once_from_existing_snapshot(reminder):
+    service, cfg = reminder
+    cfg.update(admin_only=False, members=["甲", "乙", "丙"], member_qq={"甲": 10001, "乙": 10002})
+    service.config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    now = datetime(2026, 11, 19, 22, 50, tzinfo=TZ)
+    messages = render_reports([row(owner="乙")], now, cfg["members"], cfg["ministers"])
+    service._save({"2026-11-19": {"messages": messages, "deliveries": {}}})
+    api = api_with()
+    api.send_group_msg.return_value = {"status": "ok", "retcode": 0, "data": {"message_id": 2}}
+
+    await service.check_once(api, now)
+    await service.check_once(api, now)
+
+    calls = api.send_group_msg.await_args_list
+    assert len(calls) == 2
+    assert "当月尚未立项成员：甲 [CQ:at,qq=10001]、丙" in calls[0].args[1]
+    assert "本月尚未完成选题成员：甲、乙 [CQ:at,qq=10002]、丙" in calls[0].args[1]
+    assert calls[1].args[1] == messages[1]
+    assert service._load(service.state_path)["2026-11-19"]["messages"] == messages
+    service.fetch_records.assert_not_awaited()
+
+
 @pytest.mark.parametrize("result", [None, {"status": "ok", "retcode": 0, "data": {}}])
 async def test_uncertain_send_is_never_automatically_duplicated(reminder, result):
     service, _ = reminder

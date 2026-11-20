@@ -5,5 +5,6 @@
   "app_token": "",
   "table_id": "",
   "members": ["成员甲", "成员乙"],
+  "member_qq": {},
   "ministers": ["部长甲", "部长乙"]
 }

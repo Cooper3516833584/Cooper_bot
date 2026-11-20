@@ -16,6 +16,8 @@ from cooper_bot.modules.ai.feishu_secrets import load_feishu_credentials
 
 TZ = ZoneInfo("Asia/Shanghai")
 FIELDS = ["负责人", "参与人", "完成状态", "立项日期", "结项日期"]
+_NOT_STARTED = "⚠️ 当月尚未立项成员："
+_NOT_COMPLETED = "⏳ 本月尚未完成选题成员："
 
 
 def _people(value):
@@ -62,9 +64,9 @@ def render_reports(records, now, members, ministers):
 
     lines = ["📢 【喻家山下·每日选题进度播报】",
              f"🗓️ 日期：{now.year}年{now.month}月{now.day}日",
-             "⚠️ 当月尚未立项成员：" + ("、".join(n for n in members if n not in established) or "无")]
+             _NOT_STARTED + ("、".join(n for n in members if n not in established) or "无")]
     if now.day >= 15:
-        lines.append("⏳ 本月尚未完成选题成员：" + ("、".join(n for n in members if n not in completed) or "无"))
+        lines.append(_NOT_COMPLETED + ("、".join(n for n in members if n not in completed) or "无"))
     if undated:
         lines.append("⚠️ 部分选题缺少立项日期或已完成但缺少结项日期，未计入对应统计："
                      + "、".join(n for n in members if n in undated))
@@ -74,6 +76,27 @@ def render_reports(records, now, members, ministers):
                      + "\n".join(f"{name}：{count}篇" for name, count in counts.items())
                      + "\n💪 各位部长继续加油，保持选题产出节奏！")
     return ["\n".join(lines), minister_text]
+
+
+def _mention_pending_members(message, member_qq):
+    if not isinstance(member_qq, dict) or not member_qq:
+        return message
+    lines, mentioned = message.split("\n"), set()
+    for i, line in enumerate(lines):
+        if not line.startswith((_NOT_STARTED, _NOT_COMPLETED)):
+            continue
+        label, colon, names = line.partition("：")
+        if names == "无":
+            continue
+        people = []
+        for name in names.split("、"):
+            uid = member_qq.get(name)
+            if type(uid) is int and uid > 0 and uid not in mentioned:
+                mentioned.add(uid)
+                name += f" [CQ:at,qq={uid}]"
+            people.append(name)
+        lines[i] = label + colon + "、".join(people)
+    return "\n".join(lines)
 
 
 class TopicReminderService:
@@ -187,6 +210,8 @@ class TopicReminderService:
                         if scene == "private":
                             result = await api.send_private_msg(target, message)
                         else:
+                            if part == 0:
+                                message = _mention_pending_members(message, cfg.get("member_qq"))
                             result = await api.send_group_msg(target, message)
                     except Exception:
                         day["deliveries"][key] = "uncertain"
