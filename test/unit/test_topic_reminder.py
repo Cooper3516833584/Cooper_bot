@@ -136,13 +136,15 @@ async def test_group_delivery_requires_explicit_configuration(reminder):
     api.send_private_msg.assert_not_called()
 
 
-async def test_group_mentions_pending_members_once_from_existing_snapshot(reminder):
+@pytest.mark.parametrize("day", [15, 16])
+async def test_group_mentions_pending_members_from_day_sixteen(reminder, day):
     service, cfg = reminder
     cfg.update(admin_only=False, members=["甲", "乙", "丙"], member_qq={"甲": 10001, "乙": 10002})
     service.config_path.write_text(json.dumps(cfg), encoding="utf-8")
-    now = datetime(2026, 11, 19, 22, 50, tzinfo=TZ)
+    now = datetime(2026, 11, day, 22, 50, tzinfo=TZ)
+    day_key = now.date().isoformat()
     messages = render_reports([row(owner="乙")], now, cfg["members"], cfg["ministers"])
-    service._save({"2026-11-19": {"messages": messages, "deliveries": {}}})
+    service._save({day_key: {"messages": messages, "deliveries": {}}})
     api = api_with()
     api.send_group_msg.return_value = {"status": "ok", "retcode": 0, "data": {"message_id": 2}}
 
@@ -151,10 +153,16 @@ async def test_group_mentions_pending_members_once_from_existing_snapshot(remind
 
     calls = api.send_group_msg.await_args_list
     assert len(calls) == 2
-    assert "当月尚未立项成员：甲 [CQ:at,qq=10001]、丙" in calls[0].args[1]
-    assert "本月尚未完成选题成员：甲、乙 [CQ:at,qq=10002]、丙" in calls[0].args[1]
+    monthly = calls[0].args[1]
+    if day == 15:
+        assert monthly == messages[0]
+        assert "本月尚未完成选题成员：甲、乙、丙" in monthly
+        assert "[CQ:at" not in monthly
+    else:
+        assert "当月尚未立项成员：[CQ:at,qq=10001]、丙" in monthly
+        assert "本月尚未完成选题成员：[CQ:at,qq=10001]、[CQ:at,qq=10002]、丙" in monthly
     assert calls[1].args[1] == messages[1]
-    assert service._load(service.state_path)["2026-11-19"]["messages"] == messages
+    assert service._load(service.state_path)[day_key]["messages"] == messages
     service.fetch_records.assert_not_awaited()
 
 

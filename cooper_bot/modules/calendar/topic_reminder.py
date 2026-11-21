@@ -81,7 +81,7 @@ def render_reports(records, now, members, ministers):
 def _mention_pending_members(message, member_qq):
     if not isinstance(member_qq, dict) or not member_qq:
         return message
-    lines, mentioned = message.split("\n"), set()
+    lines = message.split("\n")
     for i, line in enumerate(lines):
         if not line.startswith((_NOT_STARTED, _NOT_COMPLETED)):
             continue
@@ -91,9 +91,8 @@ def _mention_pending_members(message, member_qq):
         people = []
         for name in names.split("、"):
             uid = member_qq.get(name)
-            if type(uid) is int and uid > 0 and uid not in mentioned:
-                mentioned.add(uid)
-                name += f" [CQ:at,qq={uid}]"
+            if type(uid) is int and uid > 0:
+                name = f"[CQ:at,qq={uid}]"
             people.append(name)
         lines[i] = label + colon + "、".join(people)
     return "\n".join(lines)
@@ -210,7 +209,7 @@ class TopicReminderService:
                         if scene == "private":
                             result = await api.send_private_msg(target, message)
                         else:
-                            if part == 0:
+                            if part == 0 and now.day >= 16:
                                 message = _mention_pending_members(message, cfg.get("member_qq"))
                             result = await api.send_group_msg(target, message)
                     except Exception:
