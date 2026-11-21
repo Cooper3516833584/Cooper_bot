@@ -694,7 +694,6 @@ class KimiCliRunner:
         self._executable_resolver = executable_resolver
         self._argv_prefix = tuple(argv_prefix or ())
         self._global_slots = asyncio.Semaphore(max(1, int(settings.max_concurrency)))
-        self._admin_slot = asyncio.Lock()
         self._queue_lock = asyncio.Lock()
         self._queued = 0
         self._max_queue = max(1, int(max_queue))
@@ -777,27 +776,18 @@ class KimiCliRunner:
             result = fitting
         return result
 
-    async def _acquire_slot(self, request: KimiRunRequest) -> tuple[bool, bool]:
+    async def _acquire_slot(self, request: KimiRunRequest) -> None:
         async with self._queue_lock:
             if self._closing or self._queued >= self._max_queue:
                 raise KimiBusyError(request.request_id)
             self._queued += 1
-        admin_acquired = False
-        global_acquired = False
         try:
-            if request.profile == "admin":
-                await asyncio.wait_for(self._admin_slot.acquire(), timeout=self._queue_timeout_seconds)
-                admin_acquired = True
             await asyncio.wait_for(self._global_slots.acquire(), timeout=self._queue_timeout_seconds)
-            global_acquired = True
-            return admin_acquired, global_acquired
         except TimeoutError as exc:
             raise KimiBusyError(request.request_id) from exc
         finally:
             async with self._queue_lock:
                 self._queued = max(0, self._queued - 1)
-            if not global_acquired and admin_acquired:
-                self._admin_slot.release()
 
     @staticmethod
     async def _read_stream(stream: asyncio.StreamReader, maximum: int, *, keep_tail: bool = False) -> bytes:
@@ -1084,7 +1074,7 @@ class KimiCliRunner:
             raise KimiSecurityViolation(request.request_id, "public_profile_unhealthy")
         profile = self._profile_for(request.profile, request.request_id)
         argv = self._build_argv(request, profile)
-        admin_acquired, global_acquired = await self._acquire_slot(request)
+        await self._acquire_slot(request)
         process: Optional[asyncio.subprocess.Process] = None
         stdout_task: Optional[asyncio.Task[bytes]] = None
         stderr_task: Optional[asyncio.Task[bytes]] = None
@@ -1171,10 +1161,7 @@ class KimiCliRunner:
                 await asyncio.gather(*pending_tasks, return_exceptions=True)
             if process is not None:
                 self._processes.discard(process)
-            if global_acquired:
-                self._global_slots.release()
-            if admin_acquired:
-                self._admin_slot.release()
+            self._global_slots.release()
 
     async def aclose(self) -> None:
         self._closing = True
