@@ -587,7 +587,7 @@ class AIService:
         payload["reply_contract"] = (
             '当前会话的文本由 bot 统一发送，你只返回最终回复，不通过 Bash/HTTP/QQ 工具另发同一会话文本。'
             '普通聊天、接话、回某人一句只需直接回答；群内明确要求回复某位成员时 @ 目标，返回 JSON '
-            '{"qq_reply":{"text":"回复正文","at":[成员QQ号]}}，QQ号仅取当前发言者、mentioned_user_ids、历史或引用中已确认的 speaker。'
+            '{"qq_reply":{"text":"回复正文","at":[成员QQ号]}}。'
             '普通接话不要自动 @ 发言人；需要 @ 时仅填写 at 列表，同一成员只填一次，正文不要另写 @QQ号 或 CQ 码。'
             '找不到或同名不明确时询问，不搜索本机文件或读取凭据来找人。'
             'recent_conversation 是当前 QQ 会话的近期发言数据，与 conversation_history 按 message_id 去重理解，'
@@ -720,12 +720,7 @@ class AIService:
                 self._kimi_capability_errors = tuple(dict.fromkeys((*self._kimi_capability_errors, "kimi_public_forbidden_tool_observed")))
             raise
         text = str(result.text or "").strip()
-        speakers = {positive_id(item.get("_speaker", {}).get("user_id")) for item in history + visible}
-        speakers.add(positive_id((speaker or {}).get("user_id")))
-        speakers.update(positive_id(uid) for uid in (speaker or {}).get("mentioned_user_ids", []))
-        if quoted_message and quoted_message.get("available"):
-            speakers.add(positive_id(quoted_message.get("speaker", {}).get("user_id")))
-        text = render_reply(text, group=base_key.startswith("group:"), speakers=speakers)
+        text = render_reply(text, group=base_key.startswith("group:"))
         if not text:
             raise RuntimeError("empty kimi response")
         if storage_key and not defer_history:

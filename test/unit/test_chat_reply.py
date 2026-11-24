@@ -7,17 +7,17 @@ import pytest
 from cooper_bot.modules.ai.chat_reply import recent_context, render_reply
 
 
-def test_plain_text_stays_compatible_and_verified_mention_is_rendered_once():
-    assert render_reply("普通回复", group=True, speakers={10}) == "普通回复"
+def test_plain_text_stays_compatible_and_structured_mention_is_rendered_once():
+    assert render_reply("普通回复", group=True) == "普通回复"
     text = json.dumps({"qq_reply": {"text": "不用谢 [CQ:at,qq=all]", "at": [10, 10]}}, ensure_ascii=False)
-    reply = render_reply(text, group=True, speakers={10})
+    reply = render_reply(text, group=True)
     assert reply == "[CQ:at,qq=10] 不用谢 &#91;CQ:at,qq=all&#93;"
 
 
 @pytest.mark.parametrize("group", [True, False])
 def test_missing_at_defaults_to_no_mentions_and_still_escapes_cq(group):
     text = json.dumps({"qq_reply": {"text": "hello [CQ:at,qq=all]"}})
-    assert render_reply(text, group=group, speakers=set()) == "hello &#91;CQ:at,qq=all&#93;"
+    assert render_reply(text, group=group) == "hello &#91;CQ:at,qq=all&#93;"
 
 
 @pytest.mark.parametrize("payload", [
@@ -29,13 +29,13 @@ def test_missing_at_defaults_to_no_mentions_and_still_escapes_cq(group):
 ])
 def test_missing_at_compatibility_does_not_accept_other_malformed_envelopes(payload):
     with pytest.raises(ValueError):
-        render_reply(json.dumps(payload), group=True, speakers={10})
+        render_reply(json.dumps(payload), group=True)
 
 
-@pytest.mark.parametrize("mentions,group", [([11], True), (["all"], True), ([True], True), ([10], False)])
-def test_unverified_mention_and_private_mentions_are_rejected(mentions, group):
+@pytest.mark.parametrize("mentions,group", [(["all"], True), ([True], True), ([0], True), ([10], False)])
+def test_invalid_and_private_structured_mentions_are_rejected(mentions, group):
     with pytest.raises(ValueError):
-        render_reply(json.dumps({"qq_reply": {"text": "hello", "at": mentions}}), group=group, speakers={10})
+        render_reply(json.dumps({"qq_reply": {"text": "hello", "at": mentions}}), group=group)
 
 
 @pytest.mark.parametrize("body", [
@@ -45,30 +45,29 @@ def test_unverified_mention_and_private_mentions_are_rejected(mentions, group):
     "@123456789 hello [CQ:at,qq=123456789]",
 ])
 @pytest.mark.parametrize("structured", [False, True])
-def test_inline_mentions_are_verified_and_rendered_only_once(body, structured):
+def test_inline_mentions_are_rendered_only_once(body, structured):
     text = json.dumps({"qq_reply": {"text": body, "at": [123456789, 123456789]}}) if structured else body
-    assert render_reply(text, group=True, speakers={123456789}) == "[CQ:at,qq=123456789] hello"
+    assert render_reply(text, group=True) == "[CQ:at,qq=123456789] hello"
 
 
 def test_inline_mentions_keep_distinct_members_and_target_order():
     text = json.dumps({"qq_reply": {"text": "@987654321 hello @123456789", "at": [123456789]}})
-    assert render_reply(text, group=True, speakers={123456789, 987654321}) == "[CQ:at,qq=123456789] [CQ:at,qq=987654321] hello"
+    assert render_reply(text, group=True) == "[CQ:at,qq=123456789] [CQ:at,qq=987654321] hello"
 
 
-@pytest.mark.parametrize("group,speakers", [(True, set()), (False, {123456789})])
 @pytest.mark.parametrize("structured", [False, True])
-def test_numeric_mentions_without_allowed_group_target_do_not_show_raw_qq(group, speakers, structured):
+def test_private_inline_mentions_do_not_show_raw_qq(structured):
     text = "@123456789 hello"
     if structured:
         text = json.dumps({"qq_reply": {"text": text}})
-    assert render_reply(text, group=group, speakers=speakers) == "该用户 hello"
+    assert render_reply(text, group=False) == "该用户 hello"
 
 
-def test_plain_cq_cannot_bypass_target_checks_or_mention_everyone():
-    for body in ("[CQ:at,qq=all] hello", "[CQ:at,qq=987654321] hello"):
-        out = render_reply(body, group=True, speakers={123456789})
+def test_plain_cq_cannot_mention_everyone_or_use_an_invalid_qq_number():
+    for body in ("[CQ:at,qq=all] hello", "[CQ:at,qq=0] hello"):
+        out = render_reply(body, group=True)
         assert out == body.replace("[", "&#91;").replace("]", "&#93;")
-    assert render_reply("[CQ:at,qq=123456789] hello", group=False, speakers={123456789}) == "&#91;CQ:at,qq=123456789&#93; hello"
+    assert render_reply("[CQ:at,qq=123456789] hello", group=False) == "&#91;CQ:at,qq=123456789&#93; hello"
 
 
 @pytest.mark.parametrize("text", [
@@ -78,17 +77,17 @@ def test_plain_cq_cannot_bypass_target_checks_or_mention_everyone():
     "示例 `@123456789` 和 `[CQ:at,qq=123456789]`",
 ])
 def test_normalizing_mentions_preserves_regular_text_email_urls_and_code(text):
-    out = render_reply(text, group=True, speakers={123456789})
+    out = render_reply(text, group=True)
     assert out == text.replace("[CQ:at,qq=123456789]", "&#91;CQ:at,qq=123456789&#93;")
 
 
-def test_inline_mentions_respect_existing_ten_target_limit():
-    ids = list(range(123456780, 123456791))
-    text = " ".join(f"@{uid}" for uid in ids) + " hello"
-    out = render_reply(text, group=True, speakers=set(ids))
-    assert out.count("[CQ:at,") == 10
-    assert "@123456790" not in out
-    assert "该用户" in out
+@pytest.mark.parametrize("structured_count", [0, 6, 12])
+def test_group_reply_renders_more_than_ten_mentions(structured_count):
+    ids = list(range(123456780, 123456792))
+    body = "hello" + "".join(f" @{uid}" for uid in ids[structured_count:])
+    text = json.dumps({"qq_reply": {"text": body, "at": ids[:structured_count]}}) if structured_count else body
+    expected = " ".join(f"[CQ:at,qq={uid}]" for uid in ids) + " hello"
+    assert render_reply(text, group=True) == expected
 
 
 async def test_recent_context_combines_recovery_and_live_without_replaying_commands():

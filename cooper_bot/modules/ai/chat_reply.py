@@ -82,7 +82,7 @@ async def recent_context(api, evt, aisvc, identity, session_key, cutoff):
     return ordered[-limit:] if limit else []
 
 
-def _render_mentions(body, *, group, speakers, targets, escape_body=False):
+def _render_mentions(body, *, group, targets, escape_body=False):
     def escape_cq(value):
         return _CQ_AT_RE.sub(lambda m: m[0].replace("[", "&#91;").replace("]", "&#93;"), value)
 
@@ -92,35 +92,33 @@ def _render_mentions(body, *, group, speakers, targets, escape_body=False):
             return value if escape_body else escape_cq(value)
         is_cq = match.group("cq") is not None
         uid = positive_id(message_segments(value)[0]["data"].get("qq")) if is_cq else positive_id(match.group("qq"))
-        if not group or uid is None or uid not in speakers or (uid not in targets and len(targets) >= 10):
+        if not group or uid is None:
             if is_cq:
                 return value if escape_body else escape_cq(value)
             return "该用户"
-        if uid not in targets:
-            targets.append(uid)
+        targets[uid] = None
         return ""
 
-    # 仅已确认的群成员可转成真正的 @；与结构化目标合并后，同一人只保留一次。
     body = _INLINE_AT_RE.sub(replace, body)
     if escape_body:
         body = html.escape(body, quote=False).replace("[", "&#91;").replace("]", "&#93;")
     return " ".join([*(f"[CQ:at,qq={uid}]" for uid in targets), body.strip()]).strip() if targets else body
 
 
-def render_reply(text, *, group, speakers):
+def render_reply(text, *, group):
     try:
         payload = json.loads(text)
     except (ValueError, TypeError):
         payload = None
     if not isinstance(payload, dict) or "qq_reply" not in payload:
-        return _render_mentions(text, group=group, speakers=speakers, targets=[]) if isinstance(text, str) else text
+        return _render_mentions(text, group=group, targets={}) if isinstance(text, str) else text
     reply = payload["qq_reply"]
     if set(payload) != {"qq_reply"} or not isinstance(reply, dict) or set(reply) not in ({"text"}, {"text", "at"}):
         raise ValueError("invalid QQ reply envelope")
     body, mentions = reply["text"], reply.get("at", [])
-    if not isinstance(body, str) or not body.strip() or not isinstance(mentions, list) or len(mentions) > 10:
+    if not isinstance(body, str) or not body.strip() or not isinstance(mentions, list):
         raise ValueError("invalid QQ reply content")
-    targets = list(dict.fromkeys(positive_id(uid) for uid in mentions))
-    if targets and (not group or any(uid is None or uid not in speakers for uid in targets)):
-        raise ValueError("unverified QQ mention target")
-    return _render_mentions(body, group=group, speakers=speakers, targets=targets, escape_body=True)
+    targets = dict.fromkeys(positive_id(uid) for uid in mentions)
+    if targets and (not group or None in targets):
+        raise ValueError("invalid QQ mention target")
+    return _render_mentions(body, group=group, targets=targets, escape_body=True)
