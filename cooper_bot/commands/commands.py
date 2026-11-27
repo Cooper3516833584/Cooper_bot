@@ -26,7 +26,7 @@ from cooper_bot.modules.handin.handinsvc import (
     pretty_ts,
     required_suffix_display,
 )
-from cooper_bot.commands.command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query, run_list_dir_query
+from cooper_bot.commands.command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query
 from cooper_bot.core.router import get_files
 from cooper_bot.core.ziputil import open_fast_zip, write_path as zip_write_path
 from cooper_bot.modules.calendar.daily_calendar import parse_calendar_date
@@ -124,7 +124,6 @@ _EXPLICIT_COMMAND_NAMES = {
     "help",
     "kick",
     "level",
-    "ls",
     "memory",
     "ping",
     "signin",
@@ -4426,6 +4425,9 @@ async def _handle_explicit_command(
             return
         await reply(api, ctx, f"已设置 {target_uid} 的等级为 {stored}（生效等级 {effective}）。", logsvc)
         return
+    if cmd in ("count", "countlist", "countremove") and ctx.level < 2:
+        await reply(api, ctx, f"权限不足：/{cmd} 仅对 2 级及以上开放。", logsvc)
+        return
     if cmd == "count":
         key = conv_key(ctx)
         old = state.pending_count_session.get(key)
@@ -4534,11 +4536,13 @@ async def _handle_explicit_command(
             "/help 或 /h  查看帮助",
             "/ping  检查在线状态",
             "/whoami  查看身份和权限等级",
-            "/count  开始临时收集名单；发送 end 结束并清空",
-            "/countlist  查看已提交名单和未交名单",
-            "/countremove 序号  移除已提交名单中的人名",
         ]
         if ctx.level >= 2:
+            lines.extend([
+                "/count  开始临时收集名单，发送 end 结束并清空",
+                "/countlist  查看已提交名单和未交名单",
+                "/countremove 序号  移除已提交名单中的人名",
+            ])
             lines.append("/autoat  单条消息依次 @ 当前群全部成员（仅群聊）")
             lines.append("/signin HH:MM  创建签到任务（群内创建，私聊发教室时间牌照片）")
             lines.append("/memory help  查看记忆管理用法（个人权限 2 级及以上）")
@@ -4555,7 +4559,6 @@ async def _handle_explicit_command(
             lines.extend([
                 "",
                 "资料检索：",
-                "/ls [root/子目录]  查看目录",
                 "/find 关键词 [root/子目录]  搜索文件或文件夹",
                 "/get 序号 [序号...]  获取搜索结果中的文件；文件夹自动打包",
                 "搜索后直接回复文件夹序号可进入目录。",
@@ -4786,12 +4789,8 @@ async def _handle_explicit_command(
         return
         return
     # 文件相关命令：游客(0)直接拒绝
-    if cmd in ("ls", "find", "get") and ctx.level < 1:
+    if cmd in ("find", "get") and ctx.level < 1:
         await reply(api, ctx, "权限不足：你当前是 0 级（游客），不能访问资料库。", logsvc)
-        return
-    if cmd == "ls":
-        ls_result = run_list_dir_query(filesvc=filesvc, ctx=ctx, path_arg=(rest if rest else None))
-        await reply(api, ctx, str(ls_result.message or ""), logsvc)
         return
     if cmd == "find":
         # 支持：

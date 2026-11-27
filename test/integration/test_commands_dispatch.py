@@ -421,10 +421,11 @@ async def test_command_find_folder_number_choice_precedes_private_aichat(tmp_dat
 
 
 @pytest.mark.asyncio
-async def test_command_ls_dispatch_uses_list_service(dispatch_harness) -> None:
-    list_mock = Mock(return_value=(True, "目录内容：\n📁 textbook_and_material/"))
+async def test_removed_ls_command_does_not_list_directories(monkeypatch, dispatch_harness) -> None:
+    list_mock = Mock()
     filesvc = _make_filesvc_stub(list_impl=list_mock)
     ctx = _make_ctx(scene="group", level=1)
+    monkeypatch.setattr(commands, "_handle_ai_chat_trigger", AsyncMock(return_value=False))
 
     await commands.dispatch(
         api=SimpleNamespace(),
@@ -439,8 +440,8 @@ async def test_command_ls_dispatch_uses_list_service(dispatch_harness) -> None:
         aisvc=None,
     )
 
-    list_mock.assert_called_once_with(ctx, "public")
-    assert any("目录内容" in one["text"] for one in dispatch_harness.messages)
+    list_mock.assert_not_called()
+    assert [one["text"] for one in dispatch_harness.messages] == ["未知命令（用 /help 查看）"]
 
 
 @pytest.mark.asyncio

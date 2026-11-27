@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -53,7 +54,8 @@ def _make_private_ctx() -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_count_flow_collect_countlist_and_end(monkeypatch) -> None:
+@pytest.mark.parametrize("level", [0, 1, 2, 3])
+async def test_count_flow_collect_countlist_and_end(monkeypatch, level) -> None:
     replies: list[str] = []
 
     async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
@@ -65,6 +67,7 @@ async def test_count_flow_collect_countlist_and_end(monkeypatch) -> None:
     state = commands.BotState()
     logsvc = _DummyLogService()
     ctx = _make_ctx()
+    ctx.level = level
     filesvc = _make_filesvc()
     handin = SimpleNamespace(
         _tasks={},
@@ -84,6 +87,10 @@ async def test_count_flow_collect_countlist_and_end(monkeypatch) -> None:
     )
 
     key = commands.conv_key(ctx)
+    if level < 2:
+        assert key not in state.pending_count_session
+        assert "/count 仅对 2 级及以上开放" in replies[-1]
+        return
     assert key in state.pending_count_session
 
     handled = await commands._handle_pre_dispatch_state(
@@ -142,13 +149,39 @@ async def test_count_flow_collect_countlist_and_end(monkeypatch) -> None:
     assert "没有进行中的 /count 统计" in replies[-1]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/count", "/countlist", "/countremove 1"])
+async def test_level_one_cannot_access_active_count_session(monkeypatch, command) -> None:
+    reply = AsyncMock()
+    roster = Mock()
+    monkeypatch.setattr(commands, "reply", reply)
+    ctx = _make_ctx()
+    state = commands.BotState()
+    key = commands.conv_key(ctx)
+    state.pending_count_session[key] = {"names": ["Alice"], "ts": 1.0}
+
+    await commands._handle_explicit_command(
+        api=SimpleNamespace(),
+        ctx=ctx,
+        t=command,
+        filesvc=_make_filesvc(),
+        logsvc=_DummyLogService(),
+        state=state,
+        handin=SimpleNamespace(_get_roster=roster),
+    )
+
+    assert state.pending_count_session[key] == {"names": ["Alice"], "ts": 1.0}
+    roster.assert_not_called()
+    assert reply.await_args.args[2] == f"权限不足：{command.split()[0]} 仅对 2 级及以上开放。"
+
+
 def test_parse_count_names_supports_numbered_multiline() -> None:
     names = commands._parse_count_names("1、Alice\n2、Bob\n3)Carol\n4.Dave\n5.   Eve  6.Frank")
     assert names == ["Alice", "Bob", "Carol", "Dave", "Eve", "Frank"]
 
 
 @pytest.mark.asyncio
-async def test_help_includes_count_commands(monkeypatch) -> None:
+async def test_help_hides_count_and_ls_for_level_one(monkeypatch) -> None:
     replies: list[str] = []
 
     async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
@@ -170,14 +203,14 @@ async def test_help_includes_count_commands(monkeypatch) -> None:
     )
 
     assert replies
-    assert "/count  开始临时收集名单" in replies[-1]
-    assert "/countlist  查看已提交名单和未交名单" in replies[-1]
-    assert "/countremove 序号" in replies[-1]
+    assert "/count" not in replies[-1]
+    assert "/ls" not in replies[-1]
+    assert "/find" in replies[-1]
     assert "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）" not in replies[-1]
 
 
 @pytest.mark.asyncio
-async def test_help_includes_autoat_for_level_two(monkeypatch) -> None:
+async def test_help_includes_count_and_autoat_for_level_two(monkeypatch) -> None:
     replies: list[str] = []
 
     async def _fake_reply(_api, _ctx, text: str, _logsvc, force_private_user_id=None) -> None:
@@ -201,6 +234,10 @@ async def test_help_includes_autoat_for_level_two(monkeypatch) -> None:
     )
 
     assert replies
+    assert "/count  开始临时收集名单" in replies[-1]
+    assert "/countlist  查看已提交名单和未交名单" in replies[-1]
+    assert "/countremove 序号" in replies[-1]
+    assert "/ls" not in replies[-1]
     assert "/autoat  单条消息依次 @ 当前群全部成员（仅群聊）" in replies[-1]
 
 
@@ -313,6 +350,7 @@ async def test_countlist_is_bound_to_same_context(monkeypatch) -> None:
     state = commands.BotState()
     group_ctx = _make_ctx()
     private_ctx = _make_private_ctx()
+    private_ctx.level = 2
     state.pending_count_session[commands.conv_key(group_ctx)] = {"names": ["Alice"], "ts": 1.0}
 
     await commands._handle_explicit_command(
@@ -343,6 +381,7 @@ async def test_countremove_removes_by_submitted_index(monkeypatch) -> None:
 
     state = commands.BotState()
     ctx = _make_ctx()
+    ctx.level = 2
     key = commands.conv_key(ctx)
     state.pending_count_session[key] = {"names": ["Alice", "Bob", "Outsider"], "ts": 1.0}
 
