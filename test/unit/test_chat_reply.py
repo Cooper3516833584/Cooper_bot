@@ -14,6 +14,20 @@ def test_plain_text_stays_compatible_and_structured_mention_is_rendered_once():
     assert reply == "[CQ:at,qq=10] 不用谢 &#91;CQ:at,qq=all&#93;"
 
 
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("body,expected", [
+    ('先输入 `/find "电路 实验"`，再输入 ``/get 1 2``。', '先输入 /find "电路 实验"，再输入 /get 1 2。'),
+    ("可以发送 `／HELP`。", "可以发送 ／HELP。"),
+    ("```text\n/find /tmp\n/get 1\n```", "/find /tmp\n/get 1"),
+    ("示例 `/find @123456789`。", "示例 /find @123456789。"),
+    ("路径 `/tmp`，终端命令 `ls -a`，旧指令 `/ls`。", "路径 `/tmp`，终端命令 `ls -a`，旧指令 `/ls`。"),
+    ("```sh\n/find 1\nprintf '%s' hello\n```", "```sh\n/find 1\nprintf '%s' hello\n```"),
+])
+def test_command_guidance_removes_only_bot_command_backticks(body, expected, structured):
+    text = json.dumps({"qq_reply": {"text": body}}) if structured else body
+    assert render_reply(text, group=True) == expected
+
+
 @pytest.mark.parametrize("group", [True, False])
 def test_missing_at_defaults_to_no_mentions_and_still_escapes_cq(group):
     text = json.dumps({"qq_reply": {"text": "hello [CQ:at,qq=all]"}})

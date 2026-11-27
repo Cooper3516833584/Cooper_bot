@@ -26,6 +26,7 @@ from cooper_bot.modules.handin.handinsvc import (
     pretty_ts,
     required_suffix_display,
 )
+from cooper_bot.commands import is_known_explicit_command
 from cooper_bot.commands.command_services import get_handin_task_summary, list_handin_tasks_for_group, run_find_query
 from cooper_bot.core.router import get_files
 from cooper_bot.core.ziputil import open_fast_zip, write_path as zip_write_path
@@ -107,28 +108,6 @@ _COUNT_END_RE = re.compile(r"^/?end[\s。.!！?？]*$", flags=re.IGNORECASE)
 _COUNT_END_CN_RE = re.compile(r"^结束[\s。.!！?？]*$")
 _FIND_GENERIC_TERMS = {"课本", "教材", "资料", "题库", "试卷"}
 _FIND_SUBJECT_SHORT_TERMS = {"数电", "模电", "高数", "大物", "数理方程"}
-_EXPLICIT_COMMAND_NAMES = {
-    "autoat",
-    "chandin",
-    "calendartest",
-    "count",
-    "countlist",
-    "countremove",
-    "find",
-    "get",
-    "h",
-    "handin",
-    "handincheck",
-    "handinget",
-    "handinstat",
-    "help",
-    "kick",
-    "level",
-    "memory",
-    "ping",
-    "signin",
-    "whoami",
-}
 
 
 def _strip_text_companion_cq_segments(text: str) -> str:
@@ -951,14 +930,6 @@ def _split_args(text: str):
     cmd = parts[0]
     rest = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
     return cmd, rest
-
-
-def _is_known_explicit_command(text: str) -> bool:
-    raw = str(text or "").strip()
-    if not raw.startswith(("/", "／")):
-        return False
-    parts = raw[1:].strip().split(maxsplit=1)
-    return bool(parts) and parts[0].lower() in _EXPLICIT_COMMAND_NAMES
 
 
 def _parse_signin_deadline_hhmm(text: str) -> Optional[Tuple[int, int]]:
@@ -5165,7 +5136,7 @@ async def dispatch(
                     reset_context=getattr(history_service, "forget_context", None))
                 await reply(api, ctx, result, logsvc, force_private_user_id=ctx.user_id if force_private else None)
             return
-        if _is_known_explicit_command(t) or int(getattr(ctx, "level", 0) or 0) < 1:
+        if is_known_explicit_command(t) or int(getattr(ctx, "level", 0) or 0) < 1:
             _remember_non_ai_once()
             await _handle_explicit_command(api, ctx, t, filesvc, logsvc, state, handin, perm, aisvc, calendar_service)
             return

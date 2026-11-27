@@ -5,11 +5,14 @@ import html
 import json
 import re
 
+from cooper_bot.commands import is_known_explicit_command
+
 from .message_context import message_segments, normalize_onebot_event, positive_id
 from .quote_context import message_allowed
 
 
 _CQ_AT_RE = re.compile(r"\[CQ:at,[^\]]*\]", re.I)
+_BACKTICK_CODE_RE = re.compile(r"(`+)([^`]+)\1")
 _INLINE_AT_RE = re.compile(
     r"(?P<literal>https?://[^\s<>]+|`+[^`]*`+|[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"
     r"|(?P<cq>\[CQ:at,[^\]]*\])"
@@ -82,6 +85,21 @@ async def recent_context(api, evt, aisvc, identity, session_key, cutoff):
     return ordered[-limit:] if limit else []
 
 
+def _plain_command_example(literal):
+    match = _BACKTICK_CODE_RE.fullmatch(literal)
+    if not match:
+        return literal
+    delimiter, content = match.groups()
+    lines = content.strip().splitlines()
+    if len(delimiter) < 3 and len(lines) != 1:
+        return literal
+    if len(delimiter) >= 3 and lines and lines[0].strip().lower() in {"text", "plaintext"}:
+        lines = lines[1:]
+    if lines and all(not line.strip() or is_known_explicit_command(line) for line in lines):
+        return "\n".join(lines).strip()
+    return literal
+
+
 def _render_mentions(body, *, group, targets, escape_body=False):
     def escape_cq(value):
         return _CQ_AT_RE.sub(lambda m: m[0].replace("[", "&#91;").replace("]", "&#93;"), value)
@@ -89,6 +107,7 @@ def _render_mentions(body, *, group, targets, escape_body=False):
     def replace(match):
         value = match[0]
         if match.group("literal"):
+            value = _plain_command_example(value)
             return value if escape_body else escape_cq(value)
         is_cq = match.group("cq") is not None
         uid = positive_id(message_segments(value)[0]["data"].get("qq")) if is_cq else positive_id(match.group("qq"))

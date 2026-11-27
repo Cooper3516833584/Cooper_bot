@@ -99,6 +99,7 @@ async def test_admin_chat_keeps_persona_and_shares_the_existing_context_budget(m
     assert len(payload["conversation_history"]) + len(payload["recent_conversation"]) == 5
     assert payload["recent_conversation"][-1]["speaker"]["user_id"] == 20002
     assert "统一发送" in payload["reply_contract"]
+    assert "命令外不要加反引号" in payload["reply_contract"]
     assert svc._kimi_runner.requests[0].profile == "admin"
     assert all("学渣" not in json.dumps(row, ensure_ascii=False) for row in svc._load_active_chat_history("admin:10001:group:20001"))
 
@@ -136,6 +137,7 @@ async def test_full_admin_history_does_not_crowd_out_newer_group_context(monkeyp
     ('{"qq_reply":{"text":"不用谢 [CQ:at,qq=all]","at":[20003,20002,20002]}}',
      "[CQ:at,qq=20003] [CQ:at,qq=20002] 不用谢 &#91;CQ:at,qq=all&#93;"),
     ('{"qq_reply":{"text":"任务已完成","at":[20003]}}', "[CQ:at,qq=20003] 任务已完成"),
+    ('{"qq_reply":{"text":"直接发送 `/find 热统`。","at":[20003]}}', "[CQ:at,qq=20003] 直接发送 /find 热统。"),
 ])
 async def test_structured_mention_uses_existing_single_reply_delivery(monkeypatch, model_reply, expected):
     svc = AIService(_Log())
