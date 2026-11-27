@@ -36,7 +36,7 @@ from cooper_bot.modules.email_notify.mail_notify import EmailNotifyService
 from cooper_bot.modules.vision.vision_skill import VisionSkill
 from cooper_bot.modules.moderation.service import ModerationService
 from cooper_bot.commands.kick_commands import handle_kick_command, parse_kick_command, personal_level
-from cooper_bot.modules.ai.message_context import is_self_message
+from cooper_bot.modules.ai.message_context import is_self_message, positive_id
 
 log = Logger("bot", "INFO")
 
@@ -73,26 +73,67 @@ def _observe_chat_stream(aisvc, vision_skill, data):
     return is_self_message(data)
 
 
-def _schedule_friend_completion(api, ctx, data: dict, text: str):
-    if (
-        not AUTO_APPROVE_FRIEND_REQUEST
-        or data.get("post_type") != "message"
-        or data.get("message_type") != "private"
-        or data.get("sub_type") == "group"
-        or text.strip() != "请求添加你为好友"
+def _schedule_friend_completion(api, ctx, data: dict, text: str, pending: set[int]):
+    if not AUTO_APPROVE_FRIEND_REQUEST:
+        return None
+
+    post_type = data.get("post_type")
+    flag = ""
+    if post_type == "request" and data.get("request_type") == "friend":
+        user_id = positive_id(data.get("user_id"))
+        flag = str(data.get("flag") or "").strip()
+    elif post_type == "notice" and data.get("notice_type") in ("friend_add", "cooper_friend_request"):
+        user_id = positive_id(data.get("user_id"))
+        if data.get("notice_type") == "cooper_friend_request":
+            flag = str(data.get("flag") or "").strip()
+    elif (
+        post_type == "message" and ctx is not None and data.get("message_type") == "private"
+        and data.get("sub_type") != "group" and text.strip() == "请求添加你为好友"
     ):
+        user_id = ctx.user_id
+    else:
+        return None
+
+    if not user_id or user_id == positive_id(data.get("self_id")):
+        return None
+    if user_id in pending:
         return None
 
     async def _complete():
         try:
-            resp = await api.complete_friend_request(ctx.user_id, AUTO_APPROVE_FRIEND_REMARK)
-            result = (resp or {}).get("data") or {}
-            if not (resp and resp.get("status") == "ok" and result.get("is_friend") is True):
-                log.warning("好友关系补全未确认，请检查 NapCat 好友插件或 QQ 验证状态")
-        except Exception as e:
-            log.warning(f"好友关系补全失败: {type(e).__name__}")
+            resp = await api.complete_friend_request(user_id, AUTO_APPROVE_FRIEND_REMARK, flag=flag)
+            if post_type == "request" and flag and (resp or {}).get("message") == "不支持的Api cooper_complete_friend_request":
+                resp = await api.set_friend_add_request(flag, approve=True, remark=AUTO_APPROVE_FRIEND_REMARK)
+                if not resp or resp.get("status") != "ok" or resp.get("retcode", 0) != 0:
+                    log.warning("好友申请自动通过未确认，请检查 NapCat 审批接口")
+                return
 
-    return asyncio.create_task(_complete())
+            if resp and resp.get("status") == "ok" and resp.get("retcode", 0) == 0:
+                result = resp.get("data") or {}
+                if result.get("is_friend") is True:
+                    return
+                if result.get("reciprocal") == "sent":
+                    log.info("QQ 已接收回加申请，等待好友关系确认")
+                    return
+                if result.get("reciprocal") == "pending":
+                    return
+                reason = {
+                    "native_unavailable": "QQ 原生回加接口不可用",
+                    "setting_unavailable": "未能读取对方的好友验证设置",
+                    "verification_required": "对方的好友验证设置需要人工处理",
+                    "request_not_confirmed": "QQ 未确认回加申请",
+                }.get(result.get("reason"))
+                if reason:
+                    log.warning(f"好友关系补全未确认：{reason}")
+                    return
+            log.warning("好友关系补全未确认，请检查 NapCat 好友插件或 QQ 验证状态")
+        except Exception as e:
+            log.warning(f"处理好友申请失败: {type(e).__name__}")
+
+    task = asyncio.create_task(_complete())
+    pending.add(user_id)
+    task.add_done_callback(lambda _: pending.discard(user_id))
+    return task
 
 
 def _acquire_single_instance_lock() -> bool:
@@ -273,6 +314,7 @@ async def _run_bot_loop(
                 conv_lock_last_used: Dict[str, float] = {}
                 last_conv_lock_sweep = 0.0
                 inflight: Set[asyncio.Task] = set()
+                pending_friend_requests: set[int] = set()
 
                 def _sweep_conv_locks(now_ts: float) -> None:
                     nonlocal last_conv_lock_sweep
@@ -443,41 +485,21 @@ async def _run_bot_loop(
                             if _observe_chat_stream(aisvc, vision_skill, data):
                                 continue
 
-                            # ===== 自动通过好友申请（post_type=request）=====
-                            if data.get("post_type") == "request" and data.get("request_type") == "friend":
-                                if AUTO_APPROVE_FRIEND_REQUEST:
-                                    flag = data.get("flag")
-                                    req_uid = int(data.get("user_id") or 0)
-                                    comment = str(data.get("comment") or "").strip()
-                                    if flag:
-                                        log.info(f"收到好友申请：user_id={req_uid} comment={comment!r} -> 自动通过")
-                                        asyncio.create_task(
-                                            api.set_friend_add_request(
-                                                flag=str(flag),
-                                                approve=True,
-                                                remark=AUTO_APPROVE_FRIEND_REMARK,
-                                            )
-                                        )
-                                    else:
-                                        log.warning(f"收到好友申请但缺少 flag：{data}")
-                                continue
-
-                            # action 回包
                             ctx = build_ctx(data, perm=perm)
+                            text = get_text(data) if ctx else ""
+                            friend_task = _schedule_friend_completion(api, ctx, data, text, pending_friend_requests)
+                            if friend_task is not None:
+                                inflight.add(friend_task)
+                                friend_task.add_done_callback(lambda t: inflight.discard(t))
                             if not ctx:
                                 continue
                             setattr(ctx, "_ai_chat_context_aisvc", aisvc)
                             setattr(ctx, "_chat_ingest_seq", data.get("_chat_ingest_seq"))
 
-                            text = get_text(data)
                             if editor_duty_service is not None and str(data.get("group_id")) == str(editor_duty_service.group_id):
                                 duty_observation = asyncio.create_task(_observe_editor_duty(data))
                                 inflight.add(duty_observation)
                                 duty_observation.add_done_callback(lambda t: inflight.discard(t))
-                            friend_task = _schedule_friend_completion(api, ctx, data, text)
-                            if friend_task is not None:
-                                inflight.add(friend_task)
-                                friend_task.add_done_callback(lambda t: inflight.discard(t))
                             task = asyncio.create_task(_handle_one_event(ctx, data, text))
                             inflight.add(task)
                             task.add_done_callback(lambda t: inflight.discard(t))

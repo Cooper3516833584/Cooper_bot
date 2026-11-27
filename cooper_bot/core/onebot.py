@@ -247,12 +247,15 @@ class OneBotAPI:
             params["remark"] = str(remark)
         return await self.call("set_friend_add_request", params, timeout=6.0)
 
-    async def complete_friend_request(self, user_id: int, remark: str = ""):
+    async def complete_friend_request(self, user_id: int, remark: str = "", *, flag: str = ""):
         # NapCat 插件按真实申请记录匹配；HTTP 超时不重复发送好友操作。
+        params = {"user_id": int(user_id), "remark": str(remark)}
+        if flag:
+            params["flag"] = str(flag)
         return await self._call_prefer_http_no_ws_fallback(
             "cooper_complete_friend_request",
-            {"user_id": int(user_id), "remark": str(remark)},
-            timeout=10.0,
+            params,
+            timeout=16.0,
         )
 
     async def upload_group_file(self, group_id: int, file: str, name: str, folder: Optional[str] = None):
